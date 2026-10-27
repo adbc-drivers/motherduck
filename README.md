@@ -22,65 +22,97 @@
   under the License.
 -->
 
-# ADBC PostgreSQL Driver
+# ADBC Driver for MotherDuck
 
-![Vendor: PostgreSQL](https://img.shields.io/badge/vendor-PostgreSQL-blue?style=flat-square)
-![Implementation: C/C++](https://img.shields.io/badge/implementation-C%2FC%2B%2B-violet?style=flat-square)
-![Status: Stable](https://img.shields.io/badge/status-stable-green?style=flat-square)
+A C++ ADBC driver for MotherDuck's PostgreSQL protocol endpoint, forked from
+Apache Arrow ADBC's libpq-based PostgreSQL driver. This is the initial fork;
+MotherDuck-specific protocol and authentication changes remain to be implemented.
+The upstream PostgreSQL driver's approach credits [pgeon](https://github.com/0x0L/pgeon).
 
-[![conda-forge: adbc-driver-postgresql](https://img.shields.io/conda/vn/conda-forge/adbc-driver-postgresql?label=conda-forge%3A%20adbc-driver-postgresql&style=flat-square)](https://anaconda.org/conda-forge/adbc-driver-postgresql)
-[![conda-forge: libadbc-driver-postgresql](https://img.shields.io/conda/vn/conda-forge/libadbc-driver-postgresql?label=conda-forge%3A%20libadbc-driver-postgresql&style=flat-square)](https://anaconda.org/conda-forge/libadbc-driver-postgresql)
-[![CRAN: adbcpostgresql](https://img.shields.io/cran/v/adbcpostgresql?style=flat-square)](https://cran.r-project.org/web/packages/adbcpostgresql/index.html)
-[![PyPI: adbc-driver-postgresql](https://img.shields.io/pypi/v/adbc-driver-postgresql?style=flat-square)](https://pypi.org/project/adbc-driver-postgresql/)
+## Build
 
-This implements an ADBC driver that wraps [libpq][libpq], the client
-library for PostgreSQL.
+Requires CMake 3.24+, a C++20 compiler, and PostgreSQL's client library and
+headers (libpq). The driver bundles the Apache common/framework code, nanoarrow,
+fmt, portable-snippets, and boost.int128 it needs. Test builds also require
+GoogleTest/GoogleMock; CMake downloads GoogleTest 1.15.2 if it is not installed.
 
-This project owes credit to 0x0L's [pgeon][pgeon] for the overall
-approach.
+For a native development build, set `PostgreSQL_ROOT` or `CMAKE_PREFIX_PATH`
+if CMake cannot find libpq, then run:
 
-**NOTE:** this project is not affiliated with PostgreSQL in any way.
-
-[libpq]: https://www.postgresql.org/docs/current/libpq.html
-[pgeon]: https://github.com/0x0L/pgeon
-
-## Building
-
-Dependencies: libpq itself. This can be installed with your favorite
-package manager; however, you may need to set the `PKG_CONFIG_PATH`
-environment variable such that `pkg-config` can find libpq.
-
-See [CONTRIBUTING.md](../../../CONTRIBUTING.md) for details.
-
-## Testing
-
-A running instance of PostgreSQL is required.  For example, using Docker:
-
-```shell
-$ docker run -it --rm \
-    -e POSTGRES_PASSWORD=password \
-    -e POSTGRES_DB=tempdb \
-    -p 5432:5432 \
-    postgres
+```sh
+./ci/scripts/build.sh test macos arm64
+./ci/scripts/test.sh macos arm64
 ```
 
-Alternatively use the `docker compose` provided by ADBC to manage the test
-database container.
+Use `linux` or `windows` and `amd64` or `arm64` as appropriate. With Homebrew,
+for example, set `PostgreSQL_ROOT="$(brew --prefix libpq)"` after installing
+`libpq`. An existing Homebrew PostgreSQL installation also supplies libpq.
 
-```shell
-$ docker compose up postgres-test
-# When finished:
-# docker compose down postgres-test
+For a release build without test dependencies:
+
+```sh
+./ci/scripts/build.sh release macos arm64
 ```
 
-Then, to run the tests, set the environment variable specifying the
-PostgreSQL URI before running tests:
+The scripts copy the library to `build/libadbc_driver_motherduck.dylib` on
+macOS, `.so` on Linux, or `.dll` on Windows. The entry point inferred by ADBC
+driver managers is `AdbcDriverMotherduckInit`. The original PostgreSQL entry
+point and the generic `AdbcDriverInit` remain available.
 
-```shell
-$ export ADBC_POSTGRESQL_TEST_URI=postgresql://localhost:5432/postgres?user=postgres&password=password
-$ ctest
+For Foundry packaging, use the vcpkg toolchain through `CMAKE_TOOLCHAIN_FILE`,
+`VCPKG_ROOT`, or `VCPKG_INSTALLATION_ROOT`. The scripts choose static vcpkg
+triplets, including a static runtime on Windows. A native build with a system
+libpq is suitable for local development and retains that runtime dependency.
+
+Direct CMake builds are also supported:
+
+```sh
+cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/debug --parallel
+ctest --test-dir build/debug --output-on-failure
+cmake --install build/debug --prefix build/install
 ```
 
-Users of VSCode can use the CMake extension with the supplied CMakeUserPresets.json
-example to supply the required CMake and environment variables required to build and
-run tests.
+## Inherited tests
+
+The complete upstream C++ test suites are compiled in test builds. Default
+CTest runs include the server-independent tests. To run the PostgreSQL
+integration tests too, use a disposable PostgreSQL database named `postgres`:
+
+```sh
+export ADBC_POSTGRESQL_TEST_URI='postgresql://localhost:5432/postgres?user=postgres&password=password'
+export MOTHERDUCK_TEST_POSTGRESQL=ON
+./ci/scripts/build.sh test macos arm64
+./ci/scripts/test.sh macos arm64
+```
+
+These tests exercise PostgreSQL compatibility. The inherited Python files in
+`validation/` still target PostgreSQL; MotherDuck validation and published
+validation documentation will be configured separately.
+
+## Upstream history and licensing
+
+The fork was extracted from `apache/arrow-adbc` at
+`b519e662f9e368c9dfbef313d0914b6afe50fe37` (2026-10-26), retaining 373 commits
+for the driver and its bundled Apache dependencies. The original driver
+history begins with the libpq implementation on 2022-08-26. Historical paths
+`c/drivers/postgres/`, `c/driver/postgres/`, and `c/driver/postgresql/` are all
+included. Driver sources are now in `src/`, C++ tests in `tests/`, and shared
+Apache code in `third_party/arrow-adbc/`.
+
+To reproduce the extraction in a fresh, full-history clone of Apache Arrow ADBC
+checked out at that commit, use this repository's `ci/upstream-paths.txt`:
+
+```sh
+git filter-repo --paths-from-file /path/to/motherduck/ci/upstream-paths.txt \
+  --preserve-commit-hashes --preserve-commit-encoding
+```
+
+Filtering changes commit IDs. Authors, committers, dates, and commit messages
+are preserved. The retained commits are mapped in
+[`ci/upstream-commit-map.txt`](ci/upstream-commit-map.txt); the full map, including
+pruned commits, is retained locally at `.git/filter-repo/commit-map`.
+
+Imported ASF headers retain their original text, preceded by a 2026 ADBC
+Drivers Contributors copyright and modification notice. Other bundled
+third-party notices remain intact. See `LICENSE.txt` and `NOTICE.txt`.
