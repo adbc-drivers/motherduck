@@ -31,9 +31,9 @@
 #include <gtest/gtest.h>
 #include <nanoarrow/nanoarrow.hpp>
 
+#include "copy/writer.h"
+#include "database.h"
 #include "postgres_copy_test_common.h"
-#include "postgresql/copy/writer.h"
-#include "postgresql/database.h"
 #include "validation/adbc_validation_util.h"
 
 using adbc_validation::IsOkStatus;

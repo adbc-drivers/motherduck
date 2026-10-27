@@ -27,7 +27,7 @@
 
 #include <array>
 
-#include "postgresql/postgres_type.h"
+#include "postgres_type.h"
 
 namespace adbcpq {
 

@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "codegen/pgtype.h"
-#include "postgresql/result_helper.h"
+#include "result_helper.h"
 
 using adbc::driver::Status;
 

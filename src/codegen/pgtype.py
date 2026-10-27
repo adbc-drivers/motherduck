@@ -92,7 +92,7 @@ template = """// Copyright (c) 2026 ADBC Drivers Contributors
 
 #include <array>
 
-#include "postgresql/postgres_type.h"
+#include "postgres_type.h"
 
 namespace adbcpq {{
 
