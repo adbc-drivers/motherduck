@@ -20,20 +20,5 @@
 # specific language governing permissions and limitations
 # under the License.
 
-*.stdout.txt linguist-generated
-c/vendor/* linguist-vendored
-go/adbc/drivermgr/arrow-adbc/adbc.h linguist-generated
-go/adbc/drivermgr/arrow-adbc/adbc_driver_manager.h linguist-generated
-go/adbc/drivermgr/adbc_driver_manager.cc linguist-generated
-go/adbc/drivermgr/adbc_driver_manager_api.cc linguist-generated
-go/adbc/drivermgr/adbc_driver_manager_driver_loading.cc linguist-generated
-go/adbc/drivermgr/adbc_driver_manager_internal.h linguist-generated
-go/adbc/drivermgr/adbc_driver_manager_profiles.cc linguist-generated
-go/adbc/drivermgr/current_arch.h linguist-generated
-go/driver/arrow-adbc/adbc.h linguist-generated
-go/driver/flightsql/pkg/* linguist-generated
-go/adbc/pkg/panicdummy/* linguist-generated
-python/adbc_driver_flightsql/adbc_driver_flightsql/_static_version.py export-subst
-python/adbc_driver_manager/adbc_driver_manager/_static_version.py export-subst
-python/adbc_driver_postgresql/adbc_driver_postgresql/_static_version.py export-subst
-python/adbc_driver_sqlite/adbc_driver_sqlite/_static_version.py export-subst
+third_party/** linguist-vendored
+src/codegen/pgtype.h linguist-generated

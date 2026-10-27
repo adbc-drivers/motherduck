@@ -1,0 +1,88 @@
+# Copyright (c) 2026 ADBC Drivers Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# PostgreSQL driver extraction from apache/arrow-adbc.
+# Include every historical driver location; filter-repo does not follow renames.
+LICENSE.txt
+NOTICE.txt
+.clang-format
+.cmake-format
+.gitattributes
+c/driver/postgresql/validation/
+c/driver/postgresql/testdata/
+c/driver/postgresql/copy/postgres_copy_reader_test.cc
+c/driver/postgresql/copy/postgres_copy_writer_test.cc
+c/driver/postgresql/copy/postgres_copy_test_common.h
+c/driver/postgresql/error_test.cc
+c/driver/postgresql/postgres_type_test.cc
+c/driver/postgresql/postgresql_test.cc
+c/driver/postgresql/postgresql_benchmark.cc
+c/driver/postgresql/README.md
+c/driver/postgresql/vcpkg.json
+c/driver/postgresql/
+c/driver/postgres/README.md
+c/driver/postgres/vcpkg.json
+c/driver/postgres/postgres_test.cc
+c/driver/postgres/
+c/drivers/postgres/README.md
+c/drivers/postgres/postgres_test.cc
+c/drivers/postgres/
+c/driver/common/
+c/driver/sqlite/utils.c
+c/driver/sqlite/utils.h
+c/driver/framework/
+c/validation/
+validation/
+c/include/arrow-adbc/adbc.h
+adbc.h
+c/include/adbc.h
+c/include/arrow-adbc/driver/postgresql.h
+c/vendor/nanoarrow/
+c/vendor/fmt/
+c/vendor/portable-snippets/
+c/vendor/boost/
+
+c/validation/==>third_party/arrow-adbc/c/validation/
+validation/==>third_party/arrow-adbc/c/validation/
+c/driver/postgresql/validation/==>validation/
+c/driver/postgresql/testdata/==>tests/testdata/
+c/driver/postgresql/copy/postgres_copy_reader_test.cc==>tests/copy/postgres_copy_reader_test.cc
+c/driver/postgresql/copy/postgres_copy_writer_test.cc==>tests/copy/postgres_copy_writer_test.cc
+c/driver/postgresql/copy/postgres_copy_test_common.h==>tests/copy/postgres_copy_test_common.h
+c/driver/postgresql/error_test.cc==>tests/error_test.cc
+c/driver/postgresql/postgres_type_test.cc==>tests/postgres_type_test.cc
+c/driver/postgresql/postgresql_test.cc==>tests/postgresql_test.cc
+c/driver/postgresql/postgresql_benchmark.cc==>tests/postgresql_benchmark.cc
+c/driver/postgresql/README.md==>README.md
+c/driver/postgresql/vcpkg.json==>vcpkg.json
+c/driver/postgresql/==>src/
+c/driver/postgres/README.md==>README.md
+c/driver/postgres/vcpkg.json==>vcpkg.json
+c/driver/postgres/postgres_test.cc==>tests/postgresql_test.cc
+c/driver/postgres/==>src/
+c/drivers/postgres/README.md==>README.md
+c/drivers/postgres/postgres_test.cc==>tests/postgresql_test.cc
+c/drivers/postgres/==>src/
+c/driver/common/==>third_party/arrow-adbc/c/driver/common/
+c/driver/sqlite/utils.c==>third_party/arrow-adbc/c/driver/common/utils.c
+c/driver/sqlite/utils.h==>third_party/arrow-adbc/c/driver/common/utils.h
+c/driver/framework/==>third_party/arrow-adbc/c/driver/framework/
+c/include/arrow-adbc/adbc.h==>third_party/arrow-adbc/include/arrow-adbc/adbc.h
+adbc.h==>third_party/arrow-adbc/include/arrow-adbc/adbc.h
+c/include/adbc.h==>third_party/arrow-adbc/include/adbc.h
+c/include/arrow-adbc/driver/postgresql.h==>third_party/arrow-adbc/include/arrow-adbc/driver/postgresql.h
+c/vendor/nanoarrow/==>third_party/arrow-adbc/c/vendor/nanoarrow/
+c/vendor/fmt/==>third_party/arrow-adbc/c/vendor/fmt/
+c/vendor/portable-snippets/==>third_party/arrow-adbc/c/vendor/portable-snippets/
+c/vendor/boost/==>third_party/arrow-adbc/c/vendor/boost/

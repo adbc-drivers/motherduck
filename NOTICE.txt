@@ -1,3 +1,8 @@
+ADBC Driver for MotherDuck
+Copyright (c) 2026 ADBC Drivers Contributors
+
+Derived from Apache Arrow ADBC:
+
 Apache Arrow ADBC
 Copyright 2022-2026 The Apache Software Foundation
 
