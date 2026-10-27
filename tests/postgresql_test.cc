@@ -41,6 +41,7 @@
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow.hpp>
 
+#include "adbc_driver_motherduck_config.h"
 #include "common/options.h"
 #include "common/utils.h"
 #include "validation/adbc_validation.h"
@@ -208,9 +209,9 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
       case ADBC_INFO_DRIVER_ADBC_VERSION:
         return ADBC_VERSION_1_1_0;
       case ADBC_INFO_DRIVER_NAME:
-        return "ADBC PostgreSQL Driver";
+        return "ADBC MotherDuck Driver";
       case ADBC_INFO_DRIVER_VERSION:
-        return "unknown";
+        return ADBC_DRIVER_MOTHERDUCK_VERSION;
       case ADBC_INFO_VENDOR_NAME:
         return "PostgreSQL";
       default:
@@ -386,12 +387,13 @@ TEST_F(PostgresConnectionTest, GetInfoMetadata) {
       switch (code) {
         case ADBC_INFO_DRIVER_NAME: {
           ArrowStringView val = ArrowArrayViewGetStringUnsafe(str_child, offset);
-          EXPECT_EQ("ADBC PostgreSQL Driver", std::string(val.data, val.size_bytes));
+          EXPECT_EQ("ADBC MotherDuck Driver", std::string(val.data, val.size_bytes));
           break;
         }
         case ADBC_INFO_DRIVER_VERSION: {
           ArrowStringView val = ArrowArrayViewGetStringUnsafe(str_child, offset);
-          EXPECT_EQ("unknown", std::string(val.data, val.size_bytes));
+          EXPECT_EQ(ADBC_DRIVER_MOTHERDUCK_VERSION,
+                    std::string(val.data, val.size_bytes));
           break;
         }
         case ADBC_INFO_VENDOR_NAME: {

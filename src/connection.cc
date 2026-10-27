@@ -27,6 +27,8 @@
 
 #include "connection.h"
 
+#include "adbc_driver_motherduck_config.h"
+
 #include <array>
 #include <cassert>
 #include <cinttypes>
@@ -564,11 +566,10 @@ AdbcStatusCode PostgresConnection::GetInfo(struct AdbcConnection* connection,
         break;
       }
       case ADBC_INFO_DRIVER_NAME:
-        infos.push_back({info_codes[i], "ADBC PostgreSQL Driver"});
+        infos.push_back({info_codes[i], "ADBC MotherDuck Driver"});
         break;
       case ADBC_INFO_DRIVER_VERSION:
-        // TODO(lidavidm): fill in driver version
-        infos.push_back({info_codes[i], "unknown"});
+        infos.push_back({info_codes[i], ADBC_DRIVER_MOTHERDUCK_VERSION});
         break;
       case ADBC_INFO_DRIVER_ARROW_VERSION:
         infos.push_back({info_codes[i], "v" NANOARROW_VERSION});
