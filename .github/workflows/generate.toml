@@ -1,0 +1,14 @@
+#:schema https://raw.githubusercontent.com/adbc-drivers/dev/refs/heads/main/schema/generate-schema.json
+
+repository = "motherduck"
+driver = "motherduck"
+private = false
+
+[lang.script]
+subdir = "."
+
+[lang.script.test]
+skip = true
+
+[lang.script.validation]
+skip = true
