@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 ADBC Drivers Contributors
+#
+# This file has been modified from its original version, which is
+# under the Apache License:
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
