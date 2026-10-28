@@ -75,16 +75,25 @@ cmake --install build/debug --prefix build/install
 
 ## Inherited tests
 
-The complete upstream C++ test suites are compiled in test builds. Default
-CTest runs include the server-independent tests. To run the PostgreSQL
-integration tests too, use a disposable PostgreSQL database named `postgres`:
+The complete upstream C++ test suites are compiled in test builds. Linux test
+builds enable PostgreSQL integration tests by default; macOS and Windows run
+server-independent tests by default. Use the disposable Compose service locally:
 
 ```sh
-export ADBC_POSTGRESQL_TEST_URI='postgresql://localhost:5432/postgres?user=postgres&password=password'
-export MOTHERDUCK_TEST_POSTGRESQL=ON
-./ci/scripts/build.sh test macos arm64
-./ci/scripts/test.sh macos arm64
+docker compose up --detach --wait test-service
+set -a
+source .env.linux
+set +a
+./ci/scripts/build.sh test linux amd64
+./ci/scripts/test.sh linux amd64
+docker compose down --volumes
 ```
+
+The service uses `postgres:latest` with database/user `postgres` and password
+`password` on localhost port 5432. Set `MOTHERDUCK_TEST_POSTGRESQL=OFF` when
+building to disable database tests, or `ON` to enable them on another platform
+with an available PostgreSQL server. CI starts the service and loads `.env.linux`
+only on Linux.
 
 These tests exercise PostgreSQL compatibility. The inherited Python files in
 `validation/` still target PostgreSQL; MotherDuck validation and published

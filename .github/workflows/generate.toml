@@ -23,8 +23,5 @@ hypothesis = ">=6,<7"
 [lang.script]
 subdir = "."
 
-[lang.script.test]
-skip = true
-
 [lang.script.validation]
 skip = true

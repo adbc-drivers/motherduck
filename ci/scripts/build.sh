@@ -44,11 +44,16 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 build_dir="${repo_root}/build/ci-${mode}-${platform}-${arch}"
 
+postgresql_tests=OFF
+if [[ "$mode" == test && "$platform" == linux ]]; then
+  postgresql_tests=ON
+fi
+
 configure_args=(
   -S "$repo_root" -B "$build_dir"
   -DCMAKE_BUILD_TYPE="$cmake_config"
   -DBUILD_TESTING="$build_testing"
-  -DMOTHERDUCK_TEST_POSTGRESQL="${MOTHERDUCK_TEST_POSTGRESQL:-OFF}"
+  -DMOTHERDUCK_TEST_POSTGRESQL="${MOTHERDUCK_TEST_POSTGRESQL:-$postgresql_tests}"
 )
 if [[ "$platform" != windows ]] && command -v ninja >/dev/null 2>&1; then
   configure_args+=(-G Ninja)
