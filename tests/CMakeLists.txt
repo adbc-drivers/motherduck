@@ -35,7 +35,9 @@ add_library(adbc_validation STATIC
             ${ADBC_UPSTREAM_C}/validation/adbc_validation_database.cc
             ${ADBC_UPSTREAM_C}/validation/adbc_validation_statement.cc
             ${ADBC_UPSTREAM_C}/validation/adbc_validation_util.cc)
-target_link_libraries(adbc_validation PUBLIC adbc_driver_common GTest::gmock)
+# The validation helpers call the ADBC API, which the driver library provides.
+target_link_libraries(adbc_validation PUBLIC adbc_driver_common adbc_driver_motherduck
+                                             GTest::gmock)
 
 add_executable(motherduck_common_test ${ADBC_UPSTREAM_C}/driver/common/utils_test.cc)
 target_link_libraries(motherduck_common_test PRIVATE adbc_driver_common GTest::gmock_main)
