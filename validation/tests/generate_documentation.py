@@ -28,7 +28,7 @@ if __name__ == "__main__":
     reports = [report.resolve() for report in Path(".").glob("validation-report*.xml")]
     generate_documentation.generate(
         "motherduck",
-        lambda *args, **kwargs: postgresql.PostgreSQLQuirks(),
+        lambda version, vendor: postgresql.get_quirks(version),
         [("postgresql", "MotherDuck")],
         reports,
         template.resolve(),
