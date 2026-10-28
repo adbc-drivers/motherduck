@@ -17,6 +17,9 @@ repository = "motherduck"
 driver = "motherduck"
 private = false
 
+[validation.extra-pypi-dependencies]
+hypothesis = ">=6,<7"
+
 [lang.script]
 subdir = "."
 

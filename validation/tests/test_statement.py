@@ -20,22 +20,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import adbc_drivers_validation.tests.statement as test_statement
-import pytest
+from adbc_drivers_validation.tests.statement import (
+    TestStatement,  # noqa: F401
+    generate_tests,
+)
 
 from . import postgresql
 
 
 def pytest_generate_tests(metafunc) -> None:
-    vendor = metafunc.config.getoption("vendor")
-    return test_statement.generate_tests([postgresql.get_quirks(vendor)], metafunc)
-
-
-class TestStatement(test_statement.TestStatement):
-    def test_rows_affected(self, driver, conn) -> None:
-        if isinstance(driver, postgresql.CrateDBQuirks):
-            pytest.xfail(
-                "CrateDB does not make writes immediately visible, and the upstream "
-                "test provides no REFRESH TABLE hook"
-            )
-        super().test_rows_affected(driver, conn)
+    return generate_tests([postgresql.PostgreSQLQuirks()], metafunc)

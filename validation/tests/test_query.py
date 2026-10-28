@@ -36,8 +36,7 @@ from . import postgresql
 
 
 def pytest_generate_tests(metafunc) -> None:
-    vendor = metafunc.config.getoption("vendor")
-    quirks = [postgresql.get_quirks(vendor)]
+    quirks = [postgresql.PostgreSQLQuirks()]
     if not metafunc.definition.name.startswith("test_hypothesis_"):
         return generate_tests(quirks, metafunc)
     return adbc_drivers_validation.utils.generate_tests_by_marks(quirks, metafunc)
@@ -67,11 +66,6 @@ def st_decimal(draw, precision, scale) -> decimal.Decimal:
 @hypothesis.settings(deadline=5000)
 @pytest.mark.requires_features(["statement_bulk_ingest"])
 def test_hypothesis_decimal128(driver, conn, ps: tuple[int, int], data) -> None:
-    if driver.name == "cedardb" and ps[0] == 38:
-        # Not confirmed, but it appears CedarDB overflows internally when
-        # parsing large decimal values
-        pytest.skip("apparent bug in CedarDB with precision = 38")
-
     dec = data.draw(st_decimal(*ps))
     arr = pyarrow.array([dec], type=pyarrow.decimal128(ps[0], ps[1]))
     arr.validate(full=True)
@@ -80,14 +74,7 @@ def test_hypothesis_decimal128(driver, conn, ps: tuple[int, int], data) -> None:
 
     temp_table = "temp_decimal128"
     with conn.cursor() as cur:
-        if driver.name == "cedardb":
-            # the driver doesn't add precision/scale when ingesting, but
-            # CedarDB defaults to (38, 6) apparently which trips up tests
-            cur.execute("DROP TABLE IF EXISTS temp_decimal128")
-            cur.execute(f"CREATE TABLE temp_decimal128 (col DECIMAL({ps[0]}, {ps[1]}))")
-            cur.adbc_ingest(temp_table, tbl, mode="append")
-        else:
-            cur.adbc_ingest(temp_table, tbl, mode="replace")
+        cur.adbc_ingest(temp_table, tbl, mode="replace")
         cur.execute(f"SELECT col FROM {temp_table}")
         res = cur.fetchallarrow()
 
