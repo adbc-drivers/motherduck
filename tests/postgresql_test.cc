@@ -65,8 +65,9 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return AdbcDatabaseSetOption(database, "uri", uri, error);
   }
 
-  // Works around ECO-1287 and ECO-1288 so other tests reach their own
-  // assertions; the MotherDuckDefaults* tests cover the defaults.
+  // Works around https://github.com/adbc-drivers/motherduck/issues/10 and
+  // https://github.com/adbc-drivers/motherduck/issues/11 so other tests reach their
+  // own assertions; the MotherDuckDefaults* tests cover the defaults.
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database,
                                struct AdbcError* error) const override {
     AdbcStatusCode status = SetupUri(database, error);
@@ -350,7 +351,8 @@ TEST_F(PostgresDatabaseTest, TypeResolverModeOptionDefault) {
   EXPECT_THAT(type_resolver_mode, ::testing::Optional("server"s));
 }
 
-// ECO-1287: the default server type resolver fails on NULL OIDs in pg_type.
+// https://github.com/adbc-drivers/motherduck/issues/10: the default server type
+// resolver fails on NULL OIDs in pg_type.
 TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
@@ -358,7 +360,8 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
 }
 
-// ECO-1288: by default, results come through binary COPY TO STDOUT.
+// https://github.com/adbc-drivers/motherduck/issues/11: by default, results come
+// through binary COPY TO STDOUT.
 TEST_F(PostgresDatabaseTest, MotherDuckDefaultsSelect) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   adbc_validation::Handle<struct AdbcConnection> connection;
@@ -366,7 +369,7 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsSelect) {
 
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
-  // Isolate from ECO-1287.
+  // Isolate from https://github.com/adbc-drivers/motherduck/issues/10.
   ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "adbc.postgresql.type_resolver_mode",
                                     "builtin", &error),
               IsOkStatus(&error));
