@@ -2061,9 +2061,10 @@ TEST_F(PostgresStatementTest, UpdateInExecuteQuery) {
 
   {
     // Use INSERT INTO
-    ASSERT_THAT(AdbcStatementSetSqlQuery(
-                    &statement, "INSERT INTO adbc_test (ints) VALUES (1), (2)", &error),
-                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcStatementSetSqlQuery(
+            &statement, "INSERT INTO adbc_test (ints, id) VALUES (1, 1), (2, 2)", &error),
+        IsOkStatus(&error));
     adbc_validation::StreamReader reader;
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
@@ -2078,7 +2079,8 @@ TEST_F(PostgresStatementTest, UpdateInExecuteQuery) {
     // Use INSERT INTO ... RETURNING
     ASSERT_THAT(AdbcStatementSetSqlQuery(
                     &statement,
-                    "INSERT INTO adbc_test (ints) VALUES (3), (4) RETURNING id", &error),
+                    "INSERT INTO adbc_test (ints, id) VALUES (3, 3), (4, 4) RETURNING id",
+                    &error),
                 IsOkStatus(&error));
     adbc_validation::StreamReader reader;
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
@@ -2711,10 +2713,10 @@ TEST_F(PostgresStatementTest, SetUseCopyFalse) {
                 IsOkStatus(&error));
   }
 
-  // Check option setting/getting
+  // Check option setting/getting; the test setup turns COPY off.
   ASSERT_EQ(
       adbc_validation::StatementGetOption(&statement, "adbc.postgresql.use_copy", &error),
-      "true");
+      "false");
 
   ASSERT_THAT(AdbcStatementSetOption(&statement, "adbc.postgresql.use_copy",
                                      "not true or false", &error),
