@@ -26,9 +26,8 @@ import re
 import typing
 from pathlib import Path
 
-from adbc_drivers_validation import model, quirks
-
 import adbc_driver_manager.dbapi
+from adbc_drivers_validation import model, quirks
 
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
@@ -214,14 +213,15 @@ class CrateDBQuirks(PostgreSQLQuirks):
         self,
         query: model.Query | str,
         cursor: adbc_driver_manager.dbapi.Cursor,
-    ) -> typing.Generator[None, None, None]:
+    ) -> typing.Generator:
         with super().setup_statement(query, cursor):
-            if isinstance(query, model.Query):
-                if table_name := query.metadata().setup.drop:
-                    cursor.adbc_statement.set_sql_query(
-                        f"REFRESH TABLE {self.quote_identifier(table_name)}"
-                    )
-                    cursor.adbc_statement.execute_update()
+            if isinstance(query, model.Query) and (
+                table_name := query.metadata().setup.drop
+            ):
+                cursor.adbc_statement.set_sql_query(
+                    f"REFRESH TABLE {self.quote_identifier(table_name)}"
+                )
+                cursor.adbc_statement.execute_update()
             yield
 
 

@@ -101,7 +101,7 @@ constexpr std::array<PostgresTypeResolver::Item, {item_count}> kBuiltinTypeItems
 }}}};
 
 }}  // namespace adbcpq
-"""  # noqa:E501
+"""
 
 
 def parse(pgtypedat):
@@ -158,9 +158,11 @@ def parse(pgtypedat):
             if k not in fields:
                 raise ValueError(f"line {lineno:03}: unknown field {k!r}")
             f = fields[k]
-            if f.type == int:  # noqa:E721
-                v = int(v)
-            elif isinstance(f.type, types.UnionType) and int in f.type.__args__:
+            if (
+                f.type == int
+                or isinstance(f.type, types.UnionType)
+                and int in f.type.__args__
+            ):
                 v = int(v)
             args[k] = v
         yield PgTypeDef(**args)
