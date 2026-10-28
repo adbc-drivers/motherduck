@@ -66,8 +66,6 @@ permissions:
 
 
 jobs:
-
-
   test:
     name: "Test/${{ matrix.platform }}_${{ matrix.arch }}"
     runs-on: ${{ matrix.runner }}
@@ -182,6 +180,8 @@ jobs:
           set +a
 
           ./ci/scripts/test.sh ${{ matrix.platform }} ${{ matrix.arch }}
+
+
 
 
   build:
