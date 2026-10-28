@@ -22,7 +22,6 @@
 
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -88,7 +87,6 @@ class PostgresConnection {
   bool autocommit() const { return autocommit_; }
   bool use_copy() const { return use_copy_; }
   std::string_view VendorName();
-  const std::array<int, 3>& VendorVersion();
 
  private:
   friend class PostgresStatement;

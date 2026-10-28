@@ -23,6 +23,11 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 
+# The validation job runs against the Compose service, not MotherDuck.
+if [[ "${GITHUB_JOB:-}" == validate ]]; then
+  exit 0
+fi
+
 if [[ -z "${MOTHERDUCK_TOKEN:-}" ]]; then
   printf 'MOTHERDUCK_TOKEN must be set to run tests against MotherDuck\n' >&2
   exit 1

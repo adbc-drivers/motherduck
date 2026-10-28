@@ -53,27 +53,8 @@ def driver_path(driver: adbc_drivers_validation.model.DriverQuirks) -> str:
         "win32": "dll",
         "darwin": "dylib",
     }.get(sys.platform, "so")
-    # Library can be in multiple possible locations
-    # base = c/driver/postgresql
-    base = Path(__file__).parent.parent.parent
-
-    possible_paths = [
-        # 1. c/build/driver/postgresql/ (CMake build from c/ directory)
-        base.parent.parent / f"build/driver/postgresql/libadbc_driver_postgresql.{ext}",
-        # 2. <repo-root>/build/driver/postgresql/ (CI build location)
-        base.parent.parent.parent
-        / f"build/driver/postgresql/libadbc_driver_postgresql.{ext}",
-        # 3. c/driver/postgresql/build/ (local CMake build from driver dir)
-        base / f"build/libadbc_driver_postgresql.{ext}",
-        # 4. c/driver/postgresql/ (direct build output in driver dir)
-        base / f"libadbc_driver_postgresql.{ext}",
-    ]
-
-    for path in possible_paths:
-        if path.exists():
-            return str(path)
-
-    return str(possible_paths[0])
+    base = Path(__file__).resolve().parent.parent.parent
+    return str(base / f"build/libadbc_driver_motherduck.{ext}")
 
 
 @pytest.fixture(scope="session", autouse=True)

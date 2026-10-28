@@ -17,15 +17,17 @@ repository = "motherduck"
 driver = "motherduck"
 private = false
 
-[secrets.MOTHERDUCK_TOKEN]
-secret = "MOTHERDUCK_TOKEN"
-contexts = ["test"]
-
 [validation.extra-pypi-dependencies]
 hypothesis = ">=6,<7"
 
 [lang.script]
 subdir = "."
 
-[lang.script.validation]
-skip = true
+# The C++ tests run against MotherDuck. The token lives in the `motherduck`
+# GitHub environment, so only the test job can read it.
+[lang.script.test]
+environment = "motherduck"
+
+[secrets.MOTHERDUCK_TOKEN]
+secret = "MOTHERDUCK_TOKEN"
+contexts = ["test"]

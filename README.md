@@ -75,22 +75,32 @@ cmake --install build/debug --prefix build/install
 
 ## Inherited tests
 
-The complete upstream C++ test suites are compiled in test builds. Default
-CTest runs include the server-independent tests. To run the PostgreSQL
-integration tests too, use a disposable PostgreSQL database named `postgres`:
+The complete upstream C++ test suites are compiled in test builds. Linux test
+builds enable PostgreSQL integration tests by default; macOS and Windows run
+server-independent tests by default. Use the disposable Compose service locally:
 
 ```sh
-export ADBC_POSTGRESQL_TEST_URI='postgresql://localhost:5432/postgres?user=postgres&password=password'
-export MOTHERDUCK_TEST_POSTGRESQL=ON
-./ci/scripts/build.sh test macos arm64
-./ci/scripts/test.sh macos arm64
+docker compose up --detach --wait test-service
+set -a
+source .env.linux
+set +a
+./ci/scripts/build.sh test linux amd64
+./ci/scripts/test.sh linux amd64
+docker compose down --volumes
 ```
 
-CI runs these tests against MotherDuck's Postgres endpoint instead of a local
-PostgreSQL server. It needs a `MOTHERDUCK_TOKEN` repository secret;
-`ci/scripts/pre-test.sh` builds the connection URI from it, and
-`MOTHERDUCK_PG_HOST` and `MOTHERDUCK_TEST_DATABASE` override the default host
-(`pg.us-east-1-aws.motherduck.com`) and database (`md:`).
+The service uses `postgres:latest` with database/user `postgres` and password
+`password` on localhost port 5432. Set `MOTHERDUCK_TEST_POSTGRESQL=OFF` when
+building to disable database tests, or `ON` to enable them on another platform
+with an available PostgreSQL server. CI starts the service and loads `.env.linux`
+only on Linux.
+
+In CI, the C++ tests run against MotherDuck's Postgres endpoint instead of the
+Compose service. The test job uses the `MOTHERDUCK_TOKEN` secret from the
+`motherduck` GitHub environment; `ci/scripts/pre-test.sh` builds the connection
+URI from it, and `MOTHERDUCK_PG_HOST` and `MOTHERDUCK_TEST_DATABASE` override the
+default host (`pg.us-east-1-aws.motherduck.com`) and database (`md:`). The
+validation suite still uses the Compose service.
 
 These tests exercise PostgreSQL compatibility. The inherited Python files in
 `validation/` still target PostgreSQL; MotherDuck validation and published
