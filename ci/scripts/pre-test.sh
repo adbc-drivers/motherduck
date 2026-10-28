@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Points the server-dependent tests at MotherDuck's Postgres endpoint. The
-# workflow sources the generated .env.override before running test.sh.
+# Writes .env.override, which the workflow sources before running test.sh.
 
 set -euo pipefail
 if [[ $# -lt 2 ]]; then
@@ -32,9 +31,8 @@ fi
 host="${MOTHERDUCK_PG_HOST:-pg.us-east-1-aws.motherduck.com}"
 database="${MOTHERDUCK_TEST_DATABASE:-md:}"
 
-# The vcpkg-built libpq does not see the OS trust store, so verify the server
-# certificate against the CA bundle from the pixi environment. The generated
-# test job does not install that environment itself.
+# vcpkg's libpq can't see the OS trust store, so use the pixi env's CA bundle.
+# The generated test job doesn't install the env itself.
 if [[ ! -d "${repo_root}/.pixi/envs/default" ]] && command -v pixi >/dev/null 2>&1; then
   (cd "$repo_root" && pixi install)
 fi
@@ -58,11 +56,11 @@ fi
 uri="postgresql://postgres@${host}:5432/${database//:/%3A}"
 uri+="?sslmode=verify-full&sslrootcert=${ca_bundle}"
 
-# The token goes in PGPASSWORD, not the URI, so it never appears in test output.
+# PGPASSWORD rather than the URI keeps the token out of test output.
 {
   printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$uri"
   printf 'PGPASSWORD=%q\n' "$MOTHERDUCK_TOKEN"
-  # The tests' expected catalog; with md: it's the account's default database.
+  # With md:, the tests fall back to the account's default database.
   if [[ "$database" != "md:" ]]; then
     printf 'MOTHERDUCK_TEST_CATALOG=%q\n' "$database"
   fi

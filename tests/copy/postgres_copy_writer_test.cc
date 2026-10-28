@@ -106,8 +106,7 @@ class PostgresCopyStreamWriteTester {
 class PostgresCopyTest : public ::testing::Test {
  public:
   void SetUp() override {
-    // These tests check the COPY encoder's bytes, so the built-in type table is
-    // enough and they don't need a server.
+    // Encoder tests only need the builtin type table, not a server.
     type_resolver_ = std::make_shared<PostgresTypeResolver>();
     ASSERT_TRUE(InternalAdbcInitializeTypeResolver(*type_resolver_).ok());
   }
@@ -1180,8 +1179,6 @@ using TimestampTestParamType =
 class PostgresCopyWriteTimestampTest
     : public testing::TestWithParam<TimestampTestParamType> {
   void SetUp() override {
-    // These tests check the COPY encoder's bytes, so the built-in type table is
-    // enough and they don't need a server.
     type_resolver_ = std::make_shared<PostgresTypeResolver>();
     ASSERT_TRUE(InternalAdbcInitializeTypeResolver(*type_resolver_).ok());
   }
@@ -1317,8 +1314,6 @@ using DurationTestParamType =
 class PostgresCopyWriteDurationTest
     : public testing::TestWithParam<DurationTestParamType> {
   void SetUp() override {
-    // These tests check the COPY encoder's bytes, so the built-in type table is
-    // enough and they don't need a server.
     type_resolver_ = std::make_shared<PostgresTypeResolver>();
     ASSERT_TRUE(InternalAdbcInitializeTypeResolver(*type_resolver_).ok());
   }
@@ -1450,8 +1445,6 @@ TEST_F(PostgresCopyTest, PostgresCopyWriteBinary) {
 class PostgresCopyListTest : public testing::TestWithParam<enum ArrowType> {
  public:
   void SetUp() override {
-    // These tests check the COPY encoder's bytes, so the built-in type table is
-    // enough and they don't need a server.
     type_resolver_ = std::make_shared<PostgresTypeResolver>();
     ASSERT_TRUE(InternalAdbcInitializeTypeResolver(*type_resolver_).ok());
   }

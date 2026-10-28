@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Test builds in CI compile the server-dependent tests, which run against
-# MotherDuck's Postgres endpoint (see pre-test.sh).
+# CI test builds include the server tests; pre-test.sh points them at MotherDuck.
 
 set -euo pipefail
 if [[ $# -ne 3 ]]; then
