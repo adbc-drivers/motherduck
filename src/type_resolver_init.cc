@@ -102,13 +102,13 @@ static Status InsertPgTypeResult(const PqResultHelper& result,
     const char* typname = item[1].data;
     const char* typreceive = item[2].data;
     int64_t typbasetype;
-    UNWRAP_RESULT(typbasetype, item[3].ParseInteger());
+    UNWRAP_RESULT(typbasetype, ParseNullablePgOid(item[3].value(), item[3].is_null));
     int64_t typrelid;
-    UNWRAP_RESULT(typrelid, item[4].ParseInteger());
+    UNWRAP_RESULT(typrelid, ParseNullablePgOid(item[4].value(), item[4].is_null));
 
     int64_t typarray;
     if (num_cols == 6) {
-      UNWRAP_RESULT(typarray, item[5].ParseInteger());
+      UNWRAP_RESULT(typarray, ParseNullablePgOid(item[5].value(), item[5].is_null));
     } else {
       typarray = 0;
     }

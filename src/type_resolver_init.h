@@ -22,6 +22,9 @@
 
 #pragma once
 
+#include <charconv>
+#include <string_view>
+
 #include <libpq-fe.h>
 
 #include "driver/framework/status.h"
@@ -38,6 +41,26 @@ enum class TypeResolverMode {
 
 adbc::driver::Status RebuildTypeResolver(PGconn* conn, PostgresTypeResolver& resolver);
 adbc::driver::Status InitializeTypeResolver(PostgresTypeResolver& resolver);
+
+// MotherDuck returns NULL for unused typbasetype, typrelid, and typarray.
+inline adbc::driver::Result<int64_t> ParseNullablePgOid(std::string_view value,
+                                                        bool is_null) {
+  if (is_null) {
+    return int64_t{0};
+  }
+
+  int64_t parsed = 0;
+  const char* first = value.data();
+  const char* last = first + value.size();
+  if (first == nullptr) {
+    return adbc::driver::Status::Internal("Can't parse '", value, "' as integer");
+  }
+  auto result = std::from_chars(first, last, parsed, 10);
+  if (result.ec == std::errc() && result.ptr == last) {
+    return parsed;
+  }
+  return adbc::driver::Status::Internal("Can't parse '", value, "' as integer");
+}
 
 }  // namespace adbcpq
 
