@@ -84,6 +84,5 @@ def driver_path(driver: adbc_drivers_validation.model.DriverQuirks) -> str:
 
 @pytest.fixture(scope="session", autouse=True)
 def _setup_backend(request, conn_factory) -> None:  # noqa: F811
-    with conn_factory() as conn:  # noqa: F811
-        with conn.cursor() as cursor:
-            cursor.execute("CREATE SCHEMA IF NOT EXISTS secondary")
+    with conn_factory() as c, c.cursor() as cursor:
+        cursor.execute("CREATE SCHEMA IF NOT EXISTS secondary")
