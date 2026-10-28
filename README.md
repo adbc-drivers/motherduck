@@ -97,8 +97,8 @@ only on Linux.
 
 In CI, the C++ tests run against MotherDuck's Postgres endpoint instead of the
 Compose service. The test job uses the `MOTHERDUCK_TOKEN` secret from the
-`motherduck` GitHub environment; `ci/scripts/pre-test.sh` builds the connection
-URI from it, and `MOTHERDUCK_PG_HOST` and `MOTHERDUCK_TEST_DATABASE` override the
+`test` GitHub environment; `ci/scripts/pre-test.sh` builds the connection URI
+from it, and `MOTHERDUCK_PG_HOST` and `MOTHERDUCK_TEST_DATABASE` override the
 default host (`pg.us-east-1-aws.motherduck.com`) and database (`md:`). The
 validation suite still uses the Compose service.
 
