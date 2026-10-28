@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+license.tpl
 pixi.lock
 tests/testdata/numeric_roundtrip_fixtures.csv
 third_party/arrow-adbc/c/vendor/boost/int128.hpp
