@@ -50,7 +50,6 @@ gtest_discover_tests(motherduck_framework_test TEST_PREFIX framework.)
 add_executable(motherduck_driver_test driver_test.cc)
 target_link_libraries(motherduck_driver_test PRIVATE adbc_driver_motherduck
                                                      GTest::gtest_main)
-gtest_discover_tests(motherduck_driver_test TEST_PREFIX driver.)
 
 # Compile the complete inherited test suites even when no PostgreSQL server is
 # configured. The default test run exercises their server-independent cases.
@@ -97,3 +96,5 @@ if(WIN32)
                                $<TARGET_FILE_DIR:${test_target}>)
   endforeach()
 endif()
+
+gtest_discover_tests(motherduck_driver_test TEST_PREFIX driver.)
