@@ -30,6 +30,7 @@
 
 #include "database.h"
 #include "postgres_type.h"
+#include "result_helper.h"
 #include "type_resolver_init.h"
 
 namespace adbcpq {
@@ -565,36 +566,49 @@ TEST(PostgresTypeTest, PostgresTypeResolver) {
 }
 
 TEST(PostgresTypeTest, NullablePgTypeOids) {
-  auto missing = ParseNullablePgOid("", true);
+  auto missing = PqRecord{"", 0, true}.ParseIntegerOrZero();
   ASSERT_TRUE(missing.has_value());
   EXPECT_EQ(missing.value(), 0);
 
-  auto present = ParseNullablePgOid("23", false);
+  auto present = PqRecord{"23", 2, false}.ParseIntegerOrZero();
   ASSERT_TRUE(present.has_value());
   EXPECT_EQ(present.value(), 23);
 
-  EXPECT_FALSE(ParseNullablePgOid("", false).has_value());
-  EXPECT_FALSE(ParseNullablePgOid("nope", false).has_value());
+  EXPECT_FALSE(PqRecord({"", 0, false}).ParseIntegerOrZero().has_value());
+  EXPECT_FALSE(PqRecord({"nope", 4, false}).ParseIntegerOrZero().has_value());
+}
+
+// Mirrors InsertPgTypeResult for one MotherDuck pg_type row.
+static ArrowErrorCode InsertMotherDuckRow(PostgresTypeResolver& resolver,
+                                          PostgresTypeResolver::Item item) {
+  ResolveNumericTypreceive(&item);
+  return resolver.Insert(item, nullptr);
 }
 
 TEST(PostgresTypeTest, MotherDuckPgTypeCompatibility) {
-  PostgresTypeResolver::Item builtin = {
-      23, "int4", "2406", 0, 0, 0,
-  };
+  PostgresTypeResolver resolver;
   PostgresType type;
 
-  PostgresTypeResolver resolver;
+  PostgresTypeResolver::Item builtin = {23, "int4", "2406", 0, 0, 0};
+  ResolveNumericTypreceive(&builtin);
+  EXPECT_STREQ(builtin.typreceive, "int4recv");
   ASSERT_EQ(resolver.Insert(builtin, nullptr), NANOARROW_OK);
   ASSERT_EQ(resolver.Find(builtin.oid, &type, nullptr), NANOARROW_OK);
   EXPECT_EQ(type.type_id(), PostgresTypeId::kInt4);
-  EXPECT_STREQ(PostgresTyprecv(type.type_id()), "int4recv");
 
-  PostgresTypeResolver::Item unknown = {
-      90000, "motherduck_extension_type", "90001", 0, 0, 0,
-  };
-  ASSERT_EQ(resolver.Insert(unknown, nullptr), NANOARROW_OK);
-  ASSERT_EQ(resolver.Find(unknown.oid, &type, nullptr), NANOARROW_OK);
-  EXPECT_EQ(type.type_id(), PostgresTypeId::kUserDefined);
+  // Names alone don't make a type built-in: a user type named like a built-in, and
+  // pseudo-types without a built-in entry (record), stay opaque.
+  for (const auto& item : {
+           PostgresTypeResolver::Item{90000, "motherduck_extension_type", "90001", 0, 0,
+                                      0},
+           PostgresTypeResolver::Item{90002, "json", "323", 0, 0, 0},
+           PostgresTypeResolver::Item{2249, "record", "2402", 0, 0, 0},
+       }) {
+    SCOPED_TRACE(item.typname);
+    ASSERT_EQ(InsertMotherDuckRow(resolver, item), NANOARROW_OK);
+    ASSERT_EQ(resolver.Find(item.oid, &type, nullptr), NANOARROW_OK);
+    EXPECT_EQ(type.type_id(), PostgresTypeId::kUserDefined);
+  }
 
   nanoarrow::UniqueSchema schema;
   ArrowSchemaInit(schema.get());
@@ -611,31 +625,27 @@ TEST(PostgresTypeTest, MotherDuckArrayResolutionIsIndependentOfRowOrder) {
   PostgresTypeResolver resolver;
   PostgresType type;
 
-  PostgresTypeResolver::Item physical_array = {
-      1007, "_int4", "2400", 0, 0, 0,
+  // The physical array row comes before its element, and typarray is NULL (0), so the
+  // array is only resolvable from its own row on a later rebuild pass.
+  const PostgresTypeResolver::Item rows[] = {
+      {1007, "_int4", "2400", 0, 0, 0},
+      {23, "int4", "2406", 0, 0, 0},
   };
-  ASSERT_EQ(resolver.Insert(physical_array, nullptr), NANOARROW_OK);
+  EXPECT_NE(InsertMotherDuckRow(resolver, rows[0]), NANOARROW_OK);
+  for (int pass = 0; pass < 2; pass++) {
+    for (const auto& row : rows) {
+      InsertMotherDuckRow(resolver, row);
+    }
+  }
 
-  PostgresTypeResolver::Item element = {
-      23, "int4", "2406", 0, 0, 0,
-  };
-  ASSERT_EQ(resolver.Insert(element, nullptr), NANOARROW_OK);
-
-  PostgresTypeResolver::Item resolved_array = {
-      1007, "_int4", "array_recv", 23, 0, 0,
-  };
-  ASSERT_EQ(resolver.Insert(resolved_array, nullptr), NANOARROW_OK);
-
-  // Rebuilding retries every row; the physical row must not replace the array.
-  ASSERT_EQ(resolver.Insert(physical_array, nullptr), NANOARROW_OK);
-  ASSERT_EQ(resolver.Find(physical_array.oid, &type, nullptr), NANOARROW_OK);
+  ASSERT_EQ(resolver.Find(1007, &type, nullptr), NANOARROW_OK);
   EXPECT_EQ(type.type_id(), PostgresTypeId::kArray);
   ASSERT_EQ(type.n_children(), 1);
   EXPECT_EQ(type.child(0).type_id(), PostgresTypeId::kInt4);
 
-  ASSERT_EQ(resolver.FindArray(element.oid, &type, nullptr), NANOARROW_OK);
-  EXPECT_EQ(type.oid(), physical_array.oid);
-  EXPECT_NE(resolver.GetOID(PostgresTypeId::kUserDefined), physical_array.oid);
+  ASSERT_EQ(resolver.FindArray(23, &type, nullptr), NANOARROW_OK);
+  EXPECT_EQ(type.oid(), 1007);
+  EXPECT_EQ(resolver.GetOID(PostgresTypeId::kUserDefined), 0);
 }
 
 TEST(PostgresTypeTest, PostgresTypeResolveRecord) {

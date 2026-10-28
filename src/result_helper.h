@@ -68,6 +68,14 @@ struct PqRecord {
     }
   }
 
+  // MotherDuck returns NULL for unused OID columns such as typarray.
+  Result<int64_t> ParseIntegerOrZero() const {
+    if (is_null) {
+      return int64_t{0};
+    }
+    return ParseInteger();
+  }
+
   Result<std::vector<std::string>> ParseTextArray() const {
     std::string text_array(data, len);
     text_array.erase(0, 1);

@@ -27,8 +27,11 @@
 
 #include "type_resolver_init.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -45,6 +48,22 @@ Status InitializeTypeResolver(PostgresTypeResolver& resolver) {
     UNWRAP_NANOARROW(na_error, Internal, resolver.Insert(item, &na_error));
   }
   return Status::Ok();
+}
+
+void ResolveNumericTypreceive(PostgresTypeResolver::Item* item) {
+  const std::string_view typreceive(item->typreceive);
+  if (typreceive.empty() || !std::all_of(typreceive.begin(), typreceive.end(),
+                                         [](char c) { return c >= '0' && c <= '9'; })) {
+    return;
+  }
+
+  for (const auto& builtin : kBuiltinTypeItems) {
+    if (builtin.oid == item->oid && std::strcmp(builtin.typname, item->typname) == 0) {
+      item->typreceive = builtin.typreceive;
+      item->child_oid = builtin.child_oid;
+      return;
+    }
+  }
 }
 
 static Status InsertPgAttributeResult(const PqResultHelper& result,
@@ -102,13 +121,13 @@ static Status InsertPgTypeResult(const PqResultHelper& result,
     const char* typname = item[1].data;
     const char* typreceive = item[2].data;
     int64_t typbasetype;
-    UNWRAP_RESULT(typbasetype, ParseNullablePgOid(item[3].value(), item[3].is_null));
+    UNWRAP_RESULT(typbasetype, item[3].ParseIntegerOrZero());
     int64_t typrelid;
-    UNWRAP_RESULT(typrelid, ParseNullablePgOid(item[4].value(), item[4].is_null));
+    UNWRAP_RESULT(typrelid, item[4].ParseIntegerOrZero());
 
     int64_t typarray;
     if (num_cols == 6) {
-      UNWRAP_RESULT(typarray, ParseNullablePgOid(item[5].value(), item[5].is_null));
+      UNWRAP_RESULT(typarray, item[5].ParseIntegerOrZero());
     } else {
       typarray = 0;
     }
@@ -121,8 +140,10 @@ static Status InsertPgTypeResult(const PqResultHelper& result,
     type_item.oid = static_cast<uint32_t>(oid);
     type_item.typname = typname;
     type_item.typreceive = typreceive;
+    type_item.child_oid = 0;
     type_item.class_oid = static_cast<uint32_t>(typrelid);
     type_item.base_oid = static_cast<uint32_t>(typbasetype);
+    ResolveNumericTypreceive(&type_item);
 
     // XXX: it seems to be intentional that we ignore errors here?
     int insert_result = resolver.Insert(type_item, nullptr);
