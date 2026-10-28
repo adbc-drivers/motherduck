@@ -86,6 +86,12 @@ export MOTHERDUCK_TEST_POSTGRESQL=ON
 ./ci/scripts/test.sh macos arm64
 ```
 
+CI runs these tests against MotherDuck's Postgres endpoint instead of a local
+PostgreSQL server. It needs a `MOTHERDUCK_TOKEN` repository secret;
+`ci/scripts/pre-test.sh` builds the connection URI from it, and
+`MOTHERDUCK_PG_HOST` and `MOTHERDUCK_TEST_DATABASE` override the default host
+(`pg.us-east-1-aws.motherduck.com`) and database (`md:`).
+
 These tests exercise PostgreSQL compatibility. The inherited Python files in
 `validation/` still target PostgreSQL; MotherDuck validation and published
 validation documentation will be configured separately.
