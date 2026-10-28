@@ -22,7 +22,6 @@
 
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -68,16 +67,13 @@ class PostgresDatabase {
     return type_resolver_;
   }
 
-  Status InitVersions(PGconn* conn);
   std::string_view VendorName() { return "PostgreSQL"; }
-  const std::array<int, 3>& VendorVersion() { return postgres_server_version_; }
   bool use_copy() const { return use_copy_; }
 
  private:
   int32_t open_connections_;
   std::string uri_;
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
-  std::array<int, 3> postgres_server_version_{};
   bool use_copy_ = true;
   TypeResolverMode type_resolver_mode_ = TypeResolverMode::kServer;
 };

@@ -1318,8 +1318,4 @@ AdbcStatusCode PostgresConnection::SetOptionInt(const char* key, int64_t value,
 
 std::string_view PostgresConnection::VendorName() { return database_->VendorName(); }
 
-const std::array<int, 3>& PostgresConnection::VendorVersion() {
-  return database_->VendorVersion();
-}
-
 }  // namespace adbcpq
