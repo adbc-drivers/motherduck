@@ -62,4 +62,8 @@ uri+="?sslmode=verify-full&sslrootcert=${ca_bundle}"
 {
   printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$uri"
   printf 'PGPASSWORD=%q\n' "$MOTHERDUCK_TOKEN"
+  # The tests' expected catalog; with md: it's the account's default database.
+  if [[ "$database" != "md:" ]]; then
+    printf 'MOTHERDUCK_TEST_CATALOG=%q\n' "$database"
+  fi
 } > "${repo_root}/.env.override"

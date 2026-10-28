@@ -72,13 +72,11 @@ add_executable(motherduck_copy_test copy/postgres_copy_reader_test.cc
 target_link_libraries(motherduck_copy_test
                       PRIVATE adbc_driver_motherduck adbc_driver_motherduck_impl
                               adbc_validation GTest::gmock_main)
-add_test(NAME copy_unit COMMAND motherduck_copy_test
-                                --gtest_filter=PostgresCopyUtilsTest.*)
+add_test(NAME copy_unit COMMAND motherduck_copy_test)
 
 if(MOTHERDUCK_TEST_POSTGRESQL)
   add_test(NAME postgresql_integration COMMAND motherduck_postgresql_test)
-  add_test(NAME copy_integration COMMAND motherduck_copy_test)
-  set_tests_properties(postgresql_integration copy_integration
+  set_tests_properties(postgresql_integration
                        PROPERTIES LABELS
                                   postgresql
                                   RUN_SERIAL

@@ -34,6 +34,7 @@
 #include "copy/writer.h"
 #include "database.h"
 #include "postgres_copy_test_common.h"
+#include "type_resolver_init.h"
 #include "validation/adbc_validation_util.h"
 
 using adbc_validation::IsOkStatus;
@@ -102,38 +103,16 @@ class PostgresCopyStreamWriteTester {
   PostgresCopyStreamWriter writer_;
 };
 
-static AdbcStatusCode SetupDatabase(struct AdbcDatabase* database,
-                                    struct AdbcError* error) {
-  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
-  if (!uri) {
-    ADD_FAILURE() << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
-    return ADBC_STATUS_INVALID_ARGUMENT;
-  }
-  return AdbcDatabaseSetOption(database, "uri", uri, error);
-}
-
 class PostgresCopyTest : public ::testing::Test {
  public:
   void SetUp() override {
-    ASSERT_THAT(AdbcDatabaseNew(&database_, &error_), IsOkStatus(&error_));
-    ASSERT_THAT(SetupDatabase(&database_, &error_), IsOkStatus(&error_));
-    ASSERT_THAT(AdbcDatabaseInit(&database_, &error_), IsOkStatus(&error_));
-
-    const auto pg_db =
-        *reinterpret_cast<std::shared_ptr<PostgresDatabase>*>(database_.private_data);
-    type_resolver_ = pg_db->type_resolver();
-  }
-  void TearDown() override {
-    if (database_.private_data) {
-      ASSERT_THAT(AdbcDatabaseRelease(&database_, &error_), IsOkStatus(&error_));
-    }
-
-    if (error_.release) error_.release(&error_);
+    // These tests check the COPY encoder's bytes, so the built-in type table is
+    // enough and they don't need a server.
+    type_resolver_ = std::make_shared<PostgresTypeResolver>();
+    ASSERT_TRUE(InternalAdbcInitializeTypeResolver(*type_resolver_).ok());
   }
 
  protected:
-  struct AdbcError error_ = {};
-  struct AdbcDatabase database_ = {};
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
 };
 
@@ -1201,25 +1180,13 @@ using TimestampTestParamType =
 class PostgresCopyWriteTimestampTest
     : public testing::TestWithParam<TimestampTestParamType> {
   void SetUp() override {
-    ASSERT_THAT(AdbcDatabaseNew(&database_, &error_), IsOkStatus(&error_));
-    ASSERT_THAT(SetupDatabase(&database_, &error_), IsOkStatus(&error_));
-    ASSERT_THAT(AdbcDatabaseInit(&database_, &error_), IsOkStatus(&error_));
-
-    const auto pg_db =
-        *reinterpret_cast<std::shared_ptr<PostgresDatabase>*>(database_.private_data);
-    type_resolver_ = pg_db->type_resolver();
-  }
-  void TearDown() override {
-    if (database_.private_data) {
-      ASSERT_THAT(AdbcDatabaseRelease(&database_, &error_), IsOkStatus(&error_));
-    }
-
-    if (error_.release) error_.release(&error_);
+    // These tests check the COPY encoder's bytes, so the built-in type table is
+    // enough and they don't need a server.
+    type_resolver_ = std::make_shared<PostgresTypeResolver>();
+    ASSERT_TRUE(InternalAdbcInitializeTypeResolver(*type_resolver_).ok());
   }
 
  protected:
-  struct AdbcError error_ = {};
-  struct AdbcDatabase database_ = {};
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
 };
 
@@ -1350,25 +1317,13 @@ using DurationTestParamType =
 class PostgresCopyWriteDurationTest
     : public testing::TestWithParam<DurationTestParamType> {
   void SetUp() override {
-    ASSERT_THAT(AdbcDatabaseNew(&database_, &error_), IsOkStatus(&error_));
-    ASSERT_THAT(SetupDatabase(&database_, &error_), IsOkStatus(&error_));
-    ASSERT_THAT(AdbcDatabaseInit(&database_, &error_), IsOkStatus(&error_));
-
-    const auto pg_db =
-        *reinterpret_cast<std::shared_ptr<PostgresDatabase>*>(database_.private_data);
-    type_resolver_ = pg_db->type_resolver();
-  }
-  void TearDown() override {
-    if (database_.private_data) {
-      ASSERT_THAT(AdbcDatabaseRelease(&database_, &error_), IsOkStatus(&error_));
-    }
-
-    if (error_.release) error_.release(&error_);
+    // These tests check the COPY encoder's bytes, so the built-in type table is
+    // enough and they don't need a server.
+    type_resolver_ = std::make_shared<PostgresTypeResolver>();
+    ASSERT_TRUE(InternalAdbcInitializeTypeResolver(*type_resolver_).ok());
   }
 
  protected:
-  struct AdbcError error_ = {};
-  struct AdbcDatabase database_ = {};
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
 };
 
@@ -1495,25 +1450,13 @@ TEST_F(PostgresCopyTest, PostgresCopyWriteBinary) {
 class PostgresCopyListTest : public testing::TestWithParam<enum ArrowType> {
  public:
   void SetUp() override {
-    ASSERT_THAT(AdbcDatabaseNew(&database_, &error_), IsOkStatus(&error_));
-    ASSERT_THAT(SetupDatabase(&database_, &error_), IsOkStatus(&error_));
-    ASSERT_THAT(AdbcDatabaseInit(&database_, &error_), IsOkStatus(&error_));
-
-    const auto pg_db =
-        *reinterpret_cast<std::shared_ptr<PostgresDatabase>*>(database_.private_data);
-    type_resolver_ = pg_db->type_resolver();
-  }
-  void TearDown() override {
-    if (database_.private_data) {
-      ASSERT_THAT(AdbcDatabaseRelease(&database_, &error_), IsOkStatus(&error_));
-    }
-
-    if (error_.release) error_.release(&error_);
+    // These tests check the COPY encoder's bytes, so the built-in type table is
+    // enough and they don't need a server.
+    type_resolver_ = std::make_shared<PostgresTypeResolver>();
+    ASSERT_TRUE(InternalAdbcInitializeTypeResolver(*type_resolver_).ok());
   }
 
  protected:
-  struct AdbcError error_ = {};
-  struct AdbcDatabase database_ = {};
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
 };
 
