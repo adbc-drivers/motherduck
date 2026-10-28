@@ -38,7 +38,7 @@ _database_args = {
 class PostgreSQLQuirks(model.DriverQuirks):
     name = "postgresql"
     driver = "adbc_driver_postgresql"
-    driver_name = "ADBC PostgreSQL Driver"
+    driver_name = "ADBC MotherDuck Driver"
     vendor_name = "PostgreSQL"
     vendor_version = re.compile(r"18[0-9]{4}")
     short_version = "18"
