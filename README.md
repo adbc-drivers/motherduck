@@ -95,6 +95,13 @@ building to disable database tests, or `ON` to enable them on another platform
 with an available PostgreSQL server. CI starts the service and loads `.env.linux`
 only on Linux.
 
+In CI, the C++ tests run against MotherDuck's Postgres endpoint instead of the
+Compose service. The test job uses the `MOTHERDUCK_TOKEN` secret from the
+`test` GitHub environment; `ci/scripts/pre-test.sh` builds the connection URI
+from it, and `MOTHERDUCK_PG_HOST` and `MOTHERDUCK_TEST_DATABASE` override the
+default host (`pg.us-east-1-aws.motherduck.com`) and database (`md:`). The
+validation suite still uses the Compose service.
+
 These tests exercise PostgreSQL compatibility. The inherited Python files in
 `validation/` still target PostgreSQL; MotherDuck validation and published
 validation documentation will be configured separately.

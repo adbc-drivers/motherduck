@@ -35,7 +35,9 @@ add_library(adbc_validation STATIC
             ${ADBC_UPSTREAM_C}/validation/adbc_validation_database.cc
             ${ADBC_UPSTREAM_C}/validation/adbc_validation_statement.cc
             ${ADBC_UPSTREAM_C}/validation/adbc_validation_util.cc)
-target_link_libraries(adbc_validation PUBLIC adbc_driver_common GTest::gmock)
+# The validation helpers call the ADBC API, which the driver library provides.
+target_link_libraries(adbc_validation PUBLIC adbc_driver_common adbc_driver_motherduck
+                                             GTest::gmock)
 
 add_executable(motherduck_common_test ${ADBC_UPSTREAM_C}/driver/common/utils_test.cc)
 target_link_libraries(motherduck_common_test PRIVATE adbc_driver_common GTest::gmock_main)
@@ -71,13 +73,11 @@ add_executable(motherduck_copy_test copy/postgres_copy_reader_test.cc
 target_link_libraries(motherduck_copy_test
                       PRIVATE adbc_driver_motherduck adbc_driver_motherduck_impl
                               adbc_validation GTest::gmock_main)
-add_test(NAME copy_unit COMMAND motherduck_copy_test
-                                --gtest_filter=PostgresCopyUtilsTest.*)
+add_test(NAME copy_unit COMMAND motherduck_copy_test)
 
 if(MOTHERDUCK_TEST_POSTGRESQL)
   add_test(NAME postgresql_integration COMMAND motherduck_postgresql_test)
-  add_test(NAME copy_integration COMMAND motherduck_copy_test)
-  set_tests_properties(postgresql_integration copy_integration
+  set_tests_properties(postgresql_integration
                        PROPERTIES LABELS
                                   postgresql
                                   RUN_SERIAL

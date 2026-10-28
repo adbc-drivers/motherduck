@@ -55,6 +55,7 @@ jobs:
           - { platform: linux, arch: amd64, runner: ubuntu-latest }
           - { platform: macos, arch: arm64, runner: macos-latest }
           - { platform: windows, arch: amd64, runner: windows-latest }
+    environment: test
     permissions:
       contents: read
       packages: read
@@ -119,6 +120,8 @@ jobs:
           fi
 
       - name: Test
+        env:
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }} # zizmor: ignore[secrets-outside-env]
         working-directory: .
         run: |
           set -a
