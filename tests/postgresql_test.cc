@@ -296,6 +296,10 @@ class MotherDuckTestDatabase : public ::testing::Environment {
     ASSERT_THAT(AdbcDatabaseNew(&database.value, &error.value), IsOkStatus(&error.value));
     ASSERT_THAT(quirks_.SetupDatabase(&database.value, setup_uri_.c_str(), &error.value),
                 IsOkStatus(&error.value));
+    // Single attach mode can't connect to md:.
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      "workspace", &error.value),
+                IsOkStatus(&error.value));
     ASSERT_THAT(AdbcDatabaseInit(&database.value, &error.value),
                 IsOkStatus(&error.value));
     ASSERT_THAT(AdbcConnectionNew(&connection.value, &error.value),

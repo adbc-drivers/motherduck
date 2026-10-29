@@ -81,8 +81,7 @@ cmake --install build/debug --prefix build/install
 and `workspace` attaches every database in the account. The driver adds
 `--attach_mode=<mode>` to libpq's `options`, after any session options from
 the URI or `PGOPTIONS`. If those already set `attach_mode`, they win.
-Single mode needs a named database, so connect to a database by name rather
-than `md:`.
+Single mode needs a named database; to connect to `md:`, set `workspace`.
 
 ## Inherited tests
 
@@ -111,9 +110,9 @@ Compose service. The test job uses the `MOTHERDUCK_TOKEN` secret from the
 `test` GitHub environment; `ci/scripts/pre-test.sh` builds the connection URI
 from it. Each job gets a fresh database, `adbc_ci_<run>_<platform>_<arch>`,
 which the tests create before they start and drop when they finish, so
-concurrent jobs and runs don't share tables. Test connections use
-`attach_mode=single`, so other databases in the account stay out of catalog
-queries. `MOTHERDUCK_PG_HOST` overrides the default host
+concurrent jobs and runs don't share tables. Test connections use the
+driver's default `attach_mode=single`, so other databases in the account stay
+out of catalog queries. `MOTHERDUCK_PG_HOST` overrides the default host
 (`pg.us-east-1-aws.motherduck.com`); `MOTHERDUCK_TEST_DATABASE` names an
 existing database to use instead, which the tests leave in place. The validation
 suite still uses the Compose service.

@@ -68,20 +68,13 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 
 uri_for() {
-  printf 'postgresql://postgres@%s:5432/%s?sslmode=verify-full&sslrootcert=%s%s' \
-    "$host" "${1//:/%3A}" "$ca_bundle" "${2:-}"
+  printf 'postgresql://postgres@%s:5432/%s?sslmode=verify-full&sslrootcert=%s' \
+    "$host" "${1//:/%3A}" "$ca_bundle"
 }
 
 # PGPASSWORD rather than the URI keeps the token out of test output.
 {
-  # With a named database, attach only that one so other databases' tables
-  # don't show up in catalog queries.
-  if [[ "$database" == "md:" ]]; then
-    printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$(uri_for "$database")"
-  else
-    printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' \
-      "$(uri_for "$database" '&options=--attach_mode%3Dsingle')"
-  fi
+  printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$(uri_for "$database")"
   printf 'PGPASSWORD=%q\n' "$MOTHERDUCK_TOKEN"
   # With md:, the tests fall back to the account's default database.
   if [[ "$database" != "md:" ]]; then
