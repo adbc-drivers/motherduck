@@ -40,9 +40,13 @@ class PostgreSQLQuirks(model.DriverQuirks):
     name = "postgresql"
     driver = "adbc_driver_postgresql"
     driver_name = "ADBC MotherDuck Driver"
-    vendor_name = "PostgreSQL"
-    vendor_version = re.compile(r"18[0-9]{4}")
-    short_version = "18"
+    # The driver still reports PostgreSQL and the endpoint's server_version_num
+    # (https://github.com/adbc-drivers/motherduck/issues/15).
+    vendor_name = "MotherDuck"
+    vendor_version = re.compile(r"[0-9]{6}")
+    # MotherDuck is a service with no version to pin, so the docs label the
+    # results "latest".
+    short_version = "latest"
     features = model.DriverFeatures(
         connection_get_table_schema=True,
         connection_transactions=True,
@@ -113,6 +117,6 @@ class PostgreSQLQuirks(model.DriverQuirks):
 @functools.cache
 def get_quirks(version: str) -> PostgreSQLQuirks:
     quirks = PostgreSQLQuirks()
-    if version != quirks.short_version and version != "latest":
-        raise ValueError(f"Unsupported PostgreSQL version: {version}")
+    if version != quirks.short_version:
+        raise ValueError(f"Unsupported MotherDuck version: {version}")
     return quirks

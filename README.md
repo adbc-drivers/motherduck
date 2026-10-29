@@ -107,10 +107,11 @@ queries. `MOTHERDUCK_PG_HOST` overrides the default host
 (`pg.us-east-1-aws.motherduck.com`); `MOTHERDUCK_TEST_DATABASE` names an
 existing database to use instead, which the tests leave in place.
 
-These tests exercise PostgreSQL compatibility. The validation suite's quirks in
-`validation/tests/postgresql.py` still describe the driver as PostgreSQL apart
-from the catalog, schema and temporary tables; published validation
-documentation will be configured separately.
+The validation suite's quirks in `validation/tests/postgresql.py` describe
+MotherDuck: its catalog, `main` schema, no temporary tables, and the vendor
+name `MotherDuck`. The driver still reports itself as PostgreSQL (#15), so the
+vendor check fails until that's fixed. Published validation documentation will
+be configured separately.
 
 ## Upstream history and licensing
 

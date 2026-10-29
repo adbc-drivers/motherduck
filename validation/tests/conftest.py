@@ -42,7 +42,7 @@ from .postgresql import get_quirks
 
 def pytest_addoption(parser) -> None:
     adbc_drivers_validation.tests.conftest.pytest_addoption(parser)
-    parser.addoption("--vendor-version", action="store", default="18")
+    parser.addoption("--vendor-version", action="store", default="latest")
 
 
 @pytest.fixture(scope="session")
