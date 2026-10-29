@@ -81,10 +81,8 @@ cmake --install build/debug --prefix build/install
 and `workspace` attaches every database in the account. The driver adds
 `--attach_mode=<mode>` to libpq's `options`, after any session options from
 the URI or `PGOPTIONS`. If those already set `attach_mode`, they win.
-
-Single mode needs a named database, so if the option isn't set the driver
-leaves the attach mode alone for `md:` connections and for hosts outside
-`*.motherduck.com`, such as a local PostgreSQL server used for testing.
+Single mode needs a named database, so connect to a database by name rather
+than `md:`.
 
 ## Inherited tests
 

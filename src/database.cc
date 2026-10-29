@@ -46,20 +46,13 @@ namespace adbcpq {
 
 std::string AddAttachMode(std::string_view options, std::string_view attach_mode) {
   std::string result(options);
-  if (attach_mode.empty() || options.find("attach_mode") != std::string_view::npos) {
+  if (options.find("attach_mode") != std::string_view::npos) {
     return result;
   }
   if (!result.empty()) result += ' ';
   result += "--attach_mode=";
   result += attach_mode;
   return result;
-}
-
-bool UseDefaultAttachMode(std::string_view host, std::string_view dbname) {
-  constexpr std::string_view kSuffix = ".motherduck.com";
-  return host.size() > kSuffix.size() &&
-         host.substr(host.size() - kSuffix.size()) == kSuffix && !dbname.empty() &&
-         dbname != "md:";
 }
 
 PostgresDatabase::PostgresDatabase() : open_connections_(0) {
@@ -178,7 +171,6 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
     attach_mode_ = value;
-    attach_mode_set_ = true;
   } else {
     InternalAdbcSetError(error, "%s%s", "[libpq] Unknown database option ", key);
     return ADBC_STATUS_NOT_IMPLEMENTED;
@@ -225,28 +217,18 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
   std::vector<const char*> keywords;
   std::vector<const char*> values;
   const char* options = std::getenv("PGOPTIONS");
-  const char* host = std::getenv("PGHOST");
-  const char* dbname = std::getenv("PGDATABASE");
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
     if (option->val == nullptr) continue;
     if (std::strcmp(option->keyword, "options") == 0) {
       options = option->val;
       continue;
     }
-    if (std::strcmp(option->keyword, "host") == 0) host = option->val;
-    if (std::strcmp(option->keyword, "dbname") == 0) dbname = option->val;
     keywords.push_back(option->keyword);
     values.push_back(option->val);
   }
-  std::string_view attach_mode;
-  if (attach_mode_set_ || UseDefaultAttachMode(host ? host : "", dbname ? dbname : "")) {
-    attach_mode = attach_mode_;
-  }
-  std::string session_options = AddAttachMode(options ? options : "", attach_mode);
-  if (!session_options.empty()) {
-    keywords.push_back("options");
-    values.push_back(session_options.c_str());
-  }
+  std::string session_options = AddAttachMode(options ? options : "", attach_mode_);
+  keywords.push_back("options");
+  values.push_back(session_options.c_str());
   keywords.push_back(nullptr);
   values.push_back(nullptr);
 

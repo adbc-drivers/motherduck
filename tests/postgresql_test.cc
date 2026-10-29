@@ -39,7 +39,6 @@
 #include <arrow-adbc/driver/postgresql.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
-#include <libpq-fe.h>
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow.hpp>
 
@@ -532,20 +531,6 @@ TEST(MotherDuckAttachModeTest, AddAttachMode) {
             adbcpq::AddAttachMode("--attach_mode=workspace", "single"));
   EXPECT_EQ("-c attach_mode=workspace",
             adbcpq::AddAttachMode("-c attach_mode=workspace", "single"));
-  // No mode leaves the options alone.
-  EXPECT_EQ("", adbcpq::AddAttachMode("", ""));
-  EXPECT_EQ("--session_name=x", adbcpq::AddAttachMode("--session_name=x", ""));
-}
-
-TEST(MotherDuckAttachModeTest, UseDefaultAttachMode) {
-  EXPECT_TRUE(adbcpq::UseDefaultAttachMode("pg.us-east-1-aws.motherduck.com", "my_db"));
-  // Single mode needs a named database.
-  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("pg.us-east-1-aws.motherduck.com", "md:"));
-  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("pg.us-east-1-aws.motherduck.com", ""));
-  // Other servers reject the unknown attach_mode parameter.
-  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("localhost", "postgres"));
-  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("", "postgres"));
-  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("motherduck.com.example.org", "my_db"));
 }
 
 class PostgresConnectionTest : public ::testing::Test,
@@ -658,21 +643,6 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogs) {
 
 // With the default attach_mode=single, only the connected database is a catalog.
 TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachModeSingle) {
-  char* parse_error = nullptr;
-  PQconninfoOption* conninfo =
-      PQconninfoParse(std::getenv("ADBC_POSTGRESQL_TEST_URI"), &parse_error);
-  ASSERT_NE(conninfo, nullptr) << parse_error;
-  std::string dbname;
-  for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
-    if (std::strcmp(option->keyword, "dbname") == 0 && option->val) {
-      dbname = option->val;
-    }
-  }
-  PQconninfoFree(conninfo);
-  if (dbname.empty() || dbname == "md:") {
-    GTEST_SKIP() << "attach_mode=single needs a named database, not md:";
-  }
-
   ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
 
@@ -695,8 +665,9 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachModeSingle) {
     catalogs.emplace_back(name.data, name.size_bytes);
   }
   // DuckDB's built-in system and temp catalogs may also be listed.
-  EXPECT_THAT(catalogs, ::testing::Contains(dbname));
-  EXPECT_THAT(catalogs, ::testing::Each(::testing::AnyOf(dbname, "system", "temp")));
+  const std::string catalog = quirks()->catalog();
+  EXPECT_THAT(catalogs, ::testing::Contains(catalog));
+  EXPECT_THAT(catalogs, ::testing::Each(::testing::AnyOf(catalog, "system", "temp")));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
