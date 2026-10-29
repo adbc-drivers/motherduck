@@ -2700,6 +2700,27 @@ TEST_F(PostgresStatementTest, MultipleStatementsSingleQuery) {
   ASSERT_EQ(reader.array->length, 3);
 }
 
+TEST_F(PostgresStatementTest, MultipleStatementsSingleQueryError) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // The failing statement reports its own error and stops the ones after it.
+  const char* query = R"(DROP TABLE IF EXISTS test_query_statements_error;
+            SELECT * FROM test_query_statements_missing;
+            CREATE TABLE test_query_statements_error (ints INT);)";
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  ASSERT_EQ("42P01", std::string_view(error.sqlstate, 5));
+  error.release(&error);
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "SELECT * FROM test_query_statements_error", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  error.release(&error);
+}
+
 TEST_F(PostgresStatementTest, SetUseCopyFalse) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 

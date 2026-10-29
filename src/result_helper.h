@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -145,6 +146,10 @@ class PqResultHelper {
   Status Execute(const std::vector<std::string>& params = {},
                  PostgresType* param_types = nullptr);
   Status ExecuteCopy();
+  // Run each statement in turn through one pipeline. The endpoint binds every
+  // statement of a multi-statement simple query before running any of them, so
+  // later statements can't see objects created by earlier ones.
+  Status ExecutePipeline(const std::vector<std::string>& statements);
   Status ResolveParamTypes(PostgresTypeResolver& type_resolver,
                            PostgresType* param_types);
   Status ResolveOutputTypes(PostgresTypeResolver& type_resolver,
@@ -219,5 +224,10 @@ class PqResultHelper {
 
   Status PrepareInternal(int n_params, const Oid* param_oids) const;
 };
+
+// Split a query on the semicolons between its statements, skipping those inside
+// string literals, quoted identifiers, dollar quotes and comments. Statements
+// with nothing but whitespace or comments are dropped.
+std::vector<std::string> SplitStatements(std::string_view query);
 
 }  // namespace adbcpq

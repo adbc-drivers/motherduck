@@ -27,9 +27,11 @@
 
 #include "result_helper.h"
 
+#include <cctype>
 #include <charconv>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "driver/framework/status.h"
@@ -77,6 +79,11 @@ Status PqResultHelper::DescribePrepared() {
 Status PqResultHelper::Execute(const std::vector<std::string>& params,
                                PostgresType* param_types) {
   if (params.size() == 0 && param_types == nullptr && output_format_ == Format::kText) {
+    std::vector<std::string> statements = SplitStatements(query_);
+    if (statements.size() > 1) {
+      return ExecutePipeline(statements);
+    }
+
     ClearResult();
     result_ = PQexec(conn_, query_.c_str());
   } else {
@@ -113,6 +120,74 @@ Status PqResultHelper::Execute(const std::vector<std::string>& params,
   }
 
   return Status::Ok();
+}
+
+Status PqResultHelper::ExecutePipeline(const std::vector<std::string>& statements) {
+  ClearResult();
+  if (PQenterPipelineMode(conn_) != 1) {
+    return MakeStatus(nullptr, "[libpq] Failed to enter pipeline mode: {}",
+                      PQerrorMessage(conn_));
+  }
+
+  // Queue every statement ahead of one sync, so the server skips the rest
+  // once one fails, as it would for a multi-statement simple query.
+  Status status;
+  for (const auto& statement : statements) {
+    if (PQsendQueryParams(conn_, statement.c_str(), /*nParams=*/0,
+                          /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
+                          /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
+                          static_cast<int>(Format::kText)) != 1) {
+      status = MakeStatus(nullptr, "[libpq] Failed to send query '{}': {}", statement,
+                          PQerrorMessage(conn_));
+      break;
+    }
+  }
+  if (PQpipelineSync(conn_) != 1 && status.ok()) {
+    status =
+        MakeStatus(nullptr, "[libpq] Failed to sync pipeline: {}", PQerrorMessage(conn_));
+  }
+
+  // Drain everything up to the sync, keeping the last statement's result (as
+  // PQexec would) or the first error. libpq returns null after each statement's
+  // results; two nulls in a row means nothing more is coming, e.g. because the
+  // sync was never sent or the connection dropped.
+  size_t index = 0;
+  bool previous_null = false;
+  while (true) {
+    PGresult* result = PQgetResult(conn_);
+    if (result == nullptr) {
+      if (previous_null) break;
+      previous_null = true;
+      index++;
+      continue;
+    }
+    previous_null = false;
+
+    ExecStatusType result_status = PQresultStatus(result);
+    if (result_status == PGRES_PIPELINE_SYNC) {
+      PQclear(result);
+      break;
+    }
+
+    if (!status.ok()) {
+      PQclear(result);
+    } else if (result_status == PGRES_TUPLES_OK || result_status == PGRES_COMMAND_OK ||
+               result_status == PGRES_EMPTY_QUERY) {
+      SetResult(result);
+    } else {
+      SetResult(result);
+      status = MakeStatus(result_, "[libpq] Failed to execute query '{}': {}",
+                          index < statements.size() ? statements[index] : query_,
+                          PQresultErrorMessage(result_));
+    }
+  }
+
+  if (PQexitPipelineMode(conn_) != 1 && status.ok()) {
+    status = MakeStatus(nullptr, "[libpq] Failed to exit pipeline mode: {}",
+                        PQerrorMessage(conn_));
+  }
+
+  return status;
 }
 
 Status PqResultHelper::ExecuteCopy() {
@@ -221,6 +296,127 @@ int64_t PqResultHelper::AffectedRows() const {
   } else {
     return -1;
   }
+}
+
+namespace {
+
+bool IsIdentifierChar(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) || c == '_' ||
+         static_cast<unsigned char>(c) >= 0x80;
+}
+
+// Return the index just past the literal or identifier quoted by query[start].
+size_t SkipQuoted(std::string_view query, size_t start, bool backslash_escapes) {
+  const char quote = query[start];
+  size_t i = start + 1;
+  while (i < query.size()) {
+    if (backslash_escapes && query[i] == '\\') {
+      i += 2;
+    } else if (query[i] == quote) {
+      // A doubled quote stands for itself.
+      if (i + 1 < query.size() && query[i + 1] == quote) {
+        i += 2;
+      } else {
+        return i + 1;
+      }
+    } else {
+      i++;
+    }
+  }
+  return query.size();
+}
+
+// Return the "$tag$" opening a dollar quote at query[start], or an empty view
+// if there isn't one (e.g. a $1 parameter or a $ inside an identifier).
+std::string_view DollarQuoteTag(std::string_view query, size_t start) {
+  if (query[start] != '$') return {};
+  if (start > 0 && IsIdentifierChar(query[start - 1])) return {};
+  size_t i = start + 1;
+  if (i < query.size() && std::isdigit(static_cast<unsigned char>(query[i]))) return {};
+  while (i < query.size() && IsIdentifierChar(query[i])) i++;
+  if (i < query.size() && query[i] == '$') return query.substr(start, i - start + 1);
+  return {};
+}
+
+std::string_view TrimWhitespace(std::string_view text) {
+  size_t begin = 0;
+  size_t end = text.size();
+  while (begin < end && std::isspace(static_cast<unsigned char>(text[begin]))) begin++;
+  while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) end--;
+  return text.substr(begin, end - begin);
+}
+
+}  // namespace
+
+std::vector<std::string> SplitStatements(std::string_view query) {
+  std::vector<std::string> statements;
+  size_t start = 0;
+  // Whether the current statement has anything besides whitespace and comments
+  bool has_content = false;
+
+  auto finish_statement = [&](size_t end) {
+    if (has_content) {
+      statements.emplace_back(TrimWhitespace(query.substr(start, end - start)));
+    }
+    start = end + 1;
+    has_content = false;
+  };
+
+  size_t i = 0;
+  while (i < query.size()) {
+    const char c = query[i];
+    const char next = i + 1 < query.size() ? query[i + 1] : '\0';
+
+    if (c == '-' && next == '-') {
+      i = query.find('\n', i);
+      if (i == std::string_view::npos) i = query.size();
+      continue;
+    }
+    if (c == '/' && next == '*') {
+      // Block comments nest.
+      int depth = 1;
+      i += 2;
+      while (i < query.size() && depth > 0) {
+        if (query.compare(i, 2, "/*") == 0) {
+          depth++;
+          i += 2;
+        } else if (query.compare(i, 2, "*/") == 0) {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(c))) {
+      i++;
+      continue;
+    }
+    if (c == ';') {
+      finish_statement(i);
+      i++;
+      continue;
+    }
+
+    has_content = true;
+    if (c == '\'') {
+      // E'...' strings take backslash escapes.
+      const bool escape_string = i > 0 && (query[i - 1] == 'E' || query[i - 1] == 'e') &&
+                                 !(i > 1 && IsIdentifierChar(query[i - 2]));
+      i = SkipQuoted(query, i, escape_string);
+    } else if (c == '"') {
+      i = SkipQuoted(query, i, /*backslash_escapes=*/false);
+    } else if (std::string_view tag = DollarQuoteTag(query, i); !tag.empty()) {
+      size_t close = query.find(tag, i + tag.size());
+      i = close == std::string_view::npos ? query.size() : close + tag.size();
+    } else {
+      i++;
+    }
+  }
+  finish_statement(query.size());
+
+  return statements;
 }
 
 }  // namespace adbcpq
