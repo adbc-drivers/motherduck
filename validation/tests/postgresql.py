@@ -20,6 +20,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import functools
 import os
 import re
 from pathlib import Path
@@ -116,3 +117,11 @@ class PostgreSQLQuirks(model.DriverQuirks):
     def split_statement(self, statement: str) -> list[str]:
         """Split a multi-statement SQL string into individual statements."""
         return quirks.split_statement(statement)
+
+
+@functools.cache
+def get_quirks(version: str) -> PostgreSQLQuirks:
+    quirks = PostgreSQLQuirks()
+    if version != quirks.short_version and version != "latest":
+        raise ValueError(f"Unsupported PostgreSQL version: {version}")
+    return quirks

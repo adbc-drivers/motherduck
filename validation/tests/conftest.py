@@ -35,16 +35,17 @@ from adbc_drivers_validation.tests.conftest import (  # noqa: F401
     pytest_collection_modifyitems,
 )
 
-from .postgresql import PostgreSQLQuirks
+from .postgresql import get_quirks
 
 
 def pytest_addoption(parser) -> None:
     adbc_drivers_validation.tests.conftest.pytest_addoption(parser)
+    parser.addoption("--vendor-version", action="store", default="18")
 
 
 @pytest.fixture(scope="session")
-def driver() -> adbc_drivers_validation.model.DriverQuirks:
-    return PostgreSQLQuirks()
+def driver(pytestconfig) -> adbc_drivers_validation.model.DriverQuirks:
+    return get_quirks(pytestconfig.getoption("vendor_version"))
 
 
 @pytest.fixture(scope="session")
