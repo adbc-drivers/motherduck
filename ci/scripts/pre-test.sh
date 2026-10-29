@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Writes .env.override, which the workflow sources before running test.sh.
+# Writes .env.override, which the workflow sources before running test.sh or
+# the validation suite.
 
 set -euo pipefail
 if [[ $# -lt 2 ]]; then
@@ -22,11 +23,6 @@ if [[ $# -lt 2 ]]; then
 fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
-
-# The validation job runs against the Compose service, not MotherDuck.
-if [[ "${GITHUB_JOB:-}" == validate ]]; then
-  exit 0
-fi
 
 if [[ -z "${MOTHERDUCK_TOKEN:-}" ]]; then
   printf 'MOTHERDUCK_TOKEN must be set to run tests against MotherDuck\n' >&2
@@ -41,7 +37,7 @@ if [[ -n "${MOTHERDUCK_TEST_DATABASE:-}" ]]; then
   manage_database=false
 else
   run="${GITHUB_RUN_ID:-local}_${GITHUB_RUN_ATTEMPT:-1}"
-  database="adbc_ci_${run}_${1}_${2}"
+  database="adbc_ci_${run}_${GITHUB_JOB:-test}_${1}_${2}"
   manage_database=true
 fi
 
@@ -83,6 +79,11 @@ uri_for() {
       "$(uri_for "$database" '&options=--attach_mode%3Dsingle')"
   fi
   printf 'PGPASSWORD=%q\n' "$MOTHERDUCK_TOKEN"
+  # The validation suite's equivalents of the C++ tests' workarounds for
+  # https://github.com/adbc-drivers/motherduck/issues/10 and
+  # https://github.com/adbc-drivers/motherduck/issues/11.
+  printf 'POSTGRES_TYPE_RESOLVER_MODE=builtin\n'
+  printf 'POSTGRES_USE_COPY=false\n'
   # With md:, the tests fall back to the account's default database.
   if [[ "$database" != "md:" ]]; then
     printf 'MOTHERDUCK_TEST_CATALOG=%q\n' "$database"

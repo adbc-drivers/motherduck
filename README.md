@@ -95,21 +95,22 @@ building to disable database tests, or `ON` to enable them on another platform
 with an available PostgreSQL server. CI starts the service and loads `.env.linux`
 only on Linux.
 
-In CI, the C++ tests run against MotherDuck's Postgres endpoint instead of the
-Compose service. The test job uses the `MOTHERDUCK_TOKEN` secret from the
-`test` GitHub environment; `ci/scripts/pre-test.sh` builds the connection URI
-from it. Each job gets a fresh database, `adbc_ci_<run>_<platform>_<arch>`,
-which the tests create before they start and drop when they finish, so
+In CI, the C++ tests and the Python validation suite run against MotherDuck's
+Postgres endpoint instead of the Compose service. The test and validate jobs use
+the `MOTHERDUCK_TOKEN` secret from the `test` GitHub environment;
+`ci/scripts/pre-test.sh` builds the connection URI from it. Each job gets a
+fresh database, `adbc_ci_<run>_<job>_<platform>_<arch>`, which the tests
+create before they start and drop when they finish, so
 concurrent jobs and runs don't share tables. Test connections use
 `attach_mode=single`, so other databases in the account stay out of catalog
 queries. `MOTHERDUCK_PG_HOST` overrides the default host
 (`pg.us-east-1-aws.motherduck.com`); `MOTHERDUCK_TEST_DATABASE` names an
-existing database to use instead, which the tests leave in place. The validation
-suite still uses the Compose service.
+existing database to use instead, which the tests leave in place.
 
-These tests exercise PostgreSQL compatibility. The inherited Python files in
-`validation/` still target PostgreSQL; MotherDuck validation and published
-validation documentation will be configured separately.
+These tests exercise PostgreSQL compatibility. The validation suite's quirks in
+`validation/tests/postgresql.py` still describe the driver as PostgreSQL apart
+from the catalog, schema and temporary tables; published validation
+documentation will be configured separately.
 
 ## Upstream history and licensing
 

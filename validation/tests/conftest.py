@@ -20,9 +20,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os
 import sys
 from pathlib import Path
 
+import adbc_driver_manager.dbapi
 import adbc_drivers_validation.model
 import adbc_drivers_validation.tests.conftest
 import pytest
@@ -58,7 +60,36 @@ def driver_path(driver: adbc_drivers_validation.model.DriverQuirks) -> str:
     return str(base / f"build/libadbc_driver_motherduck.{ext}")
 
 
+@pytest.fixture(scope="session")
+def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
+    """Give the session a fresh database (see ci/scripts/pre-test.sh) and drop it
+    afterwards, so concurrent jobs and earlier runs can't leave tables behind."""
+    setup_uri = os.environ.get("MOTHERDUCK_TEST_SETUP_URI")
+    catalog = os.environ.get("MOTHERDUCK_TEST_CATALOG")
+    if not setup_uri or not catalog:
+        yield
+        return
+
+    name = driver.quote_one_identifier(catalog)
+
+    def execute(query: str) -> None:
+        with (
+            adbc_driver_manager.dbapi.connect(
+                driver=driver_path,
+                db_kwargs={**db_kwargs, "uri": setup_uri},
+                autocommit=True,
+            ) as c,
+            c.cursor() as cursor,
+        ):
+            cursor.execute(query)
+
+    execute(f"DROP DATABASE IF EXISTS {name}")
+    execute(f"CREATE DATABASE {name}")
+    yield
+    execute(f"DROP DATABASE IF EXISTS {name}")
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _setup_backend(request, conn_factory) -> None:  # noqa: F811
+def _setup_backend(request, _motherduck_database, conn_factory) -> None:  # noqa: F811
     with conn_factory() as c, c.cursor() as cursor:
         cursor.execute("CREATE SCHEMA IF NOT EXISTS secondary")

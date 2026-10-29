@@ -33,6 +33,7 @@ _database_args = {
     "adbc.postgresql.type_resolver_mode": os.environ.get(
         "POSTGRES_TYPE_RESOLVER_MODE", "server"
     ),
+    "adbc.postgresql.use_copy": os.environ.get("POSTGRES_USE_COPY", "true"),
 }
 
 
@@ -54,15 +55,18 @@ class PostgreSQLQuirks(model.DriverQuirks):
         statement_bulk_ingest=True,
         statement_bulk_ingest_catalog=False,
         statement_bulk_ingest_schema=False,
-        statement_bulk_ingest_temporary=True,
+        # MotherDuck has no temporary tables.
+        statement_bulk_ingest_temporary=False,
         statement_bind=True,
         statement_execute_schema=True,
         statement_get_parameter_schema=True,
         statement_prepare=True,
         statement_rows_affected=True,
         statement_rows_affected_ddl=False,
-        current_catalog="postgres",
-        current_schema="public",
+        # The database ci/scripts/pre-test.sh picks, else the account's default
+        # database for md: connections.
+        current_catalog=os.environ.get("MOTHERDUCK_TEST_CATALOG", "my_db"),
+        current_schema="main",
         secondary_schema="secondary",
         supported_xdbc_fields=["xdbc_type_name"],
     )
