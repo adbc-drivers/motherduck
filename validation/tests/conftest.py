@@ -72,7 +72,7 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
 
     name = driver.quote_one_identifier(catalog)
 
-    def execute(query: str) -> None:
+    def execute(*queries: str) -> None:
         with (
             adbc_driver_manager.dbapi.connect(
                 driver=driver_path,
@@ -81,10 +81,10 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
             ) as c,
             c.cursor() as cursor,
         ):
-            cursor.execute(query)
+            for query in queries:
+                cursor.execute(query)
 
-    execute(f"DROP DATABASE IF EXISTS {name}")
-    execute(f"CREATE DATABASE {name}")
+    execute(f"DROP DATABASE IF EXISTS {name}", f"CREATE DATABASE {name}")
     yield
     execute(f"DROP DATABASE IF EXISTS {name}")
 

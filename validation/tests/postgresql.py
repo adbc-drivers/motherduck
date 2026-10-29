@@ -25,15 +25,14 @@ import os
 import re
 from pathlib import Path
 
-import adbc_driver_manager.dbapi
 from adbc_drivers_validation import model, quirks
 
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
-    "adbc.postgresql.type_resolver_mode": os.environ.get(
-        "POSTGRES_TYPE_RESOLVER_MODE", "server"
-    ),
-    "adbc.postgresql.use_copy": os.environ.get("POSTGRES_USE_COPY", "true"),
+    # Work around https://github.com/adbc-drivers/motherduck/issues/10 and
+    # https://github.com/adbc-drivers/motherduck/issues/11, as the C++ tests do.
+    "adbc.postgresql.type_resolver_mode": "builtin",
+    "adbc.postgresql.use_copy": "false",
 }
 
 
@@ -100,18 +99,6 @@ class PostgreSQLQuirks(model.DriverQuirks):
             )
             or ("undefined_table" in error_str and table_name.lower() in error_str)
         )
-
-    def qualify_temp_table(
-        self, cursor: adbc_driver_manager.dbapi.Cursor, name: str
-    ) -> list[str]:
-        cursor.execute(
-            "SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()"
-        )
-        row = cursor.fetchone()
-        if row is None:
-            raise RuntimeError("Could not determine temporary schema")
-        (schema,) = row
-        return [self.features.current_catalog, schema, name]
 
     def quote_one_identifier(self, identifier: str) -> str:
         """Quote an identifier using PostgreSQL's double-quote syntax."""
