@@ -54,6 +54,9 @@ TEST(SplitStatementsTest, Quotes) {
               ElementsAre(R"(SELECT E'\'; ')", R"(SELECT 'a\')", "SELECT 3"));
   EXPECT_THAT(SplitStatements(R"(SELECT note'\'; SELECT 2)"),
               ElementsAre(R"(SELECT note'\')", "SELECT 2"));
+  // With standard_conforming_strings off, they escape quotes in every literal.
+  EXPECT_THAT(SplitStatements(R"(SELECT 'a\'; b'; SELECT 2)", /*backslash_escapes=*/true),
+              ElementsAre(R"(SELECT 'a\'; b')", "SELECT 2"));
 }
 
 TEST(SplitStatementsTest, DollarQuotes) {

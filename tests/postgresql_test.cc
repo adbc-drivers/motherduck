@@ -2796,6 +2796,54 @@ TEST_F(PostgresStatementTest, MultipleStatementsSingleQueryError) {
   error.release(&error);
 }
 
+TEST_F(PostgresStatementTest, MultipleStatementsSingleQueryQuoting) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // Semicolons inside literals don't split statements, and the batch reports
+  // the last statement's row count.
+  const char* query = R"(DROP TABLE IF EXISTS test_query_statements_quoting;
+            CREATE TABLE test_query_statements_quoting (strs TEXT);
+            INSERT INTO test_query_statements_quoting VALUES ('a;b'), ('it''s; here');)";
+  int64_t rows_affected = 0;
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, &rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(2, rows_affected);
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "SELECT * FROM test_query_statements_quoting "
+                                       "WHERE strs IN ('a;b', 'it''s; here')",
+                                       &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  reader.GetSchema();
+  ASSERT_THAT(reader.MaybeNext(), adbc_validation::IsOkErrno());
+  ASSERT_EQ(reader.array->length, 2);
+}
+
+TEST_F(PostgresStatementTest, MultipleStatementsSingleQueryCopy) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // A COPY in a batch fails cleanly and leaves the connection usable.
+  for (const char* query : {"SELECT 1; COPY (SELECT 1) TO STDOUT",
+                            "DROP TABLE IF EXISTS test_query_statements_copy; "
+                            "CREATE TABLE test_query_statements_copy (ints INT); "
+                            "COPY test_query_statements_copy FROM STDIN"}) {
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+                ::testing::Not(IsOkStatus(&error)));
+    error.release(&error);
+  }
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1; SELECT 2", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+}
+
 TEST_F(PostgresStatementTest, SetUseCopyFalse) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 

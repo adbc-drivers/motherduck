@@ -232,8 +232,7 @@ Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
     // If there is no output requested, we still need to execute and
     // set affected_rows if needed. We don't need an output schema or to set up a copy
     // reader, so we can skip those steps by going straight to Execute(). This also
-    // enables us to support queries with multiple statements because we can call PQexec()
-    // instead of PQexecParams().
+    // enables us to support queries with multiple statements, which can't be prepared.
     UNWRAP_STATUS(ExecuteAll(affected_rows));
     return Status::Ok();
   }
@@ -304,7 +303,7 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
       UNWRAP_STATUS(BindNextAndExecute(affected_rows));
     } while (bind_stream_);
   } else {
-    UNWRAP_STATUS(helper_.Execute());
+    UNWRAP_STATUS(helper_.ExecuteScript());
 
     if (affected_rows != nullptr) {
       *affected_rows = helper_.AffectedRows();

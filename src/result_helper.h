@@ -145,11 +145,12 @@ class PqResultHelper {
   Status DescribePrepared();
   Status Execute(const std::vector<std::string>& params = {},
                  PostgresType* param_types = nullptr);
+  // Like Execute, but run a query of several statements one at a time through
+  // a pipeline. The endpoint binds every statement of a multi-statement simple
+  // query before running any of them, so later statements can't see objects
+  // created by earlier ones.
+  Status ExecuteScript();
   Status ExecuteCopy();
-  // Run each statement in turn through one pipeline. The endpoint binds every
-  // statement of a multi-statement simple query before running any of them, so
-  // later statements can't see objects created by earlier ones.
-  Status ExecutePipeline(const std::vector<std::string>& statements);
   Status ResolveParamTypes(PostgresTypeResolver& type_resolver,
                            PostgresType* param_types);
   Status ResolveOutputTypes(PostgresTypeResolver& type_resolver,
@@ -223,11 +224,16 @@ class PqResultHelper {
   Format output_format_ = Format::kText;
 
   Status PrepareInternal(int n_params, const Oid* param_oids) const;
+  Status ExecutePipeline(const std::vector<std::string>& statements);
+  Status CollectPipelineResults(const std::string& statement, bool* ended_copy_in);
 };
 
 // Split a query on the semicolons between its statements, skipping those inside
 // string literals, quoted identifiers, dollar quotes and comments. Statements
-// with nothing but whitespace or comments are dropped.
-std::vector<std::string> SplitStatements(std::string_view query);
+// with nothing but whitespace or comments are dropped. backslash_escapes says
+// whether backslashes escape quotes in every literal, as they do when
+// standard_conforming_strings is off, rather than only in E'' literals.
+std::vector<std::string> SplitStatements(std::string_view query,
+                                         bool backslash_escapes = false);
 
 }  // namespace adbcpq

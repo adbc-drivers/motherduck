@@ -29,6 +29,7 @@
 
 #include <cctype>
 #include <charconv>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -79,11 +80,6 @@ Status PqResultHelper::DescribePrepared() {
 Status PqResultHelper::Execute(const std::vector<std::string>& params,
                                PostgresType* param_types) {
   if (params.size() == 0 && param_types == nullptr && output_format_ == Format::kText) {
-    std::vector<std::string> statements = SplitStatements(query_);
-    if (statements.size() > 1) {
-      return ExecutePipeline(statements);
-    }
-
     ClearResult();
     result_ = PQexec(conn_, query_.c_str());
   } else {
@@ -122,6 +118,19 @@ Status PqResultHelper::Execute(const std::vector<std::string>& params,
   return Status::Ok();
 }
 
+Status PqResultHelper::ExecuteScript() {
+  // With standard_conforming_strings off, backslashes escape quotes in every
+  // string literal, not just E'' ones.
+  const char* conforming = PQparameterStatus(conn_, "standard_conforming_strings");
+  const bool backslash_escapes =
+      conforming != nullptr && std::strcmp(conforming, "off") == 0;
+  std::vector<std::string> statements = SplitStatements(query_, backslash_escapes);
+  if (statements.size() <= 1) {
+    return Execute();
+  }
+  return ExecutePipeline(statements);
+}
+
 Status PqResultHelper::ExecutePipeline(const std::vector<std::string>& statements) {
   ClearResult();
   if (PQenterPipelineMode(conn_) != 1) {
@@ -129,64 +138,126 @@ Status PqResultHelper::ExecutePipeline(const std::vector<std::string>& statement
                       PQerrorMessage(conn_));
   }
 
-  // Queue every statement ahead of one sync, so the server skips the rest
-  // once one fails, as it would for a multi-statement simple query.
+  // The statements share one sync, so they run in one implicit transaction as
+  // in a multi-statement simple query. Each one's results are read before the
+  // next is sent: queueing them all first can deadlock once the server blocks
+  // writing results we aren't reading while we block sending more statements.
   Status status;
+  bool ended_copy_in = false;
   for (const auto& statement : statements) {
     if (PQsendQueryParams(conn_, statement.c_str(), /*nParams=*/0,
                           /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
                           /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
-                          static_cast<int>(Format::kText)) != 1) {
+                          static_cast<int>(Format::kText)) != 1 ||
+        PQsendFlushRequest(conn_) != 1 || PQflush(conn_) != 0) {
       status = MakeStatus(nullptr, "[libpq] Failed to send query '{}': {}", statement,
                           PQerrorMessage(conn_));
       break;
     }
+
+    status = CollectPipelineResults(statement, &ended_copy_in);
+    if (!status.ok()) break;
   }
-  if (PQpipelineSync(conn_) != 1 && status.ok()) {
+
+  // Wait for the sync. A null result means it isn't coming because the
+  // connection broke, so stop rather than block forever.
+  if (PQpipelineSync(conn_) == 1) {
+    while (PGresult* result = PQgetResult(conn_)) {
+      const bool synced = PQresultStatus(result) == PGRES_PIPELINE_SYNC;
+      PQclear(result);
+      if (synced) break;
+    }
+  } else if (status.ok()) {
     status =
         MakeStatus(nullptr, "[libpq] Failed to sync pipeline: {}", PQerrorMessage(conn_));
   }
 
-  // Drain everything up to the sync, keeping the last statement's result (as
-  // PQexec would) or the first error. libpq returns null after each statement's
-  // results; two nulls in a row means nothing more is coming, e.g. because the
-  // sync was never sent or the connection dropped.
-  size_t index = 0;
-  bool previous_null = false;
-  while (true) {
-    PGresult* result = PQgetResult(conn_);
-    if (result == nullptr) {
-      if (previous_null) break;
-      previous_null = true;
-      index++;
-      continue;
-    }
-    previous_null = false;
-
-    ExecStatusType result_status = PQresultStatus(result);
-    if (result_status == PGRES_PIPELINE_SYNC) {
-      PQclear(result);
-      break;
-    }
-
-    if (!status.ok()) {
-      PQclear(result);
-    } else if (result_status == PGRES_TUPLES_OK || result_status == PGRES_COMMAND_OK ||
-               result_status == PGRES_EMPTY_QUERY) {
-      SetResult(result);
-    } else {
-      SetResult(result);
-      status = MakeStatus(result_, "[libpq] Failed to execute query '{}': {}",
-                          index < statements.size() ? statements[index] : query_,
-                          PQresultErrorMessage(result_));
+  if (ended_copy_in) {
+    // In extended-query mode PQputCopyEnd sends a Sync of its own, so the
+    // reply to ours is still on its way, and libpq would hand it to the next
+    // query as that query's result. Queue a no-op and a sync behind it: libpq
+    // reports the stray reply as an extra sync ahead of the no-op's result,
+    // and reading through the final sync consumes it.
+    if (PQsendQueryParams(conn_, "SELECT 1", /*nParams=*/0, /*paramTypes=*/nullptr,
+                          /*paramValues=*/nullptr, /*paramLengths=*/nullptr,
+                          /*paramFormats=*/nullptr,
+                          static_cast<int>(Format::kText)) == 1 &&
+        PQpipelineSync(conn_) == 1) {
+      bool saw_query_result = false;
+      while (true) {
+        PGresult* result = PQgetResult(conn_);
+        if (result == nullptr) {
+          // A null follows the no-op's results; any other means the
+          // connection broke.
+          if (saw_query_result && PQstatus(conn_) == CONNECTION_OK) continue;
+          break;
+        }
+        const bool synced = PQresultStatus(result) == PGRES_PIPELINE_SYNC;
+        PQclear(result);
+        if (synced && saw_query_result) break;
+        if (!synced) saw_query_result = true;
+      }
     }
   }
 
+  // This only fails if results are still pending, i.e. the connection broke,
+  // in which case any earlier error is the more useful one to report.
   if (PQexitPipelineMode(conn_) != 1 && status.ok()) {
     status = MakeStatus(nullptr, "[libpq] Failed to exit pipeline mode: {}",
                         PQerrorMessage(conn_));
   }
 
+  return status;
+}
+
+Status PqResultHelper::CollectPipelineResults(const std::string& statement,
+                                              bool* ended_copy_in) {
+  Status status;
+  while (PGresult* result = PQgetResult(conn_)) {
+    switch (PQresultStatus(result)) {
+      case PGRES_TUPLES_OK:
+      case PGRES_COMMAND_OK:
+      case PGRES_EMPTY_QUERY:
+        // Keep the last result, as PQexec would.
+        if (status.ok()) {
+          SetResult(result);
+        } else {
+          PQclear(result);
+        }
+        break;
+      case PGRES_COPY_IN:
+      case PGRES_COPY_OUT:
+      case PGRES_COPY_BOTH: {
+        // There's no COPY data to send or a place to put it, so end the COPY.
+        // Otherwise libpq stays in COPY state and never returns null.
+        const ExecStatusType copy_status = PQresultStatus(result);
+        PQclear(result);
+        status = Status(
+            ADBC_STATUS_NOT_IMPLEMENTED,
+            "[libpq] COPY is not supported in a multi-statement query: " + statement);
+        if (copy_status != PGRES_COPY_OUT) {
+          PQputCopyEnd(conn_, "COPY is not supported in a multi-statement query");
+          *ended_copy_in = true;
+        }
+        if (copy_status != PGRES_COPY_IN) {
+          char* buffer = nullptr;
+          while (PQgetCopyData(conn_, &buffer, /*async=*/0) >= 0) {
+            PQfreemem(buffer);
+          }
+        }
+        break;
+      }
+      default:
+        if (status.ok()) {
+          SetResult(result);
+          status = MakeStatus(result_, "[libpq] Failed to execute query '{}': {}",
+                              statement, PQresultErrorMessage(result_));
+        } else {
+          PQclear(result);
+        }
+        break;
+    }
+  }
   return status;
 }
 
@@ -348,7 +419,7 @@ std::string_view TrimWhitespace(std::string_view text) {
 
 }  // namespace
 
-std::vector<std::string> SplitStatements(std::string_view query) {
+std::vector<std::string> SplitStatements(std::string_view query, bool backslash_escapes) {
   std::vector<std::string> statements;
   size_t start = 0;
   // Whether the current statement has anything besides whitespace and comments
@@ -404,7 +475,7 @@ std::vector<std::string> SplitStatements(std::string_view query) {
       // E'...' strings take backslash escapes.
       const bool escape_string = i > 0 && (query[i - 1] == 'E' || query[i - 1] == 'e') &&
                                  !(i > 1 && IsIdentifierChar(query[i - 2]));
-      i = SkipQuoted(query, i, escape_string);
+      i = SkipQuoted(query, i, backslash_escapes || escape_string);
     } else if (c == '"') {
       i = SkipQuoted(query, i, /*backslash_escapes=*/false);
     } else if (std::string_view tag = DollarQuoteTag(query, i); !tag.empty()) {
