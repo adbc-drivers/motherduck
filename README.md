@@ -73,6 +73,19 @@ ctest --test-dir build/debug --output-on-failure
 cmake --install build/debug --prefix build/install
 ```
 
+## Options
+
+`adbc.motherduck.attach_mode` (database option) sets the MotherDuck
+[attach mode](https://motherduck.com/docs/sql-reference/postgres-endpoint/#session-options):
+`single` (the default) attaches only the database named in the connection,
+and `workspace` attaches every database in the account. The driver adds
+`--attach_mode=<mode>` to libpq's `options`, after any session options from
+the URI or `PGOPTIONS`. If those already set `attach_mode`, they win.
+
+Single mode needs a named database, so if the option isn't set the driver
+leaves the attach mode alone for `md:` connections and for hosts outside
+`*.motherduck.com`, such as a local PostgreSQL server used for testing.
+
 ## Inherited tests
 
 The complete upstream C++ test suites are compiled in test builds. Linux test

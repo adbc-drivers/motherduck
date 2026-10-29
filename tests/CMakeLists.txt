@@ -65,7 +65,7 @@ target_compile_definitions(motherduck_postgresql_test
 )
 add_test(NAME postgresql_unit
          COMMAND motherduck_postgresql_test
-                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*-PostgresTypeTest.BuiltinResolver
+                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:MotherDuckAttachModeTest.*-PostgresTypeTest.BuiltinResolver
 )
 
 add_executable(motherduck_copy_test copy/postgres_copy_reader_test.cc

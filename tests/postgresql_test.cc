@@ -39,12 +39,14 @@
 #include <arrow-adbc/driver/postgresql.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
+#include <libpq-fe.h>
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow.hpp>
 
 #include "adbc_driver_motherduck_config.h"
 #include "common/options.h"
 #include "common/utils.h"
+#include "database.h"
 #include "validation/adbc_validation.h"
 #include "validation/adbc_validation_util.h"
 
@@ -408,6 +410,69 @@ TEST_F(PostgresDatabaseTest, AdbcDriverBackwardsCompatibility) {
               IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
 }
 
+TEST(MotherDuckAttachModeTest, OptionDefault) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
+              ::testing::Optional("single"s));
+}
+
+TEST(MotherDuckAttachModeTest, OptionSetGet) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const std::string value : {"workspace", "single"}) {
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      value.c_str(), &error),
+                IsOkStatus(&error));
+    EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                    &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
+                ::testing::Optional(value));
+  }
+}
+
+TEST(MotherDuckAttachModeTest, OptionInvalid) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const char* value : {"", "SINGLE", "multi"}) {
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      value, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
+              ::testing::Optional("single"s));
+}
+
+TEST(MotherDuckAttachModeTest, AddAttachMode) {
+  EXPECT_EQ("--attach_mode=single", adbcpq::AddAttachMode("", "single"));
+  EXPECT_EQ("--session_name=x --attach_mode=workspace",
+            adbcpq::AddAttachMode("--session_name=x", "workspace"));
+  // Options from the URI win.
+  EXPECT_EQ("--attach_mode=workspace",
+            adbcpq::AddAttachMode("--attach_mode=workspace", "single"));
+  EXPECT_EQ("-c attach_mode=workspace",
+            adbcpq::AddAttachMode("-c attach_mode=workspace", "single"));
+  // No mode leaves the options alone.
+  EXPECT_EQ("", adbcpq::AddAttachMode("", ""));
+  EXPECT_EQ("--session_name=x", adbcpq::AddAttachMode("--session_name=x", ""));
+}
+
+TEST(MotherDuckAttachModeTest, UseDefaultAttachMode) {
+  EXPECT_TRUE(adbcpq::UseDefaultAttachMode("pg.us-east-1-aws.motherduck.com", "my_db"));
+  // Single mode needs a named database.
+  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("pg.us-east-1-aws.motherduck.com", "md:"));
+  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("pg.us-east-1-aws.motherduck.com", ""));
+  // Other servers reject the unknown attach_mode parameter.
+  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("localhost", "postgres"));
+  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("", "postgres"));
+  EXPECT_FALSE(adbcpq::UseDefaultAttachMode("motherduck.com.example.org", "my_db"));
+}
+
 class PostgresConnectionTest : public ::testing::Test,
                                public adbc_validation::ConnectionTest {
  public:
@@ -514,6 +579,49 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogs) {
   struct AdbcGetObjectsCatalog* cat =
       InternalAdbcGetObjectsDataGetCatalogByName(*get_objects_data, catalog.c_str());
   ASSERT_NE(cat, nullptr) << "catalog " << catalog << " not found";
+}
+
+// With the default attach_mode=single, only the connected database is a catalog.
+TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachModeSingle) {
+  char* parse_error = nullptr;
+  PQconninfoOption* conninfo =
+      PQconninfoParse(std::getenv("ADBC_POSTGRESQL_TEST_URI"), &parse_error);
+  ASSERT_NE(conninfo, nullptr) << parse_error;
+  std::string dbname;
+  for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
+    if (std::strcmp(option->keyword, "dbname") == 0 && option->val) {
+      dbname = option->val;
+    }
+  }
+  PQconninfoFree(conninfo);
+  if (dbname.empty() || dbname == "md:") {
+    GTEST_SKIP() << "attach_mode=single needs a named database, not md:";
+  }
+
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(
+      AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_CATALOGS, nullptr, nullptr,
+                               nullptr, nullptr, nullptr, &reader.stream.value, &error),
+      IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NE(nullptr, reader.array->release);
+
+  auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+  ASSERT_NE(*get_objects_data, nullptr)
+      << "could not initialize the AdbcGetObjectsData object";
+
+  std::vector<std::string> catalogs;
+  for (int i = 0; i < (*get_objects_data)->n_catalogs; i++) {
+    const struct ArrowStringView name = (*get_objects_data)->catalogs[i]->catalog_name;
+    catalogs.emplace_back(name.data, name.size_bytes);
+  }
+  // DuckDB's built-in system and temp catalogs may also be listed.
+  EXPECT_THAT(catalogs, ::testing::Contains(dbname));
+  EXPECT_THAT(catalogs, ::testing::Each(::testing::AnyOf(dbname, "system", "temp")));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
