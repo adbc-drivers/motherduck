@@ -34,7 +34,16 @@ if [[ -z "${MOTHERDUCK_TOKEN:-}" ]]; then
 fi
 
 host="${MOTHERDUCK_PG_HOST:-pg.us-east-1-aws.motherduck.com}"
-database="${MOTHERDUCK_TEST_DATABASE:-md:}"
+# By default each job gets a fresh database, which the tests create and drop, so
+# concurrent jobs and runs don't share tables. An explicit database is left as is.
+if [[ -n "${MOTHERDUCK_TEST_DATABASE:-}" ]]; then
+  database="$MOTHERDUCK_TEST_DATABASE"
+  manage_database=false
+else
+  run="${GITHUB_RUN_ID:-local}_${GITHUB_RUN_ATTEMPT:-1}"
+  database="adbc_ci_${run}_${1}_${2}"
+  manage_database=true
+fi
 
 # vcpkg's libpq can't see the OS trust store, so use the pixi env's CA bundle.
 # The generated test job doesn't install the env itself.
@@ -58,15 +67,28 @@ if command -v cygpath >/dev/null 2>&1; then
   ca_bundle="$(cygpath -m "$ca_bundle")"
 fi
 
-uri="postgresql://postgres@${host}:5432/${database//:/%3A}"
-uri+="?sslmode=verify-full&sslrootcert=${ca_bundle}"
+uri_for() {
+  printf 'postgresql://postgres@%s:5432/%s?sslmode=verify-full&sslrootcert=%s%s' \
+    "$host" "${1//:/%3A}" "$ca_bundle" "${2:-}"
+}
 
 # PGPASSWORD rather than the URI keeps the token out of test output.
 {
-  printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$uri"
+  # With a named database, attach only that one so other databases' tables
+  # don't show up in catalog queries.
+  if [[ "$database" == "md:" ]]; then
+    printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$(uri_for "$database")"
+  else
+    printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' \
+      "$(uri_for "$database" '&options=--attach_mode%3Dsingle')"
+  fi
   printf 'PGPASSWORD=%q\n' "$MOTHERDUCK_TOKEN"
   # With md:, the tests fall back to the account's default database.
   if [[ "$database" != "md:" ]]; then
     printf 'MOTHERDUCK_TEST_CATALOG=%q\n' "$database"
+  fi
+  if [[ "$manage_database" == true ]]; then
+    # The tests create and drop the database through this connection.
+    printf 'MOTHERDUCK_TEST_SETUP_URI=%q\n' "$(uri_for md:)"
   fi
 } > "${repo_root}/.env.override"

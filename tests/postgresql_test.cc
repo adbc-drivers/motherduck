@@ -67,17 +67,36 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return AdbcDatabaseSetOption(database, "uri", uri, error);
   }
 
+  AdbcStatusCode SetupDatabase(struct AdbcDatabase* database,
+                               struct AdbcError* error) const override {
+    const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+    if (!uri) {
+      ADD_FAILURE() << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    return SetupDatabase(database, uri, error);
+  }
+
   // Works around https://github.com/adbc-drivers/motherduck/issues/10 and
   // https://github.com/adbc-drivers/motherduck/issues/11 so other tests reach their
   // own assertions; the MotherDuckDefaults* tests cover the defaults.
-  AdbcStatusCode SetupDatabase(struct AdbcDatabase* database,
-                               struct AdbcError* error) const override {
-    AdbcStatusCode status = SetupUri(database, error);
+  AdbcStatusCode SetupDatabase(struct AdbcDatabase* database, const char* uri,
+                               struct AdbcError* error) const {
+    AdbcStatusCode status = AdbcDatabaseSetOption(database, "uri", uri, error);
     if (status != ADBC_STATUS_OK) return status;
     status = AdbcDatabaseSetOption(database, "adbc.postgresql.type_resolver_mode",
                                    "builtin", error);
     if (status != ADBC_STATUS_OK) return status;
     return AdbcDatabaseSetOption(database, "adbc.postgresql.use_copy", "false", error);
+  }
+
+  std::string QuoteIdentifier(std::string_view name) const override {
+    std::string quoted = "\"";
+    for (char c : name) {
+      if (c == '"') quoted += '"';
+      quoted += c;
+    }
+    return quoted + '"';
   }
 
   AdbcStatusCode DropTable(struct AdbcConnection* connection, const std::string& name,
@@ -244,6 +263,62 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   // Statistics come from pg_stats, which DuckDB doesn't have.
   bool supports_statistics() const override { return false; }
 };
+
+// Gives the test run a fresh database (see ci/scripts/pre-test.sh) and drops it
+// afterwards, so concurrent jobs and earlier runs can't leave tables behind.
+class MotherDuckTestDatabase : public ::testing::Environment {
+ public:
+  void SetUp() override {
+    if (!Configured()) return;
+    ASSERT_NO_FATAL_FAILURE(Execute("DROP DATABASE IF EXISTS " + catalog_));
+    ASSERT_NO_FATAL_FAILURE(Execute("CREATE DATABASE " + catalog_));
+  }
+
+  void TearDown() override {
+    if (!Configured()) return;
+    ASSERT_NO_FATAL_FAILURE(Execute("DROP DATABASE IF EXISTS " + catalog_));
+  }
+
+ private:
+  bool Configured() {
+    const char* setup_uri = std::getenv("MOTHERDUCK_TEST_SETUP_URI");
+    const char* catalog = std::getenv("MOTHERDUCK_TEST_CATALOG");
+    if (!setup_uri || !catalog) return false;
+    setup_uri_ = setup_uri;
+    catalog_ = quirks_.QuoteIdentifier(catalog);
+    return true;
+  }
+
+  void Execute(const std::string& query) {
+    Handle<struct AdbcError> error;
+    Handle<struct AdbcDatabase> database;
+    Handle<struct AdbcConnection> connection;
+    Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error.value), IsOkStatus(&error.value));
+    ASSERT_THAT(quirks_.SetupDatabase(&database.value, setup_uri_.c_str(), &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcConnectionNew(&connection.value, &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(
+        AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error.value),
+        IsOkStatus(&error.value));
+  }
+
+  PostgresQuirks quirks_;
+  std::string setup_uri_;
+  std::string catalog_;
+};
+
+[[maybe_unused]] static const auto* kMotherDuckTestDatabase =
+    ::testing::AddGlobalTestEnvironment(new MotherDuckTestDatabase);
 
 class PostgresDatabaseTest : public ::testing::Test,
                              public adbc_validation::DatabaseTest {
