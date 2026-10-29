@@ -80,7 +80,7 @@ uri_for() {
     printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$(uri_for "$database")"
   else
     printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' \
-      "$(uri_for "$database" '&options=--attach_mode=single')"
+      "$(uri_for "$database" '&options=--attach_mode%3Dsingle')"
   fi
   printf 'PGPASSWORD=%q\n' "$MOTHERDUCK_TOKEN"
   # With md:, the tests fall back to the account's default database.
