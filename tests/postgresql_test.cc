@@ -243,6 +243,43 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   bool supports_statistics() const override { return false; }
 };
 
+// Creates the test database (see ci/scripts/pre-test.sh) before any test
+// connects to it.
+class MotherDuckTestDatabase : public ::testing::Environment {
+ public:
+  void SetUp() override {
+    const char* setup_uri = std::getenv("MOTHERDUCK_TEST_SETUP_URI");
+    const char* catalog = std::getenv("MOTHERDUCK_TEST_CATALOG");
+    if (!setup_uri || !catalog) return;
+
+    struct AdbcError error = {};
+    Handle<struct AdbcDatabase> database;
+    Handle<struct AdbcConnection> connection;
+    Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", setup_uri, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcDatabaseSetOption(&database.value, "adbc.postgresql.type_resolver_mode",
+                              "builtin", &error),
+        IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
+                IsOkStatus(&error));
+    std::string query = "CREATE DATABASE IF NOT EXISTS \"" + std::string(catalog) + "\"";
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
+};
+
+const auto* kMotherDuckTestDatabase =
+    ::testing::AddGlobalTestEnvironment(new MotherDuckTestDatabase);
+
 class PostgresDatabaseTest : public ::testing::Test,
                              public adbc_validation::DatabaseTest {
  public:
