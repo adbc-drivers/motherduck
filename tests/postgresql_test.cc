@@ -1745,6 +1745,63 @@ TEST_F(PostgresStatementTest, SqlIngestSchema) {
   }
 }
 
+TEST_F(PostgresStatementTest, SqlIngestReplaceRecreatesTable) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "CREATE OR REPLACE TABLE ingest_replace_ddl "
+                                       "(old_col INTEGER)",
+                                       &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+
+  {
+    adbc_validation::Handle<struct ArrowSchema> schema;
+    adbc_validation::Handle<struct ArrowArray> batch;
+
+    ArrowSchemaInit(&schema.value);
+    ASSERT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowSchemaSetName(schema->children[0], "ints"),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT((adbc_validation::MakeBatch<int64_t>(
+                    &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr),
+                    {1, 2})),
+                adbc_validation::IsOkErrno());
+
+    ASSERT_THAT(AdbcStatementSetOption(&statement, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                       "ingest_replace_ddl", &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetOption(&statement, ADBC_INGEST_OPTION_MODE,
+                                       ADBC_INGEST_OPTION_MODE_REPLACE, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+                IsOkStatus(&error));
+    // MotherDuck rejects COPY FROM STDIN (#31), so only the DDL before it is
+    // checked here: the drop and create must succeed even if the upload fails.
+    if (AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error) !=
+        ADBC_STATUS_OK) {
+      ASSERT_NE(error.message, nullptr);
+      EXPECT_THAT(error.message, ::testing::Not(::testing::HasSubstr("Failed to drop")));
+      EXPECT_THAT(error.message,
+                  ::testing::Not(::testing::HasSubstr("Failed to create")));
+      error.release(&error);
+    }
+  }
+
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(&statement, "SELECT * FROM ingest_replace_ddl", &error),
+      IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_EQ(reader.schema->n_children, 1);
+  EXPECT_STREQ(reader.schema->children[0]->name, "ints");
+}
+
 TEST_F(PostgresStatementTest, SqlIngestTemporaryTable) {
   GTEST_SKIP() << "The Postgres endpoint rejects CREATE TEMP TABLE";
   ASSERT_THAT(quirks()->DropTempTable(&connection, "temptable", &error),

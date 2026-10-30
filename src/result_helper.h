@@ -242,6 +242,14 @@ std::vector<std::string> SplitStatements(std::string_view query,
 // Whether a statement is a COPY, ignoring leading whitespace and comments.
 bool IsCopyStatement(std::string_view statement);
 
+// Whether a statement that isn't a COPY succeeded. MotherDuck answers DDL with
+// an empty result set (a Count or Success column) instead of a command tag, so
+// PGRES_TUPLES_OK counts as success alongside PGRES_COMMAND_OK.
+inline bool IsResultOk(const PGresult* result) {
+  ExecStatusType status = PQresultStatus(result);
+  return status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK;
+}
+
 // Run commands through one libpq pipeline ending in a single sync, sending and
 // reading at the same time so neither side waits on the other. send_next
 // queues the next command (e.g. with PQsendQueryParams) and sets *sent, or
