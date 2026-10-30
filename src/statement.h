@@ -146,6 +146,7 @@ class PostgresStatement {
   void ClearResult();
   AdbcStatusCode CreateBulkTable(const std::string& current_schema,
                                  const struct ArrowSchema& source_schema,
+                                 const std::vector<struct ArrowSchemaView>& source_fields,
                                  std::string* escaped_table,
                                  std::string* escaped_field_list,
                                  PostgresType* copy_target_types,

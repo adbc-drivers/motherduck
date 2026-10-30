@@ -68,6 +68,49 @@ bool IsDdlSuccess(PGresult* result) {
   ExecStatusType status = PQresultStatus(result);
   return status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK;
 }
+
+// DuckDB reads a bare numeric as DECIMAL(18,3), so give an Arrow decimal a
+// width and scale that hold all of its values. DuckDB allows at most 38
+// digits, with a scale from 0 up to the width.
+Status DecimalTypeName(const struct ArrowSchemaView& view, std::string* out) {
+  const int32_t scale = (std::max)(view.decimal_scale, 0);
+  const int32_t width =
+      (std::max)(view.decimal_precision - view.decimal_scale, 0) + scale;
+  if (width > 38) {
+    return Status::NotImplemented("[libpq] Cannot ingest decimal(",
+                                  view.decimal_precision, ", ", view.decimal_scale,
+                                  "): DuckDB DECIMAL holds at most 38 digits");
+  }
+  *out = "numeric(" + std::to_string(width) + ", " + std::to_string(scale) + ")";
+  return Status::Ok();
+}
+
+bool IsDecimal(const struct ArrowSchemaView& view) {
+  return view.type == NANOARROW_TYPE_DECIMAL128 || view.type == NANOARROW_TYPE_DECIMAL256;
+}
+
+// The type to create an ingested column with: pg_type's name, except that
+// decimals and lists of decimals keep their precision and scale.
+Status ColumnTypeName(const PostgresType& pg_type, const struct ArrowSchema& field,
+                      const struct ArrowSchemaView& view, std::string* out) {
+  if (IsDecimal(view)) return DecimalTypeName(view, out);
+
+  if (view.type == NANOARROW_TYPE_LIST || view.type == NANOARROW_TYPE_LARGE_LIST ||
+      view.type == NANOARROW_TYPE_FIXED_SIZE_LIST) {
+    struct ArrowSchemaView child_view;
+    struct ArrowError na_error;
+    UNWRAP_NANOARROW(na_error, Internal,
+                     ArrowSchemaViewInit(&child_view, field.children[0], &na_error));
+    if (IsDecimal(child_view)) {
+      UNWRAP_STATUS(DecimalTypeName(child_view, out));
+      *out += " ARRAY";
+      return Status::Ok();
+    }
+  }
+
+  *out = pg_type.sql_type_name();
+  return Status::Ok();
+}
 }  // namespace
 
 int TupleReader::GetSchema(struct ArrowSchema* out) {
@@ -385,13 +428,11 @@ AdbcStatusCode PostgresStatement::Cancel(struct AdbcError* error) {
   return connection_->Cancel(error);
 }
 
-AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_schema,
-                                                  const struct ArrowSchema& source_schema,
-                                                  std::string* escaped_table,
-                                                  std::string* escaped_field_list,
-                                                  PostgresType* copy_target_types,
-                                                  bool* has_copy_target_types,
-                                                  struct AdbcError* error) {
+AdbcStatusCode PostgresStatement::CreateBulkTable(
+    const std::string& current_schema, const struct ArrowSchema& source_schema,
+    const std::vector<struct ArrowSchemaView>& source_fields, std::string* escaped_table,
+    std::string* escaped_field_list, PostgresType* copy_target_types,
+    bool* has_copy_target_types, struct AdbcError* error) {
   PGconn* conn = connection_->conn();
   *has_copy_target_types = false;
 
@@ -505,24 +546,10 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                     PostgresType::FromSchema(*type_resolver_, source_schema.children[i],
                                              &pg_type, &na_error),
                     &na_error, error);
-    create += " " + pg_type.sql_type_name();
-
-    // DuckDB reads a bare numeric as DECIMAL(18,3), so give it a width and
-    // scale that hold every value of the Arrow decimal, where DuckDB can (at
-    // most 38 digits, with a scale from 0 up to the width).
-    struct ArrowSchemaView field_view;
-    CHECK_NA_DETAIL(
-        INTERNAL, ArrowSchemaViewInit(&field_view, source_schema.children[i], &na_error),
-        &na_error, error);
-    if (field_view.type == NANOARROW_TYPE_DECIMAL128 ||
-        field_view.type == NANOARROW_TYPE_DECIMAL256) {
-      const int32_t scale = (std::max)(field_view.decimal_scale, 0);
-      const int32_t width =
-          (std::max)(field_view.decimal_precision - field_view.decimal_scale, 0) + scale;
-      if (width <= 38) {
-        create += "(" + std::to_string(width) + ", " + std::to_string(scale) + ")";
-      }
-    }
+    std::string type_name;
+    RAISE_STATUS(error, ColumnTypeName(pg_type, *source_schema.children[i],
+                                       source_fields[i], &type_name));
+    create += " " + type_name;
   }
 
   if (ingest_.mode == IngestMode::kAppend) {
@@ -783,8 +810,9 @@ AdbcStatusCode PostgresStatement::ExecuteIngest(struct ArrowArrayStream* stream,
   RAISE_STATUS(error, bind_stream.Begin([&]() -> Status {
     struct AdbcError tmp_error = ADBC_ERROR_INIT;
     AdbcStatusCode status_code = CreateBulkTable(
-        current_schema, bind_stream.bind_schema.value, &escaped_table,
-        &escaped_field_list, &copy_target_types, &has_copy_target_types, &tmp_error);
+        current_schema, bind_stream.bind_schema.value, bind_stream.bind_schema_fields,
+        &escaped_table, &escaped_field_list, &copy_target_types, &has_copy_target_types,
+        &tmp_error);
     return Status::FromAdbc(status_code, tmp_error);
   }));
 

@@ -2091,6 +2091,120 @@ TEST_F(PostgresStatementTest, SqlIngestJsonInvalid) {
   ASSERT_THAT(error.message, ::testing::HasSubstr("invalid input syntax for type json"));
 }
 
+// Ingest sends rows as multi-row INSERTs: full batches share a prepared
+// statement, a batch is cut early once its values pass a byte limit, and the
+// last batch is partial. Exercise all three and check every row arrives.
+TEST_F(PostgresStatementTest, SqlIngestInsertBatching) {
+  ASSERT_THAT(quirks()->DropTable(&connection, "bulk_ingest", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // 1000 rows make a full batch; the 20 one-MiB values at rows 1500-1519
+  // pass the 16 MiB limit partway through the second.
+  constexpr int64_t kRows = 2500;
+  const std::string big(1 << 20, 'x');
+  std::vector<std::optional<std::string>> values;
+  int64_t expected_bytes = 0;
+  for (int64_t i = 0; i < kRows; i++) {
+    if (i % 7 == 0) {
+      values.push_back(std::nullopt);
+      continue;
+    }
+    std::string value = (i >= 1500 && i < 1520) ? big : std::to_string(i);
+    expected_bytes += static_cast<int64_t>(value.size());
+    values.push_back(std::move(value));
+  }
+
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ASSERT_THAT(adbc_validation::MakeSchema(&schema.value, {{"s", NANOARROW_TYPE_STRING}}),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(
+      (adbc_validation::MakeBatch<std::string>(
+          &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr), values)),
+      adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementSetOption(&statement, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                     "bulk_ingest", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+              IsOkStatus(&error));
+  int64_t rows_affected = 0;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, &rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(rows_affected, kRows);
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "SELECT count(*)::BIGINT, count(s)::BIGINT, "
+                                       "sum(length(s))::BIGINT FROM bulk_ingest",
+                                       &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->length, 1);
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), kRows);
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[1], 0),
+            kRows - (kRows + 6) / 7);
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[2], 0),
+            expected_bytes);
+}
+
+// A list of decimals keeps its precision and scale, as a decimal does, rather
+// than becoming DuckDB's default DECIMAL(18,3). This checks only the created
+// column: MotherDuck can't bind binary numeric arrays, so no rows are sent.
+TEST_F(PostgresStatementTest, SqlIngestListOfDecimalColumnType) {
+  ASSERT_THAT(quirks()->DropTable(&connection, "bulk_ingest", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  struct ArrowError na_error;
+
+  ArrowSchemaInit(&schema.value);
+  ASSERT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_LIST),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(schema->children[0], "col"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetTypeDecimal(schema->children[0]->children[0],
+                                        NANOARROW_TYPE_DECIMAL128, 38, 8),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(ArrowArrayInitFromSchema(&batch.value, &schema.value, &na_error),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowArrayStartAppending(&batch.value), adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowArrayFinishBuildingDefault(&batch.value, &na_error),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementSetOption(&statement, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                     "bulk_ingest", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "SELECT data_type FROM duckdb_columns() "
+                                       "WHERE table_name = 'bulk_ingest' "
+                                       "AND column_name = 'col'",
+                                       &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NO_FATAL_FAILURE(adbc_validation::CompareArray<std::string>(
+      reader.array_view->children[0], {"DECIMAL(38,8)[]"}));
+}
+
 TEST_F(PostgresStatementTest, SqlIngestJsonb) {
   GTEST_SKIP() << "JSONB is PostgreSQL-only";
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -4240,6 +4354,23 @@ static std::vector<std::array<uint64_t, 4>> kDecimalData = {
     {8221368519775271798ULL, 126981ULL, 0, 0},
 };
 
+// kDecimalData as 256-bit values: negatives sign-extend into the upper words.
+static std::vector<std::array<uint64_t, 4>> kDecimalData256 = {
+    // -12345600000
+    {18446744061363951616ULL, 18446744073709551615ULL, 18446744073709551615ULL,
+     18446744073709551615ULL},
+    // 1234
+    {1234ULL, 0, 0, 0},
+    // 100000000
+    {100000000ULL, 0, 0, 0},
+    // 12345600000
+    {12345600000ULL, 0, 0, 0},
+    // 100000000000000
+    {100000000000000ULL, 0, 0, 0},
+    // 2342394230592232349023094
+    {8221368519775271798ULL, 126981ULL, 0, 0},
+};
+
 static std::vector<std::array<uint64_t, 4>> kDecimal256Data = {
     // 1234567890123456789012345678901234567890123456789012345678901234567890123456
     {17877984925544397504ULL, 5352188884907840935ULL, 234631617561833724ULL,
@@ -4270,7 +4401,7 @@ static std::initializer_list<DecimalTestCase> kDecimal256Cases = {
     {NANOARROW_TYPE_DECIMAL256,
      38,
      8,
-     kDecimalData,
+     kDecimalData256,
      // DuckDB's DECIMAL has a fixed scale, so its text keeps trailing zeros.
      {"-123.45600000", "0.00001234", "1.00000000", "123.45600000", "1000000.00000000",
       "23423942305922323.49023094"}}};
@@ -4279,7 +4410,7 @@ static std::initializer_list<DecimalTestCase> kDecimal256NoScaleCases = {
     {NANOARROW_TYPE_DECIMAL256,
      38,
      0,
-     kDecimalData,
+     kDecimalData256,
      {"-12345600000", "1234", "100000000", "12345600000", "100000000000000",
       "2342394230592232349023094"}}};
 
@@ -4318,9 +4449,9 @@ INSTANTIATE_TEST_SUITE_P(Decimal128Tests, PostgresDecimalTest,
 INSTANTIATE_TEST_SUITE_P(Decimal128NoScale, PostgresDecimalTest,
                          testing::ValuesIn(kDecimal128NoScaleCases));
 INSTANTIATE_TEST_SUITE_P(Decimal256Tests, PostgresDecimalTest,
-                         testing::ValuesIn(kDecimal128Cases));
+                         testing::ValuesIn(kDecimal256Cases));
 INSTANTIATE_TEST_SUITE_P(Decimal256NoScale, PostgresDecimalTest,
-                         testing::ValuesIn(kDecimal128NoScaleCases));
+                         testing::ValuesIn(kDecimal256NoScaleCases));
 INSTANTIATE_TEST_SUITE_P(Decimal256LargeTests, PostgresDecimalTest,
                          testing::ValuesIn(kDecimal256LargeCases));
 INSTANTIATE_TEST_SUITE_P(Decimal256LargeNoScale, PostgresDecimalTest,

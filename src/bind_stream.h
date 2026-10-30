@@ -355,6 +355,55 @@ struct BindStream {
     return Status::Ok();
   }
 
+  // Whether to declare a parameter as its target column's type rather than
+  // its Arrow type's: where MakeCopyFieldWriter encodes as the column's type
+  // (numeric, jsonb and arrays), and for timestamps, whose encodings match,
+  // so the value lands as COPY would have stored it rather than being cast
+  // through the session time zone.
+  static bool DeclareAsTarget(const PostgresType& type, const PostgresType& target) {
+    switch (target.type_id()) {
+      case PostgresTypeId::kNumeric:
+        return true;
+      case PostgresTypeId::kArray:
+        return type.type_id() == PostgresTypeId::kArray;
+      case PostgresTypeId::kJsonb:
+        return type.type_id() == PostgresTypeId::kJson;
+      case PostgresTypeId::kTimestamp:
+      case PostgresTypeId::kTimestamptz:
+        return type.type_id() == PostgresTypeId::kTimestamp ||
+               type.type_id() == PostgresTypeId::kTimestamptz;
+      default:
+        return false;
+    }
+  }
+
+  // Serialize the current row's values into param_buffer for the parameters
+  // starting at first_param, recording each one's offset (-1 for null) and
+  // length.
+  Status AppendCurrentRow(int64_t first_param, std::vector<int64_t>* offsets,
+                          std::vector<int>* lengths) {
+    for (int64_t col = 0; col < array_view->n_children; col++) {
+      const int64_t param = first_param + col;
+      if (ArrowArrayViewIsNull(array_view->children[col], current_row)) {
+        (*offsets)[param] = -1;
+        (*lengths)[param] = 0;
+        continue;
+      }
+      // Write() prefixes the value with its int32 length, as in COPY.
+      const int64_t start = param_buffer->size_bytes + sizeof(int32_t);
+      UNWRAP_NANOARROW(
+          na_error, Internal,
+          bind_field_writers[col]->Write(&param_buffer.value, current_row, &na_error));
+      const int64_t length = param_buffer->size_bytes - start;
+      if (length > (std::numeric_limits<int>::max)()) {
+        return Status::Internal("Column ", col, " serialized to >2GB of binary");
+      }
+      (*offsets)[param] = start;
+      (*lengths)[param] = static_cast<int>(length);
+    }
+    return Status::Ok();
+  }
+
   // Bulk ingest without COPY FROM STDIN, which MotherDuck's endpoint doesn't
   // support (#31): send the rows as multi-row INSERTs with binary parameters,
   // all through one pipeline so they run in one implicit transaction.
@@ -368,6 +417,13 @@ struct BindStream {
     const int64_t n_cols = bind_schema->n_children;
     if (n_cols == 0) {
       return Status::NotImplemented("[libpq] Bulk ingest requires at least one column");
+    }
+
+    // The protocol counts parameters in an int16.
+    constexpr int64_t kMaxParams = 65535;
+    if (n_cols > kMaxParams) {
+      return Status::NotImplemented("[libpq] Bulk ingest supports at most ", kMaxParams,
+                                    " columns, not ", n_cols);
     }
 
     // Encode each column as COPY would, and declare the type it is encoded as.
@@ -389,21 +445,17 @@ struct BindStream {
       UNWRAP_NANOARROW(na_error, Internal,
                        PostgresType::FromSchema(type_resolver, bind_schema->children[i],
                                                 &type, &na_error));
-      // The writers that encode as the column's type rather than the Arrow
-      // type's (see MakeCopyFieldWriter).
-      if (target_type != nullptr && (target_type->type_id() == PostgresTypeId::kNumeric ||
-                                     (target_type->type_id() == PostgresTypeId::kJsonb &&
-                                      type.type_id() == PostgresTypeId::kJson))) {
+      if (target_type != nullptr && DeclareAsTarget(type, *target_type)) {
         type = *target_type;
       }
       row_types[i] = type.oid();
     }
 
-    // The protocol counts parameters in an int16.
-    constexpr int64_t kMaxParams = 65535;
+    // MotherDuck rejects protocol messages over 16 MiB, so cap each batch's
+    // values below that, leaving room for the rest of the Bind message.
+    constexpr int64_t kMaxInsertBytes = 15 * 1024 * 1024;
     constexpr int64_t kMaxRowsPerInsert = 1000;
-    const int64_t rows_per_insert =
-        std::max<int64_t>(1, std::min(kMaxRowsPerInsert, kMaxParams / n_cols));
+    const int64_t rows_per_insert = (std::min)(kMaxRowsPerInsert, kMaxParams / n_cols);
 
     const std::string insert_prefix =
         "INSERT INTO " + escaped_table + " (" + escaped_field_list + ") VALUES ";
@@ -420,7 +472,6 @@ struct BindStream {
       }
       return query;
     };
-    const std::string full_insert = make_insert(rows_per_insert);
 
     std::vector<Oid> types;
     types.reserve(rows_per_insert * n_cols);
@@ -434,43 +485,57 @@ struct BindStream {
 
     int64_t rows_sent = 0;
     bool finished = false;
+    bool row_pending = false;  // the current row didn't fit in the last batch
+    // Full batches all share one statement, so parse it once: the first full
+    // batch is held back while the statement is prepared, then sent with it.
+    bool prepared = false;
+    int64_t held_rows = 0;
     Status status;
     Status pipeline_status = RunPipeline(
         pg_conn,
         [&](bool* sent) -> Status {
-          // Serialize up to rows_per_insert rows, which may span arrays.
-          param_buffer->size_bytes = 0;
-          int64_t n_rows = 0;
-          while (!finished && n_rows < rows_per_insert) {
-            UNWRAP_STATUS(EnsureNextRow());
-            if (current->release == nullptr) {
-              finished = true;
-              break;
-            }
-            for (int64_t col = 0; col < n_cols; col++) {
-              const int64_t param = n_rows * n_cols + col;
-              if (ArrowArrayViewIsNull(array_view->children[col], current_row)) {
-                offsets[param] = -1;
-                lengths[param] = 0;
-                continue;
+          *sent = true;
+          int64_t n_rows = held_rows;
+          held_rows = 0;
+          if (n_rows == 0) {
+            // Serialize up to rows_per_insert rows, which may span arrays.
+            param_buffer->size_bytes = 0;
+            while (!finished && n_rows < rows_per_insert) {
+              if (!row_pending) {
+                UNWRAP_STATUS(EnsureNextRow());
+                if (current->release == nullptr) {
+                  finished = true;
+                  break;
+                }
               }
-              // Write() prefixes the value with its int32 length, as in COPY.
-              const int64_t start = param_buffer->size_bytes + sizeof(int32_t);
-              UNWRAP_NANOARROW(na_error, Internal,
-                               bind_field_writers[col]->Write(&param_buffer.value,
-                                                              current_row, &na_error));
-              const int64_t length = param_buffer->size_bytes - start;
-              if (length > (std::numeric_limits<int>::max)()) {
-                return Status::Internal("Column ", col, " serialized to >2GB of binary");
+              row_pending = false;
+              const int64_t row_start = param_buffer->size_bytes;
+              UNWRAP_STATUS(AppendCurrentRow(n_rows * n_cols, &offsets, &lengths));
+              if (param_buffer->size_bytes > kMaxInsertBytes && n_rows > 0) {
+                // Send this row with the next batch instead.
+                param_buffer->size_bytes = row_start;
+                row_pending = true;
+                break;
               }
-              offsets[param] = start;
-              lengths[param] = static_cast<int>(length);
+              n_rows++;
             }
-            n_rows++;
-          }
+            if (n_rows == 0) {
+              *sent = false;
+              return Status::Ok();
+            }
 
-          *sent = n_rows > 0;
-          if (!*sent) return Status::Ok();
+            if (n_rows == rows_per_insert && !prepared) {
+              if (PQsendPrepare(pg_conn, /*stmtName=*/"",
+                                make_insert(rows_per_insert).c_str(),
+                                static_cast<int>(types.size()), types.data()) != 1) {
+                return MakeStatus(nullptr, "[libpq] Failed to prepare INSERT: {}",
+                                  PQerrorMessage(pg_conn));
+              }
+              prepared = true;
+              held_rows = n_rows;
+              return Status::Ok();
+            }
+          }
 
           // The buffer may have moved while growing, so point into it only now.
           const int n_params = static_cast<int>(n_rows * n_cols);
@@ -480,14 +545,21 @@ struct BindStream {
                     ? nullptr
                     : reinterpret_cast<const char*>(param_buffer->data) + offsets[i];
           }
-          // libpq copies the parameters, so the buffer can be reused.
-          const std::string tail_insert =
-              n_rows == rows_per_insert ? std::string() : make_insert(n_rows);
-          if (PQsendQueryParams(
-                  pg_conn,
-                  n_rows == rows_per_insert ? full_insert.c_str() : tail_insert.c_str(),
-                  n_params, types.data(), values.data(), lengths.data(), formats.data(),
-                  kPgBinaryFormat) != 1) {
+          // libpq copies the parameters, so the buffer can be reused. A
+          // partial batch replaces the unnamed prepared statement, so the next
+          // full batch prepares it again.
+          int sent_ok;
+          if (n_rows == rows_per_insert) {
+            sent_ok =
+                PQsendQueryPrepared(pg_conn, /*stmtName=*/"", n_params, values.data(),
+                                    lengths.data(), formats.data(), kPgBinaryFormat);
+          } else {
+            prepared = false;
+            sent_ok = PQsendQueryParams(pg_conn, make_insert(n_rows).c_str(), n_params,
+                                        types.data(), values.data(), lengths.data(),
+                                        formats.data(), kPgBinaryFormat);
+          }
+          if (sent_ok != 1) {
             return MakeStatus(nullptr, "[libpq] Failed to send INSERT: {}",
                               PQerrorMessage(pg_conn));
           }
