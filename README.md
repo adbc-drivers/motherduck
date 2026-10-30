@@ -100,10 +100,12 @@ The standard ADBC `username` database option, if set, replaces the URI's user.
 
 `adbc.motherduck.region` (database option) sets the host from a MotherDuck
 region, so the URI can leave it out: `us-east-1` connects to
-`pg.us-east-1-aws.motherduck.com`. Find your region with `md_user_info()`. The
-region must be lowercase letters, digits and dashes. Setting it together with a
-host (or `hostaddr`) in the URI is an error; when it's set, `PGHOST` is ignored.
-For example, with `region` set to `us-east-1`:
+`pg.us-east-1-aws.motherduck.com`. Find your region with `md_user_info()`. A
+region is lowercase letters and digits in dash-separated parts. It's taken to be
+on AWS unless its last part, all letters, names the cloud (`us-east-1-aws`).
+Setting it together with a host or `hostaddr` in the URI, or with `PGHOSTADDR`,
+is an error; when it's set, `PGHOST` is ignored. For example, with `region` set
+to `us-east-1`:
 
 ```text
 postgresql://postgres@/my_db?sslmode=verify-full&sslrootcert=system

@@ -560,6 +560,9 @@ TEST_F(PostgresDatabaseTest, RegionOption) {
       host.substr(kPrefix.size(), host.size() - kPrefix.size() - kSuffix.size());
   hostless.erase(start, end - start);
 
+  // Only the region can supply the host.
+  ScopedEnv pghost("PGHOST", "localhost");
+  ScopedEnv pghostaddr("PGHOSTADDR", nullptr);
   adbc_validation::Handle<struct AdbcDatabase> database;
   adbc_validation::Handle<struct AdbcConnection> connection;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
@@ -773,6 +776,9 @@ TEST(MotherDuckSessionNameTest, OptionInvalid) {
 TEST(MotherDuckRegionTest, RegionHost) {
   EXPECT_EQ("pg.us-east-1-aws.motherduck.com", adbcpq::RegionHost("us-east-1"));
   EXPECT_EQ("pg.eu-central-1-aws.motherduck.com", adbcpq::RegionHost("eu-central-1"));
+  // A region can name its cloud.
+  EXPECT_EQ("pg.us-east-1-aws.motherduck.com", adbcpq::RegionHost("us-east-1-aws"));
+  EXPECT_EQ("pg.us-central1-gcp.motherduck.com", adbcpq::RegionHost("us-central1-gcp"));
 }
 
 TEST(MotherDuckRegionTest, OptionSetGet) {
@@ -802,7 +808,10 @@ TEST(MotherDuckRegionTest, OptionInvalid) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   for (const char* value :
-       {"US-EAST-1", "us east 1", "us-east-1.example.com", "us-east-1/x", "us_east_1"}) {
+       {"US-EAST-1", "us east 1", "us-east-1.example.com", "us-east-1/x", "us_east_1",
+        "-", "--", "-us-east-1", "us-east-1-", "us--east-1",
+        "us-\xe9"
+        "ast-1"}) {
     EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
                                       value, &error),
                 IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
@@ -815,8 +824,12 @@ TEST(MotherDuckRegionTest, OptionInvalid) {
 
 TEST(MotherDuckRegionTest, ConflictsWithHost) {
   // Fails before connecting, so this needs no server.
-  for (const char* uri : {"postgresql://postgres@localhost:1/db",
-                          "host=localhost dbname=db", "hostaddr=127.0.0.1 dbname=db"}) {
+  for (const char* uri :
+       {"postgresql://postgres@localhost:1/db", "host=localhost dbname=db",
+        "hostaddr=127.0.0.1 dbname=db", "dbname=db"}) {
+    // Without a host in the URI, PGHOSTADDR conflicts.
+    ScopedEnv pghostaddr("PGHOSTADDR",
+                         std::strcmp(uri, "dbname=db") == 0 ? "127.0.0.1" : nullptr);
     struct AdbcError error = {};
     adbc_validation::Handle<struct AdbcDatabase> database;
     ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));

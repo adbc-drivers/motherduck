@@ -86,12 +86,49 @@ bool SetsSessionOption(std::string_view options, std::string_view name) {
   }
   return false;
 }
+
+// ASCII-only, unlike std::islower and friends, which follow the C locale.
+bool IsLower(char c) { return c >= 'a' && c <= 'z'; }
+bool IsDigit(char c) { return c >= '0' && c <= '9'; }
+
+// Whether value is a region: lowercase letters and digits in dash-separated
+// parts, e.g. us-east-1.
+bool IsRegion(std::string_view value) {
+  bool part_empty = true;
+  for (char c : value) {
+    if (c == '-') {
+      if (part_empty) return false;
+      part_empty = true;
+    } else if (IsLower(c) || IsDigit(c)) {
+      part_empty = false;
+    } else {
+      return false;
+    }
+  }
+  return !part_empty;
+}
+
+// Whether value can go into libpq options as is: libpq splits options on
+// whitespace, and MotherDuck isn't documented to honor libpq's backslash
+// escapes.
+bool IsOptionValue(std::string_view value) {
+  for (char c : value) {
+    if (c == '\\' || std::isspace(static_cast<unsigned char>(c))) return false;
+  }
+  return true;
+}
 }  // namespace
 
 std::string RegionHost(std::string_view region) {
   std::string host = "pg.";
   host += region;
-  host += "-aws.motherduck.com";
+  // A last part of only letters names the cloud (us-east-1-aws); otherwise
+  // it's AWS.
+  std::string_view last = region.substr(region.rfind('-') + 1);
+  bool names_cloud = !last.empty();
+  for (char c : last) names_cloud = names_cloud && IsLower(c);
+  if (!names_cloud) host += "-aws";
+  host += ".motherduck.com";
   return host;
 }
 
@@ -115,31 +152,28 @@ PostgresDatabase::~PostgresDatabase() = default;
 AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
                                            size_t* length, struct AdbcError* error) {
   std::string output;
+  // Options that are unset when empty.
+  const std::string* optional = nullptr;
   if (std::strcmp(option, ADBC_POSTGRESQL_OPTION_USE_COPY) == 0) {
     output = use_copy_ ? ADBC_OPTION_VALUE_ENABLED : ADBC_OPTION_VALUE_DISABLED;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
     output = attach_mode_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
-    if (session_name_.empty()) {
-      InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
-      return ADBC_STATUS_NOT_FOUND;
-    }
-    output = session_name_;
+    optional = &session_name_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
-    if (region_.empty()) {
-      InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
-      return ADBC_STATUS_NOT_FOUND;
-    }
-    output = region_;
+    optional = &region_;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
-    if (username_.empty()) {
-      InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
-      return ADBC_STATUS_NOT_FOUND;
-    }
-    output = username_;
+    optional = &username_;
   } else {
     InternalAdbcSetError(error, "[libpq] unknown database option '%s'", option);
     return ADBC_STATUS_NOT_FOUND;
+  }
+  if (optional != nullptr) {
+    if (optional->empty()) {
+      InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
+      return ADBC_STATUS_NOT_FOUND;
+    }
+    output = *optional;
   }
   if (output.size() + 1 <= *length) {
     std::memcpy(value, output.c_str(), output.size() + 1);
@@ -210,26 +244,22 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
     }
     attach_mode_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
-    // libpq splits options on whitespace, and MotherDuck isn't documented to
-    // honor libpq's backslash escapes, so neither can appear in the name.
-    for (const char* c = value; *c != '\0'; c++) {
-      if (*c == '\\' || std::isspace(static_cast<unsigned char>(*c))) {
-        InternalAdbcSetError(error,
-                             "[libpq] Invalid value for option %s=%s: whitespace and "
-                             "backslashes aren't allowed",
-                             key, value);
-        return ADBC_STATUS_INVALID_ARGUMENT;
-      }
+    if (!IsOptionValue(value)) {
+      InternalAdbcSetError(error,
+                           "[libpq] Invalid value for option %s=%s: whitespace and "
+                           "backslashes aren't allowed",
+                           key, value);
+      return ADBC_STATUS_INVALID_ARGUMENT;
     }
     session_name_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
-    // The region becomes part of a hostname, e.g. us-east-1.
-    for (const char* c = value; *c != '\0'; c++) {
-      if (!(std::islower(static_cast<unsigned char>(*c)) ||
-            std::isdigit(static_cast<unsigned char>(*c)) || *c == '-')) {
-        InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
-        return ADBC_STATUS_INVALID_ARGUMENT;
-      }
+    // The region becomes part of a hostname. An empty value unsets it.
+    if (*value != '\0' && !IsRegion(value)) {
+      InternalAdbcSetError(error,
+                           "[libpq] Invalid value for option %s=%s: expected a region "
+                           "such as us-east-1",
+                           key, value);
+      return ADBC_STATUS_INVALID_ARGUMENT;
     }
     region_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
@@ -307,11 +337,14 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
   }
   std::string host;
   if (!region_.empty()) {
-    if (uri_sets_host) {
+    // libpq would still apply PGHOSTADDR, connecting to that address
+    // instead of the region's host.
+    const char* env_hostaddr = std::getenv("PGHOSTADDR");
+    if (uri_sets_host || (env_hostaddr != nullptr && *env_hostaddr != '\0')) {
       PQconninfoFree(conninfo);
       InternalAdbcSetError(error,
-                           "[libpq] Set either a host in the URI or database "
-                           "option '%s', not both",
+                           "[libpq] Set either database option '%s' or a host "
+                           "(host or hostaddr in the URI, or PGHOSTADDR), not both",
                            ADBC_MOTHERDUCK_OPTION_REGION);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
