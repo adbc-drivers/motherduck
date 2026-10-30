@@ -22,8 +22,12 @@ subdir = "."
 [lang.script.test]
 environment = "test"
 
+# Validate against MotherDuck (see ci/scripts/pre-test.sh), not a Compose service.
+[lang.script.validation]
+configs = [{ service-name = "", environment = "test" }]
+
 [secrets]
-MOTHERDUCK_TOKEN = { secret = "MOTHERDUCK_TOKEN", contexts = ["test"] }
+MOTHERDUCK_TOKEN = { secret = "MOTHERDUCK_TOKEN", contexts = ["test", "validate"] }
 
 [validation.extra-pypi-dependencies]
 hypothesis = ">=6,<7"
