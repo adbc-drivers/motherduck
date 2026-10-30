@@ -34,6 +34,11 @@ host="${MOTHERDUCK_PG_HOST:-pg.us-east-1-aws.motherduck.com}"
 # concurrent jobs and runs don't share tables. An explicit database is left as is.
 if [[ -n "${MOTHERDUCK_TEST_DATABASE:-}" ]]; then
   database="$MOTHERDUCK_TEST_DATABASE"
+  # The driver's default single attach mode needs a named database.
+  if [[ "$database" == "md:" ]]; then
+    printf 'MOTHERDUCK_TEST_DATABASE must name a database, not md:\n' >&2
+    exit 1
+  fi
   manage_database=false
 else
   run="${GITHUB_RUN_ID:-local}_${GITHUB_RUN_ATTEMPT:-1}"

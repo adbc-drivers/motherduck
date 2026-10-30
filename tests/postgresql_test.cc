@@ -544,6 +544,10 @@ TEST(MotherDuckAttachModeTest, AddAttachMode) {
             adbcpq::AddAttachMode("-c attach_mode=workspace", "single"));
   EXPECT_EQ("-cattach_mode=workspace",
             adbcpq::AddAttachMode("-cattach_mode=workspace", "single"));
+  EXPECT_EQ("--attach-mode=workspace",
+            adbcpq::AddAttachMode("--attach-mode=workspace", "single"));
+  EXPECT_EQ("-c attach-mode=workspace",
+            adbcpq::AddAttachMode("-c attach-mode=workspace", "single"));
   // Other options that mention attach_mode don't count.
   EXPECT_EQ("--session_name=attach_mode=x --attach_mode=single",
             adbcpq::AddAttachMode("--session_name=attach_mode=x", "single"));
