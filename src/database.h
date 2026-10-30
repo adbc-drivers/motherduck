@@ -83,7 +83,6 @@ class PostgresDatabase {
   std::string uri_;
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
   bool use_copy_ = true;
-  TypeResolverMode type_resolver_mode_ = TypeResolverMode::kServer;
   std::string attach_mode_ = "single";
 };
 }  // namespace adbcpq

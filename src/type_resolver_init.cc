@@ -20,175 +20,75 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// For #warning Please include winsock2.h before windows.h on RTools/msys2
-#ifdef _WIN32
-#include <winsock2.h>
-#endif
-
 #include "type_resolver_init.h"
 
-#include <cstdint>
+#include <array>
+#include <memory>
 #include <string>
 #include <utility>
-#include <vector>
 
 #include "codegen/pgtype.h"
-#include "result_helper.h"
 
 using adbc::driver::Status;
 
 namespace adbcpq {
 
+namespace {
+
+// DuckDB-only types, which MotherDuck sends as text under fixed OIDs. Elements
+// must precede their arrays.
+constexpr std::array<PostgresTypeResolver::Item, 19> kMotherDuckTypeItems = {{
+    {17000, "duckdb_nested_list", "textrecv", 0, 0, 0},
+    {17001, "duckdb_struct", "textrecv", 0, 0, 0},
+    {17002, "_duckdb_struct", "array_recv", 17001, 0, 0},
+    {17003, "duckdb_map", "textrecv", 0, 0, 0},
+    {17004, "_duckdb_map", "array_recv", 17003, 0, 0},
+    {17005, "duckdb_enum", "textrecv", 0, 0, 0},
+    {17006, "_duckdb_enum", "array_recv", 17005, 0, 0},
+    {17007, "duckdb_union", "textrecv", 0, 0, 0},
+    {17008, "_duckdb_union", "array_recv", 17007, 0, 0},
+    {17009, "duckdb_timestamp_ns", "textrecv", 0, 0, 0},
+    {17010, "_duckdb_timestamp_ns", "array_recv", 17009, 0, 0},
+    {17011, "duckdb_variant", "textrecv", 0, 0, 0},
+    {17012, "_duckdb_variant", "array_recv", 17011, 0, 0},
+    {17013, "duckdb_time_ns", "textrecv", 0, 0, 0},
+    {17014, "_duckdb_time_ns", "array_recv", 17013, 0, 0},
+    {17015, "duckdb_geometry", "textrecv", 0, 0, 0},
+    {17016, "_duckdb_geometry", "array_recv", 17015, 0, 0},
+    {17017, "duckdb_type", "textrecv", 0, 0, 0},
+    {17018, "_duckdb_type", "array_recv", 17017, 0, 0},
+}};
+
+}  // namespace
+
 Status InitializeTypeResolver(PostgresTypeResolver& resolver) {
   ArrowError na_error = {};
+  // PostgreSQL types first, so GetOID() keeps returning the standard OIDs
   for (const auto& item : kBuiltinTypeItems) {
+    UNWRAP_NANOARROW(na_error, Internal, resolver.Insert(item, &na_error));
+  }
+  for (const auto& item : kMotherDuckTypeItems) {
     UNWRAP_NANOARROW(na_error, Internal, resolver.Insert(item, &na_error));
   }
   return Status::Ok();
 }
 
-static Status InsertPgAttributeResult(const PqResultHelper& result,
-                                      PostgresTypeResolver& resolver) {
-  int num_rows = result.NumRows();
-  std::vector<std::pair<std::string, uint32_t>> columns;
-  int64_t current_type_oid = 0;
-
-  if (result.NumColumns() != 3) {
-    return Status::Internal(
-        "Expected 3 columns from type resolver pg_attribute query but got ",
-        result.NumColumns());
+Status SharedTypeResolver(std::shared_ptr<PostgresTypeResolver>* out) {
+  static const auto kShared =
+      []() -> std::pair<std::shared_ptr<PostgresTypeResolver>, std::string> {
+    auto resolver = std::make_shared<PostgresTypeResolver>();
+    Status status = InitializeTypeResolver(*resolver);
+    if (!status.ok()) return {nullptr, status.message()};
+    return {std::move(resolver), ""};
+  }();
+  if (!kShared.first) {
+    return Status::Internal("Failed to build the type table: ", kShared.second);
   }
-
-  for (int row = 0; row < num_rows; row++) {
-    PqResultRow item = result.Row(row);
-    int64_t type_oid;
-    UNWRAP_RESULT(type_oid, item[0].ParseInteger());
-    std::string_view col_name = item[1].value();
-    int64_t col_oid;
-    UNWRAP_RESULT(col_oid, item[2].ParseInteger());
-
-    if (type_oid != current_type_oid && !columns.empty()) {
-      resolver.InsertClass(static_cast<uint32_t>(current_type_oid), columns);
-      columns.clear();
-      current_type_oid = type_oid;
-    }
-
-    columns.push_back({std::string(col_name), static_cast<uint32_t>(col_oid)});
-  }
-
-  if (!columns.empty()) {
-    resolver.InsertClass(static_cast<uint32_t>(current_type_oid), columns);
-  }
-
-  return Status::Ok();
-}
-
-static Status InsertPgTypeResult(const PqResultHelper& result,
-                                 PostgresTypeResolver& resolver) {
-  if (result.NumColumns() != 5 && result.NumColumns() != 6) {
-    return Status::Internal(
-        "Expected 5 or 6 columns from type resolver pg_type query but got ",
-        result.NumColumns());
-  }
-
-  int num_rows = result.NumRows();
-  int num_cols = result.NumColumns();
-  PostgresTypeResolver::Item type_item;
-
-  for (int row = 0; row < num_rows; row++) {
-    PqResultRow item = result.Row(row);
-    int64_t oid;
-    UNWRAP_RESULT(oid, item[0].ParseInteger());
-    const char* typname = item[1].data;
-    const char* typreceive = item[2].data;
-    int64_t typbasetype;
-    UNWRAP_RESULT(typbasetype, item[3].ParseInteger());
-    int64_t typrelid;
-    UNWRAP_RESULT(typrelid, item[4].ParseInteger());
-
-    int64_t typarray;
-    if (num_cols == 6) {
-      UNWRAP_RESULT(typarray, item[5].ParseInteger());
-    } else {
-      typarray = 0;
-    }
-
-    // Special case the aclitem because it shows up in a bunch of internal tables
-    if (strcmp(typname, "aclitem") == 0) {
-      typreceive = "aclitem_recv";
-    }
-
-    type_item.oid = static_cast<uint32_t>(oid);
-    type_item.typname = typname;
-    type_item.typreceive = typreceive;
-    type_item.class_oid = static_cast<uint32_t>(typrelid);
-    type_item.base_oid = static_cast<uint32_t>(typbasetype);
-
-    // XXX: it seems to be intentional that we ignore errors here?
-    int insert_result = resolver.Insert(type_item, nullptr);
-
-    // If there's an array type and the insert succeeded, add that now too
-    if (insert_result == NANOARROW_OK && typarray != 0) {
-      std::string array_typname = "_" + std::string(typname);
-      type_item.oid = static_cast<uint32_t>(typarray);
-      type_item.typname = array_typname.c_str();
-      type_item.typreceive = "array_recv";
-      type_item.child_oid = static_cast<uint32_t>(oid);
-
-      resolver.Insert(type_item, nullptr);
-    }
-  }
-
-  return Status::Ok();
-}
-
-Status RebuildTypeResolver(PGconn* conn, PostgresTypeResolver& resolver) {
-  // We need a few queries to build the resolver. The current strategy might
-  // fail for some recursive definitions (e.g., arrays of records of arrays).
-  // First, one on the pg_attribute table to resolve column names/oids for
-  // record types.
-  const std::string kColumnsQuery = R"(
-SELECT
-    attrelid,
-    attname,
-    atttypid
-FROM
-    pg_catalog.pg_attribute
-ORDER BY
-    attrelid, attnum
-)";
-
-  // Second, a query of the pg_type table. This query may need a few attempts to handle
-  // recursive definitions (e.g., record types with array column). This currently won't
-  // handle range types because those rows don't have child OID information. Arrays types
-  // are inserted after a successful insert of the element type.
-  std::string type_query =
-      "SELECT oid, typname, typreceive, typbasetype, typrelid, typarray FROM "
-      "pg_catalog.pg_type WHERE (typreceive != 0 OR typsend != 0) AND typtype != 'r' AND "
-      "typreceive::TEXT != 'array_recv'";
-
-  // Insert record type definitions (this includes table schemas)
-  PqResultHelper columns(conn, kColumnsQuery.c_str());
-  UNWRAP_STATUS(columns.Execute());
-  UNWRAP_STATUS(InsertPgAttributeResult(columns, resolver));
-
-  // Attempt filling the resolver a few times to handle recursive definitions.
-  int32_t max_attempts = 3;
-  PqResultHelper types(conn, type_query);
-  for (int32_t i = 0; i < max_attempts; i++) {
-    UNWRAP_STATUS(types.Execute());
-    UNWRAP_STATUS(InsertPgTypeResult(types, resolver));
-  }
-
+  *out = kShared.first;
   return Status::Ok();
 }
 
 }  // namespace adbcpq
-
-Status InternalAdbcRebuildTypeResolver(PGconn* conn,
-                                       adbcpq::PostgresTypeResolver& resolver) {
-  return adbcpq::RebuildTypeResolver(conn, resolver);
-}
 
 Status InternalAdbcInitializeTypeResolver(adbcpq::PostgresTypeResolver& resolver) {
   return adbcpq::InitializeTypeResolver(resolver);
