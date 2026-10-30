@@ -61,15 +61,6 @@
 
 namespace adbcpq {
 
-namespace {
-// MotherDuck answers DDL with an empty result set (a Count or Success column)
-// instead of a command tag, so PGRES_TUPLES_OK means success here too.
-bool IsDdlSuccess(PGresult* result) {
-  ExecStatusType status = PQresultStatus(result);
-  return status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK;
-}
-}  // namespace
-
 int TupleReader::GetSchema(struct ArrowSchema* out) {
   assert(copy_reader_ != nullptr);
   ArrowErrorInit(&na_error_);
@@ -461,7 +452,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                       /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
                                       /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                                       /*resultFormat=*/1 /*(binary)*/);
-      if (!IsDdlSuccess(result)) {
+      if (!IsResultOk(result)) {
         AdbcStatusCode code =
             MakeStatus(result, "[libpq] Failed to drop table: {}\nQuery was: {}",
                        PQerrorMessage(conn), drop)
@@ -524,7 +515,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                   /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
                                   /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                                   /*resultFormat=*/1 /*(binary)*/);
-  if (!IsDdlSuccess(result)) {
+  if (!IsResultOk(result)) {
     AdbcStatusCode code =
         MakeStatus(result, "[libpq] Failed to create table: {}\nQuery was: {}",
                    PQerrorMessage(conn), create)
