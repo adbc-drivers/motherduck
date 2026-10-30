@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
@@ -33,8 +34,15 @@
 #include "postgres_type.h"
 #include "type_resolver_init.h"
 
+#define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
+
 namespace adbcpq {
 using adbc::driver::Status;
+
+/// \brief Append --attach_mode=<attach_mode> to libpq session options.
+///
+/// Returns options unchanged if they already set attach_mode.
+std::string AddAttachMode(std::string_view options, std::string_view attach_mode);
 
 class PostgresDatabase {
  public:
@@ -75,5 +83,6 @@ class PostgresDatabase {
   std::string uri_;
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
   bool use_copy_ = true;
+  std::string attach_mode_ = "single";
 };
 }  // namespace adbcpq
