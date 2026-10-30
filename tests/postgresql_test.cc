@@ -78,15 +78,11 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return SetupDatabase(database, uri, error);
   }
 
-  // Works around https://github.com/adbc-drivers/motherduck/issues/10 and
-  // https://github.com/adbc-drivers/motherduck/issues/11 so other tests reach their
-  // own assertions; the MotherDuckDefaults* tests cover the defaults.
+  // Works around https://github.com/adbc-drivers/motherduck/issues/11;
+  // MotherDuckDefaultsSelect covers the default.
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database, const char* uri,
                                struct AdbcError* error) const {
     AdbcStatusCode status = AdbcDatabaseSetOption(database, "uri", uri, error);
-    if (status != ADBC_STATUS_OK) return status;
-    status = AdbcDatabaseSetOption(database, "adbc.postgresql.type_resolver_mode",
-                                   "builtin", error);
     if (status != ADBC_STATUS_OK) return status;
     return AdbcDatabaseSetOption(database, "adbc.postgresql.use_copy", "false", error);
   }
@@ -383,9 +379,6 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
 
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "adbc.postgresql.type_resolver_mode",
-                                    "builtin", &error),
-              IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   use_copy = adbc_validation::DatabaseGetOption(&database.value, key, &error);
   EXPECT_THAT(use_copy, ::testing::Optional("true"s));
@@ -403,38 +396,53 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 }
 
-TEST_F(PostgresDatabaseTest, TypeResolverModeOption) {
+// https://github.com/adbc-drivers/motherduck/issues/10
+TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+              IsOkStatus(&error));
+}
+
+TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  // A password in the URI takes precedence over PGPASSWORD.
+  std::string bad_uri = uri;
+  bad_uri += std::strchr(uri, '?') ? "&password=invalid" : "?password=invalid";
+
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error),
+              IsStatus(ADBC_STATUS_IO, &error));
+}
+
+TEST_F(PostgresDatabaseTest, TypeResolverModeOptionIgnored) {
   const char* key = "adbc.postgresql.type_resolver_mode";
-  std::optional<std::string> type_resolver_mode;
 
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, key, "builtin", &error),
-              IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
-  type_resolver_mode = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(type_resolver_mode, ::testing::Optional("builtin"s));
-}
+  // The warning is once per process, and no other test sets this option
+  ::testing::internal::CaptureStderr();
+  AdbcStatusCode status = AdbcDatabaseSetOption(&database.value, key, "server", &error);
+  std::string warning = ::testing::internal::GetCapturedStderr();
+  ASSERT_THAT(status, IsOkStatus(&error));
+  EXPECT_THAT(warning, ::testing::HasSubstr("ignoring database option " +
+                                            std::string(key) + "=server"));
 
-TEST_F(PostgresDatabaseTest, TypeResolverModeOptionDefault) {
-  const char* key = "adbc.postgresql.type_resolver_mode";
-  std::optional<std::string> type_resolver_mode;
+  ::testing::internal::CaptureStderr();
+  status = AdbcDatabaseSetOption(&database.value, key, "builtin", &error);
+  warning = ::testing::internal::GetCapturedStderr();
+  ASSERT_THAT(status, IsOkStatus(&error));
+  EXPECT_EQ(warning, "");
 
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
-  type_resolver_mode = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(type_resolver_mode, ::testing::Optional("server"s));
-}
-
-// https://github.com/adbc-drivers/motherduck/issues/10: the default server type
-// resolver fails on NULL OIDs in pg_type.
-TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
 }
 
@@ -447,10 +455,6 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsSelect) {
 
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
-  // Isolate from https://github.com/adbc-drivers/motherduck/issues/10.
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "adbc.postgresql.type_resolver_mode",
-                                    "builtin", &error),
-              IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
@@ -1345,6 +1349,85 @@ class PostgresStatementTest : public ::testing::Test,
   PostgresQuirks quirks_;
 };
 ADBCV_TEST_STATEMENT(PostgresStatementTest)
+
+// Every documented DuckDB type should resolve to a known type, not unnamed<oid:N>
+TEST_F(PostgresStatementTest, MotherDuckTypesResolve) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement,
+          "SELECT 1::TINYINT AS ti, 1::SMALLINT AS si, 1::INTEGER AS i, "
+          "1::BIGINT AS bi, 1::HUGEINT AS hi, 1::UTINYINT AS uti, "
+          "1::USMALLINT AS usi, 1::UINTEGER AS ui, 1::UBIGINT AS ub, "
+          "1::UHUGEINT AS uhi, 1::BIGNUM AS bn, 1.5::DECIMAL(10, 2) AS d, "
+          "1.5::FLOAT AS fl, 1.5::DOUBLE AS f, true AS bo, '101'::BIT AS bt, "
+          "'x' AS v, 'x'::BLOB AS b, gen_random_uuid() AS u, '{}'::JSON AS j, "
+          "DATE '2020-01-01' AS dt, TIME '12:00:00' AS tm, "
+          "TIMETZ '12:00:00+01' AS ttz, '12:00:00'::TIME_NS AS tmns, "
+          "TIMESTAMP '2020-01-01 00:00:00' AS tsl, "
+          "TIMESTAMP_S '2020-01-01 00:00:00' AS tss, "
+          "TIMESTAMP_MS '2020-01-01 00:00:00' AS tsms, "
+          "TIMESTAMPTZ '2020-01-01 00:00:00+00' AS ts, INTERVAL 1 DAY AS iv, "
+          "'POINT(1 2)'::GEOMETRY AS g, [1, 2] AS l, [1, 2, 3]::INTEGER[3] AS a, "
+          "{'a': 1} AS s, ROW(1, 'a') AS r, MAP {'a': 1} AS m, "
+          "union_value(n := 1) AS un, 1::VARIANT AS va, 'a'::ENUM('a', 'b') AS e, "
+          "[[1, 2]] AS nl, '2020-01-01 00:00:00.123456789'::TIMESTAMP_NS AS tns, "
+          "[{'a': 1}] AS ls",
+          &error),
+      IsOkStatus(&error));
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  for (int64_t i = 0; i < reader.schema->n_children; i++) {
+    const ArrowSchema* child = reader.schema->children[i];
+    SCOPED_TRACE(child->name);
+    // Unresolved OIDs are labelled unnamed<oid:N>
+    ArrowStringView typname = {nullptr, 0};
+    ASSERT_EQ(ArrowMetadataGetValue(child->metadata,
+                                    ArrowCharView("ADBC:postgresql:typname"), &typname),
+              NANOARROW_OK);
+    if (typname.data != nullptr) {
+      EXPECT_THAT(std::string(typname.data, static_cast<size_t>(typname.size_bytes)),
+                  ::testing::Not(::testing::StartsWith("unnamed")));
+    }
+  }
+
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->length, 1);
+
+  // DuckDB-only types arrive as text
+  const std::vector<std::pair<std::string, std::string>> expected_text = {
+      {"s", "{'a': 1}"},
+      {"m", "{a=1}"},
+      {"e", "a"},
+      {"nl", "[[1, 2]]"},
+      {"tns", "2020-01-01 00:00:00.123456789"},
+  };
+  for (const auto& [name, expected] : expected_text) {
+    SCOPED_TRACE(name);
+    int64_t index = -1;
+    for (int64_t i = 0; i < reader.schema->n_children; i++) {
+      if (name == reader.schema->children[i]->name) index = i;
+    }
+    ASSERT_GE(index, 0);
+    ASSERT_STREQ(reader.schema->children[index]->format, "u");
+    ArrowStringView view =
+        ArrowArrayViewGetStringUnsafe(reader.array_view->children[index], 0);
+    EXPECT_EQ(std::string_view(view.data, static_cast<size_t>(view.size_bytes)),
+              expected);
+  }
+
+  const int64_t ls_index = reader.schema->n_children - 1;
+  ASSERT_STREQ(reader.schema->children[ls_index]->format, "+l");
+  ASSERT_STREQ(reader.schema->children[ls_index]->children[0]->format, "u");
+  const ArrowArrayView* ls_values = reader.array_view->children[ls_index]->children[0];
+  ArrowStringView ls_view = ArrowArrayViewGetStringUnsafe(ls_values, 0);
+  EXPECT_EQ(std::string_view(ls_view.data, static_cast<size_t>(ls_view.size_bytes)),
+            "{'a': 1}");
+}
 
 TEST_F(PostgresStatementTest, TransactionStatus) {
   using adbc_validation::ConnectionGetOption;
