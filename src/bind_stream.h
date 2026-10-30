@@ -240,8 +240,8 @@ struct BindStream {
     return Status::Ok();
   }
 
-  Status BindAndExecuteCurrentRow(PGconn* pg_conn, PGresult** result_out,
-                                  int result_format) {
+  // Serialize the current row into param_values and param_lengths.
+  Status SerializeCurrentRow() {
     param_buffer->size_bytes = 0;
     int64_t last_offset = 0;
     std::vector<bool> is_null_param(array_view->n_children);
@@ -286,6 +286,13 @@ struct BindStream {
       last_offset += param_lengths[col];
     }
 
+    return Status::Ok();
+  }
+
+  Status BindAndExecuteCurrentRow(PGconn* pg_conn, PGresult** result_out,
+                                  int result_format) {
+    UNWRAP_STATUS(SerializeCurrentRow());
+
     PGresult* result =
         PQexecPrepared(pg_conn, /*stmtName=*/"",
                        /*nParams=*/bind_schema->n_children, param_values.data(),
@@ -301,6 +308,21 @@ struct BindStream {
     }
 
     *result_out = result;
+    return Status::Ok();
+  }
+
+  // Queue the current row for the prepared statement in a pipeline. libpq
+  // copies the parameters, so the next row can reuse the buffer.
+  Status SendCurrentRow(PGconn* pg_conn, int result_format) {
+    UNWRAP_STATUS(SerializeCurrentRow());
+
+    if (PQsendQueryPrepared(pg_conn, /*stmtName=*/"",
+                            /*nParams=*/bind_schema->n_children, param_values.data(),
+                            param_lengths.data(), param_formats.data(),
+                            result_format) != 1) {
+      return MakeStatus(nullptr, "[libpq] Failed to send prepared statement: {}",
+                        PQerrorMessage(pg_conn));
+    }
     return Status::Ok();
   }
 

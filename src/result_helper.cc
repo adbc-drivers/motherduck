@@ -23,13 +23,18 @@
 // For #warning Please include winsock2.h before windows.h on RTools/msys2
 #ifdef _WIN32
 #include <winsock2.h>
+#else
+#include <poll.h>
 #endif
 
 #include "result_helper.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -128,10 +133,70 @@ Status PqResultHelper::ExecuteScript() {
   if (statements.size() <= 1) {
     return Execute();
   }
-  return ExecutePipeline(statements);
+  // Only the one-at-a-time path can end a COPY and keep the connection usable.
+  if (std::any_of(statements.begin(), statements.end(), IsCopyStatement)) {
+    return ExecuteSequentially(statements);
+  }
+  return ExecuteBatch(statements);
 }
 
-Status PqResultHelper::ExecutePipeline(const std::vector<std::string>& statements) {
+Status PqResultHelper::ExecuteBatch(const std::vector<std::string>& statements) {
+  ClearResult();
+  size_t next = 0;
+  Status status;
+  Status pipeline_status = RunPipeline(
+      conn_,
+      [&](bool* sent) -> Status {
+        *sent = next < statements.size();
+        if (!*sent) return Status::Ok();
+        if (PQsendQueryParams(conn_, statements[next].c_str(), /*nParams=*/0,
+                              /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
+                              /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
+                              static_cast<int>(Format::kText)) != 1) {
+          return MakeStatus(nullptr, "[libpq] Failed to send query '{}': {}",
+                            statements[next], PQerrorMessage(conn_));
+        }
+        next++;
+        return Status::Ok();
+      },
+      [&](size_t index, PGresult* result) {
+        KeepPipelineResult(result, statements[index], &status);
+      });
+  // A statement's own error explains more than the pipeline failing after it.
+  if (!status.ok()) return status;
+  return pipeline_status;
+}
+
+void PqResultHelper::KeepPipelineResult(PGresult* result, const std::string& statement,
+                                        Status* status) {
+  switch (PQresultStatus(result)) {
+    case PGRES_TUPLES_OK:
+    case PGRES_COMMAND_OK:
+    case PGRES_EMPTY_QUERY:
+      // Keep the last result, as PQexec would.
+      if (status->ok()) {
+        SetResult(result);
+      } else {
+        PQclear(result);
+      }
+      break;
+    case PGRES_PIPELINE_ABORTED:
+      // Skipped because an earlier statement failed
+      PQclear(result);
+      break;
+    default:
+      if (status->ok()) {
+        SetResult(result);
+        *status = MakeStatus(result_, "[libpq] Failed to execute query '{}': {}",
+                             statement, PQresultErrorMessage(result_));
+      } else {
+        PQclear(result);
+      }
+      break;
+  }
+}
+
+Status PqResultHelper::ExecuteSequentially(const std::vector<std::string>& statements) {
   ClearResult();
   if (PQenterPipelineMode(conn_) != 1) {
     return MakeStatus(nullptr, "[libpq] Failed to enter pipeline mode: {}",
@@ -214,48 +279,28 @@ Status PqResultHelper::CollectPipelineResults(const std::string& statement,
                                               bool* ended_copy_in) {
   Status status;
   while (PGresult* result = PQgetResult(conn_)) {
-    switch (PQresultStatus(result)) {
-      case PGRES_TUPLES_OK:
-      case PGRES_COMMAND_OK:
-      case PGRES_EMPTY_QUERY:
-        // Keep the last result, as PQexec would.
-        if (status.ok()) {
-          SetResult(result);
-        } else {
-          PQclear(result);
-        }
-        break;
-      case PGRES_COPY_IN:
-      case PGRES_COPY_OUT:
-      case PGRES_COPY_BOTH: {
-        // There's no COPY data to send or a place to put it, so end the COPY.
-        // Otherwise libpq stays in COPY state and never returns null.
-        const ExecStatusType copy_status = PQresultStatus(result);
-        PQclear(result);
-        status = Status(
-            ADBC_STATUS_NOT_IMPLEMENTED,
-            "[libpq] COPY is not supported in a multi-statement query: " + statement);
-        if (copy_status != PGRES_COPY_OUT) {
-          PQputCopyEnd(conn_, "COPY is not supported in a multi-statement query");
-          *ended_copy_in = true;
-        }
-        if (copy_status != PGRES_COPY_IN) {
-          char* buffer = nullptr;
-          while (PQgetCopyData(conn_, &buffer, /*async=*/0) >= 0) {
-            PQfreemem(buffer);
-          }
-        }
-        break;
+    const ExecStatusType result_status = PQresultStatus(result);
+    if (result_status != PGRES_COPY_IN && result_status != PGRES_COPY_OUT &&
+        result_status != PGRES_COPY_BOTH) {
+      KeepPipelineResult(result, statement, &status);
+      continue;
+    }
+
+    // There's no COPY data to send or a place to put it, so end the COPY.
+    // Otherwise libpq stays in COPY state and never returns null.
+    PQclear(result);
+    status =
+        Status(ADBC_STATUS_NOT_IMPLEMENTED,
+               "[libpq] COPY is not supported in a multi-statement query: " + statement);
+    if (result_status != PGRES_COPY_OUT) {
+      PQputCopyEnd(conn_, "COPY is not supported in a multi-statement query");
+      *ended_copy_in = true;
+    }
+    if (result_status != PGRES_COPY_IN) {
+      char* buffer = nullptr;
+      while (PQgetCopyData(conn_, &buffer, /*async=*/0) >= 0) {
+        PQfreemem(buffer);
       }
-      default:
-        if (status.ok()) {
-          SetResult(result);
-          status = MakeStatus(result_, "[libpq] Failed to execute query '{}': {}",
-                              statement, PQresultErrorMessage(result_));
-        } else {
-          PQclear(result);
-        }
-        break;
     }
   }
   return status;
@@ -371,9 +416,196 @@ int64_t PqResultHelper::AffectedRows() const {
 
 namespace {
 
+// Wait until the connection's socket is readable, or writable as well if
+// `write` is set.
+Status WaitForSocket(PGconn* conn, bool write) {
+  const int socket = PQsocket(conn);
+  if (socket < 0) {
+    return Status::IO("[libpq] Connection has no socket: ", PQerrorMessage(conn));
+  }
+#ifdef _WIN32
+  WSAPOLLFD fd = {};
+  fd.fd = static_cast<SOCKET>(socket);
+  fd.events = static_cast<SHORT>(POLLRDNORM | (write ? POLLWRNORM : 0));
+  const int ready = WSAPoll(&fd, 1, /*timeout=*/-1);
+#else
+  struct pollfd fd = {};
+  fd.fd = socket;
+  fd.events = static_cast<short>(POLLIN | (write ? POLLOUT : 0));
+  int ready;
+  do {
+    ready = poll(&fd, 1, /*timeout=*/-1);
+  } while (ready < 0 && errno == EINTR);
+#endif
+  if (ready < 0) {
+    return Status::IO("[libpq] Failed to wait on the connection");
+  }
+  return Status::Ok();
+}
+
+}  // namespace
+
+Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_next,
+                   const std::function<void(size_t, PGresult*)>& on_result) {
+  if (PQenterPipelineMode(conn) != 1) {
+    return MakeStatus(nullptr, "[libpq] Failed to enter pipeline mode: {}",
+                      PQerrorMessage(conn));
+  }
+  // Without blocking, we can read results while commands are still going out.
+  // Blocking writes deadlock once the server stops reading because it's
+  // blocked writing results we aren't reading.
+  const int was_nonblocking = PQisnonblocking(conn);
+  if (PQsetnonblocking(conn, 1) != 0) {
+    Status status =
+        MakeStatus(nullptr, "[libpq] Failed to make connection nonblocking: {}",
+                   PQerrorMessage(conn));
+    PQexitPipelineMode(conn);
+    return status;
+  }
+
+  Status status;
+  bool sending = true;      // commands may remain to be sent
+  bool synced = false;      // the closing sync has been queued
+  bool done = false;        // the sync's result has arrived
+  size_t index = 0;         // the command the next result belongs to
+  bool in_command = false;  // a result for that command has arrived
+  while (!done) {
+    const int flushed = PQflush(conn);
+    if (flushed < 0) {
+      status = MakeStatus(nullptr, "[libpq] Failed to send pipeline: {}",
+                          PQerrorMessage(conn));
+      break;
+    }
+
+    // Queue the next command only once everything before it has gone out,
+    // so a slow server can't make us buffer the whole batch in memory.
+    if (flushed == 0 && !synced) {
+      if (sending) {
+        bool sent = false;
+        Status send_status = send_next(&sent);
+        if (!send_status.ok()) {
+          status = std::move(send_status);
+          sent = false;
+        }
+        sending = sent;
+      }
+      if (!sending) {
+        if (PQpipelineSync(conn) != 1) {
+          if (status.ok()) {
+            status = MakeStatus(nullptr, "[libpq] Failed to sync pipeline: {}",
+                                PQerrorMessage(conn));
+          }
+          break;
+        }
+        synced = true;
+      }
+      continue;
+    }
+
+    if (PQconsumeInput(conn) != 1) {
+      status = MakeStatus(nullptr, "[libpq] Failed to read pipeline results: {}",
+                          PQerrorMessage(conn));
+      break;
+    }
+    bool progressed = false;
+    bool copying = false;
+    while (!done && !copying && !PQisBusy(conn)) {
+      PGresult* result = PQgetResult(conn);
+      if (result == nullptr) {
+        // libpq returns null after each command's results, and also when
+        // nothing more has arrived yet.
+        if (!in_command) break;
+        index++;
+        in_command = false;
+        progressed = true;
+        continue;
+      }
+
+      progressed = true;
+      switch (PQresultStatus(result)) {
+        case PGRES_PIPELINE_SYNC:
+          PQclear(result);
+          done = true;
+          break;
+        case PGRES_COPY_IN:
+        case PGRES_COPY_OUT:
+        case PGRES_COPY_BOTH:
+          // Callers keep COPY out of pipelines; there's no way back from one
+          // here, since libpq would keep returning the COPY result.
+          PQclear(result);
+          copying = true;
+          break;
+        case PGRES_FATAL_ERROR:
+          // The server skips everything up to the sync, so stop sending.
+          sending = false;
+          in_command = true;
+          on_result(index, result);
+          break;
+        default:
+          in_command = true;
+          on_result(index, result);
+          break;
+      }
+    }
+    if (copying) {
+      status = Status(ADBC_STATUS_NOT_IMPLEMENTED,
+                      "[libpq] COPY is not supported in a pipeline");
+      break;
+    }
+    if (done || progressed) continue;
+
+    Status wait_status = WaitForSocket(conn, /*write=*/flushed == 1);
+    if (!wait_status.ok()) {
+      status = std::move(wait_status);
+      break;
+    }
+  }
+
+  // Exiting only fails if results are still pending, i.e. we gave up on the
+  // connection above, in which case the earlier error is the useful one.
+  if (PQexitPipelineMode(conn) != 1 && status.ok()) {
+    status = MakeStatus(nullptr, "[libpq] Failed to exit pipeline mode: {}",
+                        PQerrorMessage(conn));
+  }
+  if (PQsetnonblocking(conn, was_nonblocking) != 0 && status.ok()) {
+    status = MakeStatus(nullptr, "[libpq] Failed to restore blocking mode: {}",
+                        PQerrorMessage(conn));
+  }
+  return status;
+}
+
+namespace {
+
 bool IsIdentifierChar(char c) {
   return std::isalnum(static_cast<unsigned char>(c)) || c == '_' ||
          static_cast<unsigned char>(c) >= 0x80;
+}
+
+// If a comment starts at query[start], return the index just past it;
+// otherwise return start.
+size_t SkipComment(std::string_view query, size_t start) {
+  if (query.compare(start, 2, "--") == 0) {
+    const size_t end = query.find('\n', start);
+    return end == std::string_view::npos ? query.size() : end;
+  }
+  if (query.compare(start, 2, "/*") == 0) {
+    // Block comments nest.
+    int depth = 1;
+    size_t i = start + 2;
+    while (i < query.size() && depth > 0) {
+      if (query.compare(i, 2, "/*") == 0) {
+        depth++;
+        i += 2;
+      } else if (query.compare(i, 2, "*/") == 0) {
+        depth--;
+        i += 2;
+      } else {
+        i++;
+      }
+    }
+    return i;
+  }
+  return start;
 }
 
 // Return the index just past the literal or identifier quoted by query[start].
@@ -436,28 +668,8 @@ std::vector<std::string> SplitStatements(std::string_view query, bool backslash_
   size_t i = 0;
   while (i < query.size()) {
     const char c = query[i];
-    const char next = i + 1 < query.size() ? query[i + 1] : '\0';
-
-    if (c == '-' && next == '-') {
-      i = query.find('\n', i);
-      if (i == std::string_view::npos) i = query.size();
-      continue;
-    }
-    if (c == '/' && next == '*') {
-      // Block comments nest.
-      int depth = 1;
-      i += 2;
-      while (i < query.size() && depth > 0) {
-        if (query.compare(i, 2, "/*") == 0) {
-          depth++;
-          i += 2;
-        } else if (query.compare(i, 2, "*/") == 0) {
-          depth--;
-          i += 2;
-        } else {
-          i++;
-        }
-      }
+    if (const size_t end = SkipComment(query, i); end != i) {
+      i = end;
       continue;
     }
     if (std::isspace(static_cast<unsigned char>(c))) {
@@ -488,6 +700,29 @@ std::vector<std::string> SplitStatements(std::string_view query, bool backslash_
   finish_statement(query.size());
 
   return statements;
+}
+
+bool IsCopyStatement(std::string_view statement) {
+  size_t i = 0;
+  while (i < statement.size()) {
+    if (std::isspace(static_cast<unsigned char>(statement[i]))) {
+      i++;
+    } else if (const size_t end = SkipComment(statement, i); end != i) {
+      i = end;
+    } else {
+      break;
+    }
+  }
+
+  constexpr std::string_view kCopy = "copy";
+  if (statement.size() - i < kCopy.size()) return false;
+  for (size_t j = 0; j < kCopy.size(); j++) {
+    if (std::tolower(static_cast<unsigned char>(statement[i + j])) != kCopy[j]) {
+      return false;
+    }
+  }
+  i += kCopy.size();
+  return i == statement.size() || !IsIdentifierChar(statement[i]);
 }
 
 }  // namespace adbcpq

@@ -299,9 +299,39 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
       (*affected_rows) = 0;
     }
 
-    do {
-      UNWRAP_STATUS(BindNextAndExecute(affected_rows));
-    } while (bind_stream_);
+    // Send every row through one pipeline instead of waiting on each in turn.
+    // The rows share one sync, so they run in one implicit transaction.
+    Status status;
+    Status pipeline_status = RunPipeline(
+        conn_,
+        [&](bool* sent) -> Status {
+          UNWRAP_STATUS(bind_stream_->EnsureNextRow());
+          *sent = bind_stream_->current->release != nullptr;
+          if (!*sent) return Status::Ok();
+          return bind_stream_->SendCurrentRow(conn_, kPgBinaryFormat);
+        },
+        [&](size_t, PGresult* result) {
+          const ExecStatusType result_status = PQresultStatus(result);
+          if (result_status == PGRES_COMMAND_OK || result_status == PGRES_TUPLES_OK) {
+            helper_.SetResult(result);
+            if (affected_rows) {
+              (*affected_rows) += helper_.AffectedRows();
+            }
+          } else if (result_status != PGRES_PIPELINE_ABORTED && status.ok()) {
+            status =
+                MakeStatus(result, "[libpq] Failed to execute prepared statement: {} {}",
+                           PQresStatus(result_status), PQresultErrorMessage(result));
+            PQclear(result);
+          } else {
+            PQclear(result);
+          }
+        });
+    // A row's own error explains more than the pipeline failing after it.
+    UNWRAP_STATUS(status);
+    UNWRAP_STATUS(pipeline_status);
+
+    UNWRAP_STATUS(bind_stream_->Cleanup(conn_));
+    bind_stream_.reset();
   } else {
     UNWRAP_STATUS(helper_.ExecuteScript());
 

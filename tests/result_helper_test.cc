@@ -83,4 +83,20 @@ TEST(SplitStatementsTest, Unterminated) {
               ElementsAre("SELECT 1", "SELECT /* a; b"));
 }
 
+TEST(IsCopyStatementTest, Copy) {
+  EXPECT_TRUE(IsCopyStatement("COPY t FROM STDIN"));
+  EXPECT_TRUE(IsCopyStatement("copy (SELECT 1) TO STDOUT"));
+  EXPECT_TRUE(
+      IsCopyStatement("  -- load it\n/* a /* nested */ b */ Copy t FROM 'x.csv'"));
+  EXPECT_TRUE(IsCopyStatement("COPY"));
+}
+
+TEST(IsCopyStatementTest, NotCopy) {
+  EXPECT_FALSE(IsCopyStatement(""));
+  EXPECT_FALSE(IsCopyStatement("SELECT 'COPY'"));
+  EXPECT_FALSE(IsCopyStatement("COPYRIGHT"));
+  EXPECT_FALSE(IsCopyStatement("cop"));
+  EXPECT_FALSE(IsCopyStatement("-- COPY t FROM STDIN\nSELECT 1"));
+}
+
 }  // namespace adbcpq

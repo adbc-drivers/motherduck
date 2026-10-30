@@ -2844,6 +2844,109 @@ TEST_F(PostgresStatementTest, MultipleStatementsSingleQueryCopy) {
               IsOkStatus(&error));
 }
 
+// Bind values as the single BIGINT parameter $1, one row per value.
+void BindInt64Params(struct AdbcStatement* statement,
+                     const std::vector<std::optional<int64_t>>& values,
+                     struct AdbcError* error) {
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ASSERT_THAT(
+      adbc_validation::MakeSchema(&schema.value, {{"ints", NANOARROW_TYPE_INT64}}),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT(
+      adbc_validation::MakeBatch<int64_t>(
+          &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr), values),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT(AdbcStatementBind(statement, &batch.value, &schema.value, error),
+              IsOkStatus(error));
+}
+
+void ExecuteEach(struct AdbcStatement* statement, std::vector<const char*> queries,
+                 struct AdbcError* error) {
+  for (const char* query : queries) {
+    ASSERT_THAT(AdbcStatementSetSqlQuery(statement, query, error), IsOkStatus(error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(statement, nullptr, nullptr, error),
+                IsOkStatus(error));
+  }
+}
+
+TEST_F(PostgresStatementTest, ExecuteManyRows) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(&statement,
+                                      {"DROP TABLE IF EXISTS test_execute_many",
+                                       "CREATE TABLE test_execute_many (ints BIGINT)"},
+                                      &error));
+
+  // MotherDuck spends ~20 ms on each INSERT, so keep this small.
+  constexpr int64_t kRows = 500;
+  std::vector<std::optional<int64_t>> values;
+  for (int64_t i = 0; i < kRows; i++) values.push_back(i);
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "INSERT INTO test_execute_many VALUES ($1)", &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(BindInt64Params(&statement, values, &error));
+  int64_t rows_affected = 0;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, &rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(kRows, rows_affected);
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "SELECT ints FROM test_execute_many ORDER BY ints", &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  int64_t seen = 0;
+  while (true) {
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    if (!reader.array->release) break;
+    for (int64_t i = 0; i < reader.array->length; i++) {
+      ASSERT_EQ(seen, ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], i));
+      seen++;
+    }
+  }
+  ASSERT_EQ(kRows, seen);
+}
+
+TEST_F(PostgresStatementTest, ExecuteManyLargeResults) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // About 32 MB of results that nothing reads: enough to fill both ends'
+  // socket buffers, so the driver must read while it's still sending rows.
+  std::vector<std::optional<int64_t>> values;
+  for (int64_t i = 0; i < 500; i++) values.push_back(i);
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, "SELECT CAST($1 AS BIGINT) + 1, repeat('x', 65536)", &error),
+      IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(BindInt64Params(&statement, values, &error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+}
+
+TEST_F(PostgresStatementTest, ExecuteManyError) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(
+      ExecuteEach(&statement,
+                  {"DROP TABLE IF EXISTS test_execute_many_error",
+                   "CREATE TABLE test_execute_many_error (ints BIGINT PRIMARY KEY)"},
+                  &error));
+
+  // The second row breaks the primary key; the error comes back and the
+  // connection stays usable.
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "INSERT INTO test_execute_many_error VALUES ($1)", &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(BindInt64Params(&statement, {1, 1, 2}, &error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              ::testing::Not(IsOkStatus(&error)));
+  error.release(&error);
+
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(&statement, {"SELECT 1"}, &error));
+}
+
 TEST_F(PostgresStatementTest, SetUseCopyFalse) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 

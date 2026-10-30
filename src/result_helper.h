@@ -25,6 +25,7 @@
 #include <cassert>
 #include <charconv>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -145,10 +146,10 @@ class PqResultHelper {
   Status DescribePrepared();
   Status Execute(const std::vector<std::string>& params = {},
                  PostgresType* param_types = nullptr);
-  // Like Execute, but run a query of several statements one at a time through
-  // a pipeline. The endpoint binds every statement of a multi-statement simple
-  // query before running any of them, so later statements can't see objects
-  // created by earlier ones.
+  // Like Execute, but run a query of several statements as separate commands
+  // in one pipeline. The endpoint binds every statement of a multi-statement
+  // simple query before running any of them, so later statements can't see
+  // objects created by earlier ones.
   Status ExecuteScript();
   Status ExecuteCopy();
   Status ResolveParamTypes(PostgresTypeResolver& type_resolver,
@@ -224,8 +225,14 @@ class PqResultHelper {
   Format output_format_ = Format::kText;
 
   Status PrepareInternal(int n_params, const Oid* param_oids) const;
-  Status ExecutePipeline(const std::vector<std::string>& statements);
+  // Send every statement before reading results.
+  Status ExecuteBatch(const std::vector<std::string>& statements);
+  // Read each statement's results before sending the next, so a COPY can be
+  // ended and the connection recovered.
+  Status ExecuteSequentially(const std::vector<std::string>& statements);
   Status CollectPipelineResults(const std::string& statement, bool* ended_copy_in);
+  // Keep a statement's result if it's the last so far or the first error.
+  void KeepPipelineResult(PGresult* result, const std::string& statement, Status* status);
 };
 
 // Split a query on the semicolons between its statements, skipping those inside
@@ -235,5 +242,19 @@ class PqResultHelper {
 // standard_conforming_strings is off, rather than only in E'' literals.
 std::vector<std::string> SplitStatements(std::string_view query,
                                          bool backslash_escapes = false);
+
+// Whether a statement is a COPY, ignoring leading whitespace and comments.
+bool IsCopyStatement(std::string_view statement);
+
+// Run commands through one libpq pipeline ending in a single sync, sending and
+// reading at the same time so neither side waits on the other. send_next
+// queues the next command (e.g. with PQsendQueryParams) and sets *sent, or
+// leaves it false once there are none left. on_result takes ownership of each
+// result other than the sync, along with the index of its command. Sending
+// stops after a command fails, since the server skips the rest anyway.
+// Commands' own errors only reach on_result; the returned status covers
+// failures to send, receive, or run the pipeline. COPY isn't supported.
+Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_next,
+                   const std::function<void(size_t, PGresult*)>& on_result);
 
 }  // namespace adbcpq
