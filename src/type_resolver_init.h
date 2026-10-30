@@ -22,30 +22,20 @@
 
 #pragma once
 
-#include <libpq-fe.h>
-
 #include "driver/framework/status.h"
 #include "postgres_type.h"
 
 namespace adbcpq {
 
-enum class TypeResolverMode {
-  // Only use the built-in type OID definitions
-  kBuiltin,
-  // Query the database up front
-  kServer,
-};
-
-adbc::driver::Status RebuildTypeResolver(PGconn* conn, PostgresTypeResolver& resolver);
+// MotherDuck reports the standard PostgreSQL OIDs for the types it shares with
+// PostgreSQL, so the built-in table resolves them without querying pg_type (which
+// MotherDuck only partially populates). DuckDB-only types use OIDs outside the
+// table and come back as opaque binary.
 adbc::driver::Status InitializeTypeResolver(PostgresTypeResolver& resolver);
 
 }  // namespace adbcpq
 
 // exposed for testing
-
-ADBC_EXPORT
-adbc::driver::Status InternalAdbcRebuildTypeResolver(
-    PGconn* conn, adbcpq::PostgresTypeResolver& resolver);
 
 ADBC_EXPORT
 adbc::driver::Status InternalAdbcInitializeTypeResolver(

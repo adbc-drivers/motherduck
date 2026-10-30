@@ -75,15 +75,11 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return SetupDatabase(database, uri, error);
   }
 
-  // Works around https://github.com/adbc-drivers/motherduck/issues/10 and
-  // https://github.com/adbc-drivers/motherduck/issues/11 so other tests reach their
-  // own assertions; the MotherDuckDefaults* tests cover the defaults.
+  // Works around https://github.com/adbc-drivers/motherduck/issues/11 so other tests
+  // reach their own assertions; MotherDuckDefaultsSelect covers the default.
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database, const char* uri,
                                struct AdbcError* error) const {
     AdbcStatusCode status = AdbcDatabaseSetOption(database, "uri", uri, error);
-    if (status != ADBC_STATUS_OK) return status;
-    status = AdbcDatabaseSetOption(database, "adbc.postgresql.type_resolver_mode",
-                                   "builtin", error);
     if (status != ADBC_STATUS_OK) return status;
     return AdbcDatabaseSetOption(database, "adbc.postgresql.use_copy", "false", error);
   }
@@ -380,9 +376,6 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
 
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "adbc.postgresql.type_resolver_mode",
-                                    "builtin", &error),
-              IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   use_copy = adbc_validation::DatabaseGetOption(&database.value, key, &error);
   EXPECT_THAT(use_copy, ::testing::Optional("true"s));
@@ -400,34 +393,8 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 }
 
-TEST_F(PostgresDatabaseTest, TypeResolverModeOption) {
-  const char* key = "adbc.postgresql.type_resolver_mode";
-  std::optional<std::string> type_resolver_mode;
-
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, key, "builtin", &error),
-              IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
-  type_resolver_mode = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(type_resolver_mode, ::testing::Optional("builtin"s));
-}
-
-TEST_F(PostgresDatabaseTest, TypeResolverModeOptionDefault) {
-  const char* key = "adbc.postgresql.type_resolver_mode";
-  std::optional<std::string> type_resolver_mode;
-
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
-  type_resolver_mode = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(type_resolver_mode, ::testing::Optional("server"s));
-}
-
-// https://github.com/adbc-drivers/motherduck/issues/10: the default server type
-// resolver fails on NULL OIDs in pg_type.
+// https://github.com/adbc-drivers/motherduck/issues/10: Init used to read pg_type,
+// which MotherDuck only partially populates.
 TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
@@ -444,10 +411,6 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsSelect) {
 
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
-  // Isolate from https://github.com/adbc-drivers/motherduck/issues/10.
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "adbc.postgresql.type_resolver_mode",
-                                    "builtin", &error),
-              IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),

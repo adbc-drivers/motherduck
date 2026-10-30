@@ -53,18 +53,6 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
   std::string output;
   if (std::strcmp(option, ADBC_POSTGRESQL_OPTION_USE_COPY) == 0) {
     output = use_copy_ ? ADBC_OPTION_VALUE_ENABLED : ADBC_OPTION_VALUE_DISABLED;
-  } else if (std::strcmp(option, "adbc.postgresql.type_resolver_mode") == 0) {
-    switch (type_resolver_mode_) {
-      case TypeResolverMode::kBuiltin:
-        output = "builtin";
-        break;
-      case TypeResolverMode::kServer:
-        output = "server";
-        break;
-      default:
-        InternalAdbcSetError(error, "[libpq] unknown type resolver mode");
-        return ADBC_STATUS_INTERNAL;
-    }
   } else {
     InternalAdbcSetError(error, "[libpq] unknown database option '%s'", option);
     return ADBC_STATUS_NOT_FOUND;
@@ -89,31 +77,19 @@ AdbcStatusCode PostgresDatabase::GetOptionDouble(const char* option, double* val
 }
 
 AdbcStatusCode PostgresDatabase::Init(struct AdbcError* error) {
-  // Connect to build the type table
-  PGconn* conn = nullptr;
-  RAISE_ADBC(Connect(&conn, error));
+  if (uri_.empty()) {
+    InternalAdbcSetError(
+        error, "%s",
+        "[libpq] Must set database option 'uri' before creating a connection");
+    return ADBC_STATUS_INVALID_STATE;
+  }
 
   auto resolver = std::make_shared<PostgresTypeResolver>();
-  Status status;
-  switch (type_resolver_mode_) {
-    case TypeResolverMode::kBuiltin: {
-      status = InitializeTypeResolver(*resolver);
-      break;
-    }
-    case TypeResolverMode::kServer: {
-      status = RebuildTypeResolver(conn, *resolver);
-      break;
-    }
-  }
-  if (!status.ok()) {
-    RAISE_ADBC(Disconnect(&conn, nullptr));
-    return status.ToAdbc(error);
-  }
+  Status status = InitializeTypeResolver(*resolver);
+  if (!status.ok()) return status.ToAdbc(error);
 
   type_resolver_ = std::move(resolver);
-
-  RAISE_ADBC(Disconnect(&conn, nullptr));
-  return status.ToAdbc(error);
+  return ADBC_STATUS_OK;
 }
 
 AdbcStatusCode PostgresDatabase::Release(struct AdbcError* error) {
@@ -134,19 +110,6 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
       use_copy_ = true;
     } else if (std::strcmp(value, ADBC_OPTION_VALUE_DISABLED) == 0) {
       use_copy_ = false;
-    } else {
-      InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
-  } else if (std::strcmp(key, "adbc.postgresql.type_resolver_mode") == 0) {
-    if (std::strcmp(value, "auto") == 0) {
-      // TODO(https://github.com/apache/arrow-adbc/issues/4782): implement fallback mode
-      InternalAdbcSetError(error, "[libpq] %s=%s not yet supported", key, value);
-      return ADBC_STATUS_NOT_IMPLEMENTED;
-    } else if (std::strcmp(value, "builtin") == 0) {
-      type_resolver_mode_ = TypeResolverMode::kBuiltin;
-    } else if (std::strcmp(value, "server") == 0) {
-      type_resolver_mode_ = TypeResolverMode::kServer;
     } else {
       InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
       return ADBC_STATUS_INVALID_ARGUMENT;
