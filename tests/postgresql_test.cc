@@ -668,10 +668,11 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachModeSingle) {
     const struct ArrowStringView name = (*get_objects_data)->catalogs[i]->catalog_name;
     catalogs.emplace_back(name.data, name.size_bytes);
   }
-  // DuckDB's built-in system and temp catalogs may also be listed.
+  // The built-in md_information_schema, system, and temp catalogs are also listed.
   const std::string catalog = quirks()->catalog();
   EXPECT_THAT(catalogs, ::testing::Contains(catalog));
-  EXPECT_THAT(catalogs, ::testing::Each(::testing::AnyOf(catalog, "system", "temp")));
+  EXPECT_THAT(catalogs, ::testing::Each(::testing::AnyOf(catalog, "md_information_schema",
+                                                         "system", "temp")));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
