@@ -35,14 +35,16 @@
 #include "type_resolver_init.h"
 
 #define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
+#define ADBC_MOTHERDUCK_OPTION_SESSION_NAME "adbc.motherduck.session_name"
 
 namespace adbcpq {
 using adbc::driver::Status;
 
-/// \brief Append --attach_mode=<attach_mode> to libpq session options.
+/// \brief Append --<name>=<value> to libpq session options.
 ///
-/// Returns options unchanged if they already set attach_mode.
-std::string AddAttachMode(std::string_view options, std::string_view attach_mode);
+/// Returns options unchanged if they already set name.
+std::string AddSessionOption(std::string_view options, std::string_view name,
+                             std::string_view value);
 
 class PostgresDatabase {
  public:
@@ -84,5 +86,7 @@ class PostgresDatabase {
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
   bool use_copy_ = true;
   std::string attach_mode_ = "single";
+  std::string session_name_;
+  std::string password_;
 };
 }  // namespace adbcpq

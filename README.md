@@ -83,6 +83,18 @@ and `workspace` attaches every database in the account. The driver adds
 the URI or `PGOPTIONS`. If those already set `attach_mode`, they win.
 Single mode needs a named database; to connect to `md:`, set `workspace`.
 
+`adbc.motherduck.session_name` (database option) sets MotherDuck's
+[session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name),
+which routes connections with the same name to the same replica under read
+scaling and appears in query history. The driver adds `--session_name=<name>`
+to libpq's `options` the same way, escaping whitespace and backslashes. It's
+unset by default; an empty value unsets it.
+
+The MotherDuck token is the connection's password. The driver takes it from,
+in order: the standard ADBC `password` database option, a password in the URI,
+`PGPASSWORD`, and finally the `MOTHERDUCK_TOKEN` environment variable. When it
+falls back to `MOTHERDUCK_TOKEN`, libpq doesn't consult `~/.pgpass`.
+
 libpq connection service files (`~/.pg_service.conf`, `service=`, or
 `PGSERVICE`) aren't supported: the driver always passes `options`, which
 replaces any `options` a service file sets. Put connection settings in the

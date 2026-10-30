@@ -28,6 +28,7 @@
 #include "database.h"
 
 #include <atomic>
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -47,31 +48,51 @@
 namespace adbcpq {
 
 namespace {
-// Whether libpq session options set attach_mode, as --attach_mode=<mode> or
-// -c attach_mode=<mode> (or attach-mode).
-bool SetsAttachMode(std::string_view options) {
-  constexpr std::string_view kWhitespace = " \t\n\r\f\v";
-  constexpr std::string_view kSettings[] = {"attach_mode=", "attach-mode="};
-  size_t start = options.find_first_not_of(kWhitespace);
-  while (start != std::string_view::npos) {
-    size_t end = options.find_first_of(kWhitespace, start);
-    std::string_view arg = options.substr(start, end - start);
+// Whether libpq session options set a setting, as --<name>=<value> or
+// -c <name>=<value>, with either underscores or dashes in the name.
+bool SetsSessionOption(std::string_view options, std::string_view name) {
+  std::string underscores(name);
+  std::string dashes(name);
+  for (char& c : dashes) {
+    if (c == '_') c = '-';
+  }
+  underscores += '=';
+  dashes += '=';
+  // Split on whitespace, as libpq does, keeping backslash escapes in each arg.
+  size_t i = 0;
+  while (i < options.size()) {
+    if (std::isspace(static_cast<unsigned char>(options[i]))) {
+      i++;
+      continue;
+    }
+    size_t start = i;
+    while (i < options.size() && !std::isspace(static_cast<unsigned char>(options[i]))) {
+      if (options[i] == '\\' && i + 1 < options.size()) i++;
+      i++;
+    }
+    std::string_view arg = options.substr(start, i - start);
     if (arg.substr(0, 2) == "--" || arg.substr(0, 2) == "-c") arg.remove_prefix(2);
-    for (std::string_view setting : kSettings) {
+    for (std::string_view setting : {underscores, dashes}) {
       if (arg.substr(0, setting.size()) == setting) return true;
     }
-    start = options.find_first_not_of(kWhitespace, end);
   }
   return false;
 }
 }  // namespace
 
-std::string AddAttachMode(std::string_view options, std::string_view attach_mode) {
+std::string AddSessionOption(std::string_view options, std::string_view name,
+                             std::string_view value) {
   std::string result(options);
-  if (SetsAttachMode(options)) return result;
+  if (SetsSessionOption(options, name)) return result;
   if (!result.empty()) result += ' ';
-  result += "--attach_mode=";
-  result += attach_mode;
+  result += "--";
+  result += name;
+  result += '=';
+  // libpq splits options on whitespace unless it's escaped with a backslash.
+  for (char c : value) {
+    if (c == '\\' || std::isspace(static_cast<unsigned char>(c))) result += '\\';
+    result += c;
+  }
   return result;
 }
 
@@ -87,6 +108,9 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
     output = use_copy_ ? ADBC_OPTION_VALUE_ENABLED : ADBC_OPTION_VALUE_DISABLED;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
     output = attach_mode_;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0 &&
+             !session_name_.empty()) {
+    output = session_name_;
   } else {
     InternalAdbcSetError(error, "[libpq] unknown database option '%s'", option);
     return ADBC_STATUS_NOT_FOUND;
@@ -159,6 +183,10 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
     attach_mode_ = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
+    session_name_ = value;
+  } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0) {
+    password_ = value;
   } else {
     InternalAdbcSetError(error, "%s%s", "[libpq] Unknown database option ", key);
     return ADBC_STATUS_NOT_IMPLEMENTED;
@@ -201,22 +229,38 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
     return ADBC_STATUS_IO;
   }
 
-  // Merge attach_mode into the session options from the URI (or PGOPTIONS).
+  // Merge the MotherDuck settings into the session options from the URI (or
+  // PGOPTIONS), and fill in the password.
   std::vector<const char*> keywords;
   std::vector<const char*> values;
   const char* options = std::getenv("PGOPTIONS");
+  const char* password = std::getenv("PGPASSWORD");
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
     if (option->val == nullptr) continue;
     if (std::strcmp(option->keyword, "options") == 0) {
       options = option->val;
       continue;
     }
+    if (std::strcmp(option->keyword, "password") == 0) {
+      password = option->val;
+      continue;
+    }
     keywords.push_back(option->keyword);
     values.push_back(option->val);
   }
-  std::string session_options = AddAttachMode(options ? options : "", attach_mode_);
+  std::string session_options =
+      AddSessionOption(options ? options : "", "attach_mode", attach_mode_);
+  if (!session_name_.empty()) {
+    session_options = AddSessionOption(session_options, "session_name", session_name_);
+  }
   keywords.push_back("options");
   values.push_back(session_options.c_str());
+  if (!password_.empty()) password = password_.c_str();
+  if (password == nullptr) password = std::getenv("MOTHERDUCK_TOKEN");
+  if (password != nullptr) {
+    keywords.push_back("password");
+    values.push_back(password);
+  }
   keywords.push_back(nullptr);
   values.push_back(nullptr);
 
