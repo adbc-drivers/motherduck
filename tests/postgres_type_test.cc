@@ -27,7 +27,6 @@
 #include <gtest/gtest.h>
 #include <nanoarrow/nanoarrow.hpp>
 
-#include "database.h"
 #include "postgres_type.h"
 #include "type_resolver_init.h"
 
