@@ -230,11 +230,12 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
   }
 
   // Merge the MotherDuck settings into the session options from the URI (or
-  // PGOPTIONS), and fill in the password.
+  // PGOPTIONS), and fill in the token. The driver always passes a password, so
+  // libpq never falls back to PGPASSWORD or a password file.
   std::vector<const char*> keywords;
   std::vector<const char*> values;
   const char* options = std::getenv("PGOPTIONS");
-  const char* password = std::getenv("PGPASSWORD");
+  const char* password = nullptr;
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
     if (option->val == nullptr) continue;
     if (std::strcmp(option->keyword, "options") == 0) {
@@ -248,6 +249,18 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
     keywords.push_back(option->keyword);
     values.push_back(option->val);
   }
+  if (!password_.empty()) password = password_.c_str();
+  if (password == nullptr || *password == '\0')
+    password = std::getenv("MOTHERDUCK_TOKEN");
+  if (password == nullptr || *password == '\0') {
+    PQconninfoFree(conninfo);
+    InternalAdbcSetError(error, "%s",
+                         "[libpq] No MotherDuck token: set the 'password' database "
+                         "option, a password in the URI, or MOTHERDUCK_TOKEN");
+    return ADBC_STATUS_UNAUTHENTICATED;
+  }
+  keywords.push_back("password");
+  values.push_back(password);
   std::string session_options =
       AddSessionOption(options ? options : "", "attach_mode", attach_mode_);
   if (!session_name_.empty()) {
@@ -255,12 +268,6 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
   }
   keywords.push_back("options");
   values.push_back(session_options.c_str());
-  if (!password_.empty()) password = password_.c_str();
-  if (password == nullptr) password = std::getenv("MOTHERDUCK_TOKEN");
-  if (password != nullptr) {
-    keywords.push_back("password");
-    values.push_back(password);
-  }
   keywords.push_back(nullptr);
   values.push_back(nullptr);
 

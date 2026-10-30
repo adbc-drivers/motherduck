@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -420,7 +421,7 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
 TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
-  // A password in the URI takes precedence over PGPASSWORD.
+  // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
   std::string bad_uri = uri;
   bad_uri += std::strchr(uri, '?') ? "&password=invalid" : "?password=invalid";
 
@@ -462,8 +463,8 @@ class ScopedEnv {
 TEST_F(PostgresDatabaseTest, PasswordOption) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
-  const char* token = std::getenv("PGPASSWORD");
-  ASSERT_NE(token, nullptr) << "Must provide env var PGPASSWORD";
+  const char* token = std::getenv("MOTHERDUCK_TOKEN");
+  ASSERT_NE(token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
   std::string bad_uri = uri;
   bad_uri += std::strchr(uri, '?') ? "&password=invalid" : "?password=invalid";
 
@@ -478,7 +479,7 @@ TEST_F(PostgresDatabaseTest, PasswordOption) {
         IsOkStatus(&error));
     ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   }
-  // And over PGPASSWORD.
+  // And over MOTHERDUCK_TOKEN.
   {
     adbc_validation::Handle<struct AdbcDatabase> database;
     ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
@@ -491,28 +492,30 @@ TEST_F(PostgresDatabaseTest, PasswordOption) {
   }
 }
 
-TEST_F(PostgresDatabaseTest, MotherDuckTokenFallback) {
-  const char* pgpassword = std::getenv("PGPASSWORD");
-  ASSERT_NE(pgpassword, nullptr) << "Must provide env var PGPASSWORD";
-  const std::string token = pgpassword;
+TEST_F(PostgresDatabaseTest, IgnoresPostgresPasswords) {
+  const char* motherduck_token = std::getenv("MOTHERDUCK_TOKEN");
+  ASSERT_NE(motherduck_token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
+  const std::string token = motherduck_token;
 
-  // Without another password, the driver uses MOTHERDUCK_TOKEN.
+  // A valid token in PGPASSWORD or a password file doesn't rescue a bad one.
+  auto passfile = std::filesystem::temp_directory_path() / "adbc_motherduck_pgpass";
   {
-    ScopedEnv unset_pgpassword("PGPASSWORD", nullptr);
-    ScopedEnv motherduck_token("MOTHERDUCK_TOKEN", token.c_str());
+    std::ofstream out(passfile);
+    out << "*:*:*:*:" << token << "\n";
+  }
+  std::filesystem::permissions(
+      passfile, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+  {
+    ScopedEnv pgpassword("PGPASSWORD", token.c_str());
+    ScopedEnv pgpassfile("PGPASSFILE", passfile.string().c_str());
+    ScopedEnv bad_token("MOTHERDUCK_TOKEN", "invalid");
     adbc_validation::Handle<struct AdbcDatabase> database;
     ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
     ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
-    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+    EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
+                IsStatus(ADBC_STATUS_IO, &error));
   }
-  // PGPASSWORD takes precedence.
-  {
-    ScopedEnv motherduck_token("MOTHERDUCK_TOKEN", "invalid");
-    adbc_validation::Handle<struct AdbcDatabase> database;
-    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-    ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
-    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
-  }
+  std::filesystem::remove(passfile);
 }
 
 TEST_F(PostgresDatabaseTest, SessionNameOption) {
@@ -690,6 +693,22 @@ TEST(MotherDuckSessionNameTest, OptionSetGet) {
   EXPECT_THAT(
       GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME, &error),
       IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckPasswordTest, RequiresToken) {
+  // Fails before connecting, so this needs no server.
+  ScopedEnv pgpassword("PGPASSWORD", "token");
+  ScopedEnv motherduck_token("MOTHERDUCK_TOKEN", nullptr);
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri",
+                                    "postgresql://postgres@localhost:1/db", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
+              IsStatus(ADBC_STATUS_UNAUTHENTICATED, &error));
+  EXPECT_THAT(error.message, ::testing::HasSubstr("No MotherDuck token"));
   if (error.release) error.release(&error);
 }
 

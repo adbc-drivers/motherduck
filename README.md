@@ -92,8 +92,9 @@ unset by default; an empty value unsets it.
 
 The MotherDuck token is the connection's password. The driver takes it from,
 in order: the standard ADBC `password` database option, a password in the URI,
-`PGPASSWORD`, and finally the `MOTHERDUCK_TOKEN` environment variable. When it
-falls back to `MOTHERDUCK_TOKEN`, libpq doesn't consult `~/.pgpass`.
+and the `MOTHERDUCK_TOKEN` environment variable. It always passes the token to
+libpq, so `PGPASSWORD` and password files (`~/.pgpass`, `PGPASSFILE`) are never
+used. Without a token, connecting fails with `UNAUTHENTICATED`.
 
 libpq connection service files (`~/.pg_service.conf`, `service=`, or
 `PGSERVICE`) aren't supported: the driver always passes `options`, which
