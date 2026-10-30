@@ -44,11 +44,27 @@
 
 namespace adbcpq {
 
+namespace {
+// Whether libpq session options set attach_mode, as --attach_mode=<mode> or
+// -c attach_mode=<mode>.
+bool SetsAttachMode(std::string_view options) {
+  constexpr std::string_view kWhitespace = " \t\n\r\f\v";
+  constexpr std::string_view kSetting = "attach_mode=";
+  size_t start = options.find_first_not_of(kWhitespace);
+  while (start != std::string_view::npos) {
+    size_t end = options.find_first_of(kWhitespace, start);
+    std::string_view arg = options.substr(start, end - start);
+    if (arg.substr(0, 2) == "--" || arg.substr(0, 2) == "-c") arg.remove_prefix(2);
+    if (arg.substr(0, kSetting.size()) == kSetting) return true;
+    start = options.find_first_not_of(kWhitespace, end);
+  }
+  return false;
+}
+}  // namespace
+
 std::string AddAttachMode(std::string_view options, std::string_view attach_mode) {
   std::string result(options);
-  if (options.find("attach_mode") != std::string_view::npos) {
-    return result;
-  }
+  if (SetsAttachMode(options)) return result;
   if (!result.empty()) result += ' ';
   result += "--attach_mode=";
   result += attach_mode;

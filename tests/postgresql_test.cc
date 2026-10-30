@@ -228,10 +228,14 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return ddl;
   }
 
-  // For `md:` connections, the account's default database.
+  // The database the test URI connects to.
   std::string catalog() const override {
     const char* catalog = std::getenv("MOTHERDUCK_TEST_CATALOG");
-    return catalog ? catalog : "my_db";
+    if (!catalog) {
+      ADD_FAILURE() << "Must provide env var MOTHERDUCK_TEST_CATALOG";
+      return "";
+    }
+    return catalog;
   }
   std::string db_schema() const override { return "main"; }
 
@@ -535,6 +539,13 @@ TEST(MotherDuckAttachModeTest, AddAttachMode) {
             adbcpq::AddAttachMode("--attach_mode=workspace", "single"));
   EXPECT_EQ("-c attach_mode=workspace",
             adbcpq::AddAttachMode("-c attach_mode=workspace", "single"));
+  EXPECT_EQ("-cattach_mode=workspace",
+            adbcpq::AddAttachMode("-cattach_mode=workspace", "single"));
+  // Other options that mention attach_mode don't count.
+  EXPECT_EQ("--session_name=attach_mode=x --attach_mode=single",
+            adbcpq::AddAttachMode("--session_name=attach_mode=x", "single"));
+  EXPECT_EQ("--session_name=attach_mode --attach_mode=single",
+            adbcpq::AddAttachMode("--session_name=attach_mode", "single"));
 }
 
 class PostgresConnectionTest : public ::testing::Test,
@@ -638,37 +649,13 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogs) {
   ASSERT_NE(*get_objects_data, nullptr)
       << "could not initialize the AdbcGetObjectsData object";
 
-  // With `md:`, every database the account can see is a catalog.
-  const std::string catalog = quirks()->catalog();
-  struct AdbcGetObjectsCatalog* cat =
-      InternalAdbcGetObjectsDataGetCatalogByName(*get_objects_data, catalog.c_str());
-  ASSERT_NE(cat, nullptr) << "catalog " << catalog << " not found";
-}
-
-// With the default attach_mode=single, only the connected database is a catalog.
-TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachModeSingle) {
-  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
-
-  adbc_validation::StreamReader reader;
-  ASSERT_THAT(
-      AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_CATALOGS, nullptr, nullptr,
-                               nullptr, nullptr, nullptr, &reader.stream.value, &error),
-      IsOkStatus(&error));
-  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
-  ASSERT_NO_FATAL_FAILURE(reader.Next());
-  ASSERT_NE(nullptr, reader.array->release);
-
-  auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
-  ASSERT_NE(*get_objects_data, nullptr)
-      << "could not initialize the AdbcGetObjectsData object";
-
+  // With the default attach_mode=single, only the connected database is listed,
+  // along with the built-in md_information_schema, system, and temp catalogs.
   std::vector<std::string> catalogs;
   for (int i = 0; i < (*get_objects_data)->n_catalogs; i++) {
     const struct ArrowStringView name = (*get_objects_data)->catalogs[i]->catalog_name;
     catalogs.emplace_back(name.data, name.size_bytes);
   }
-  // The built-in md_information_schema, system, and temp catalogs are also listed.
   const std::string catalog = quirks()->catalog();
   EXPECT_THAT(catalogs, ::testing::Contains(catalog));
   EXPECT_THAT(catalogs, ::testing::Each(::testing::AnyOf(catalog, "md_information_schema",

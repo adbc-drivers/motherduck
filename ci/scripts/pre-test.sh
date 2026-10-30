@@ -76,10 +76,7 @@ uri_for() {
 {
   printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$(uri_for "$database")"
   printf 'PGPASSWORD=%q\n' "$MOTHERDUCK_TOKEN"
-  # With md:, the tests fall back to the account's default database.
-  if [[ "$database" != "md:" ]]; then
-    printf 'MOTHERDUCK_TEST_CATALOG=%q\n' "$database"
-  fi
+  printf 'MOTHERDUCK_TEST_CATALOG=%q\n' "$database"
   if [[ "$manage_database" == true ]]; then
     # The tests create and drop the database through this connection.
     printf 'MOTHERDUCK_TEST_SETUP_URI=%q\n' "$(uri_for md:)"
