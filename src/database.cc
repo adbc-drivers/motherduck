@@ -27,8 +27,6 @@
 
 #include "database.h"
 
-#include <array>
-#include <charconv>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -42,7 +40,6 @@
 
 #include "driver/common/utils.h"
 #include "postgres_util.h"
-#include "result_helper.h"
 
 namespace adbcpq {
 
@@ -92,17 +89,12 @@ AdbcStatusCode PostgresDatabase::GetOptionDouble(const char* option, double* val
 }
 
 AdbcStatusCode PostgresDatabase::Init(struct AdbcError* error) {
-  // Connect to initialize the version information and build the type table
+  // Connect to build the type table
   PGconn* conn = nullptr;
   RAISE_ADBC(Connect(&conn, error));
 
-  Status status = InitVersions(conn);
-  if (!status.ok()) {
-    RAISE_ADBC(Disconnect(&conn, nullptr));
-    return status.ToAdbc(error);
-  }
-
   auto resolver = std::make_shared<PostgresTypeResolver>();
+  Status status;
   switch (type_resolver_mode_) {
     case TypeResolverMode::kBuiltin: {
       status = InitializeTypeResolver(*resolver);
@@ -211,76 +203,6 @@ AdbcStatusCode PostgresDatabase::Disconnect(PGconn** conn, struct AdbcError* err
     return ADBC_STATUS_INTERNAL;
   }
   return ADBC_STATUS_OK;
-}
-
-namespace {
-
-// Parse an individual version in the form of "xxx.xxx.xxx".
-// If the version components aren't numeric, they will be zero.
-std::array<int, 3> ParseVersion(std::string_view version) {
-  std::array<int, 3> out{};
-  size_t component = 0;
-  size_t component_begin = 0;
-  size_t component_end = 0;
-
-  // While there are remaining version components and we haven't reached the end of the
-  // string
-  while (component_begin < version.size() && component < out.size()) {
-    // Find the next character that marks a version component separation or the end of the
-    // string
-    component_end = version.find_first_of(".-", component_begin);
-    if (component_end == version.npos) {
-      component_end = version.size();
-    }
-
-    // Try to parse the component as an integer (assigning zero if this fails)
-    int value = 0;
-    std::from_chars(version.data() + component_begin, version.data() + component_end,
-                    value);
-    out[component] = value;
-
-    // Move on to the next component
-    component_begin = component_end + 1;
-    component_end = component_begin;
-    component++;
-  }
-
-  return out;
-}
-
-// Parse the PostgreSQL version() string that looks like:
-// PostgreSQL 8.0.2 on i686-pc-linux-gnu, compiled by GCC gcc (GCC) 3.4.2 20041017 (Red
-// Hat 3.4.2-6.fc3), Redshift 1.0.77467
-std::array<int, 3> ParsePrefixedVersion(std::string_view version_info,
-                                        std::string_view prefix) {
-  size_t pos = version_info.find(prefix);
-  if (pos == version_info.npos) {
-    return {0, 0, 0};
-  }
-
-  // Skip the prefix and any leading whitespace
-  pos = version_info.find_first_not_of(' ', pos + prefix.size());
-  if (pos == version_info.npos) {
-    return {0, 0, 0};
-  }
-
-  return ParseVersion(version_info.substr(pos));
-}
-
-}  // namespace
-
-Status PostgresDatabase::InitVersions(PGconn* conn) {
-  PqResultHelper helper(conn, "SELECT version();");
-  UNWRAP_STATUS(helper.Execute());
-  if (helper.NumRows() != 1 || helper.NumColumns() != 1) {
-    return Status::Internal("Expected 1 row and 1 column for SELECT version(); but got ",
-                            helper.NumRows(), "/", helper.NumColumns());
-  }
-
-  std::string_view version_info = helper.Row(0)[0].value();
-  postgres_server_version_ = ParsePrefixedVersion(version_info, "PostgreSQL");
-
-  return Status::Ok();
 }
 
 }  // namespace adbcpq

@@ -29,4 +29,6 @@ from . import postgresql
 
 
 def pytest_generate_tests(metafunc) -> None:
-    return generate_tests([postgresql.PostgreSQLQuirks()], metafunc)
+    return generate_tests(
+        [postgresql.get_quirks(metafunc.config.getoption("vendor_version"))], metafunc
+    )

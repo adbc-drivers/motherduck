@@ -13,18 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-repository = "motherduck"
 driver = "motherduck"
 private = false
-
-[validation.extra-pypi-dependencies]
-hypothesis = ">=6,<7"
 
 [lang.script]
 subdir = "."
 
 [lang.script.test]
-skip = true
+environment = "test"
 
+# Validate against MotherDuck (see ci/scripts/pre-test.sh), not a Compose service.
 [lang.script.validation]
-skip = true
+configs = [{ service-name = "", environment = "test" }]
+
+[secrets]
+MOTHERDUCK_TOKEN = { secret = "MOTHERDUCK_TOKEN", contexts = ["test", "validate"] }
+
+[validation.extra-pypi-dependencies]
+hypothesis = ">=6,<7"

@@ -21,6 +21,7 @@
 // under the License.
 
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -54,6 +55,16 @@ using std::string_literals::operator""s;
 
 class PostgresQuirks : public adbc_validation::DriverQuirks {
  public:
+  // Leaves every other option at the driver's default.
+  AdbcStatusCode SetupUri(struct AdbcDatabase* database, struct AdbcError* error) const {
+    const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+    if (!uri) {
+      ADD_FAILURE() << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    return AdbcDatabaseSetOption(database, "uri", uri, error);
+  }
+
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database,
                                struct AdbcError* error) const override {
     const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
@@ -61,7 +72,29 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
       ADD_FAILURE() << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    return AdbcDatabaseSetOption(database, "uri", uri, error);
+    return SetupDatabase(database, uri, error);
+  }
+
+  // Works around https://github.com/adbc-drivers/motherduck/issues/10 and
+  // https://github.com/adbc-drivers/motherduck/issues/11 so other tests reach their
+  // own assertions; the MotherDuckDefaults* tests cover the defaults.
+  AdbcStatusCode SetupDatabase(struct AdbcDatabase* database, const char* uri,
+                               struct AdbcError* error) const {
+    AdbcStatusCode status = AdbcDatabaseSetOption(database, "uri", uri, error);
+    if (status != ADBC_STATUS_OK) return status;
+    status = AdbcDatabaseSetOption(database, "adbc.postgresql.type_resolver_mode",
+                                   "builtin", error);
+    if (status != ADBC_STATUS_OK) return status;
+    return AdbcDatabaseSetOption(database, "adbc.postgresql.use_copy", "false", error);
+  }
+
+  std::string QuoteIdentifier(std::string_view name) const override {
+    std::string quoted = "\"";
+    for (char c : name) {
+      if (c == '"') quoted += '"';
+      quoted += c;
+    }
+    return quoted + '"';
   }
 
   AdbcStatusCode DropTable(struct AdbcConnection* connection, const std::string& name,
@@ -157,23 +190,22 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   std::optional<std::string> PrimaryKeyTableDdl(std::string_view name) const override {
     std::string ddl = "CREATE TABLE ";
     ddl += name;
-    ddl += " (id SERIAL PRIMARY KEY)";
+    ddl += " (id INTEGER PRIMARY KEY)";
     return ddl;
   }
 
   std::optional<std::string> PrimaryKeyIngestTableDdl(
       std::string_view name) const override {
-    std::string ddl = "CREATE TABLE ";
-    ddl += name;
-    ddl += " (id BIGSERIAL PRIMARY KEY, value BIGINT)";
-    return ddl;
+    // The test relies on an auto-generated key, which needs SERIAL or a
+    // sequence; the Postgres endpoint supports neither.
+    return std::nullopt;
   }
 
   std::optional<std::string> CompositePrimaryKeyTableDdl(
       std::string_view name) const override {
     std::string ddl = "CREATE TABLE ";
     ddl += name;
-    ddl += " (id_primary_col1 SERIAL, id_primary_col2 SERIAL,";
+    ddl += " (id_primary_col1 INTEGER, id_primary_col2 INTEGER,";
     ddl += " PRIMARY KEY (id_primary_col1, id_primary_col2));";
     return ddl;
   }
@@ -183,9 +215,9 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
       std::string_view parent_name_2) const override {
     std::string ddl = "CREATE TABLE ";
     ddl += child_name;
-    ddl += " (id_child_col1 SERIAL PRIMARY KEY, ";
-    ddl += " id_child_col2 SERIAL, ";
-    ddl += " id_child_col3 SERIAL, ";
+    ddl += " (id_child_col1 INTEGER PRIMARY KEY, ";
+    ddl += " id_child_col2 INTEGER, ";
+    ddl += " id_child_col3 INTEGER, ";
     ddl += " FOREIGN KEY (id_child_col3) REFERENCES ";
     ddl += parent_name_1;
     ddl += " (id),";
@@ -195,12 +227,18 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return ddl;
   }
 
-  std::string catalog() const override { return "postgres"; }
-  std::string db_schema() const override { return "public"; }
+  // For `md:` connections, the account's default database.
+  std::string catalog() const override {
+    const char* catalog = std::getenv("MOTHERDUCK_TEST_CATALOG");
+    return catalog ? catalog : "my_db";
+  }
+  std::string db_schema() const override { return "main"; }
 
-  bool supports_bulk_ingest_catalog() const override { return false; }
+  // MotherDuck supports database.schema.table names.
+  bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_db_schema() const override { return true; }
-  bool supports_bulk_ingest_temporary() const override { return true; }
+  // The Postgres endpoint rejects CREATE TEMP TABLE.
+  bool supports_bulk_ingest_temporary() const override { return false; }
   bool supports_cancel() const override { return true; }
   bool supports_execute_schema() const override { return true; }
   std::optional<adbc_validation::SqlInfoValue> supports_get_sql_info(
@@ -213,15 +251,72 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
       case ADBC_INFO_DRIVER_VERSION:
         return ADBC_DRIVER_MOTHERDUCK_VERSION;
       case ADBC_INFO_VENDOR_NAME:
-        return "PostgreSQL";
+        return "MotherDuck";
       default:
         return std::nullopt;
     }
   }
   bool supports_metadata_current_catalog() const override { return true; }
   bool supports_metadata_current_db_schema() const override { return true; }
-  bool supports_statistics() const override { return true; }
+  // Statistics come from pg_stats, which DuckDB doesn't have.
+  bool supports_statistics() const override { return false; }
 };
+
+// Gives the test run a fresh database (see ci/scripts/pre-test.sh) and drops it
+// afterwards, so concurrent jobs and earlier runs can't leave tables behind.
+class MotherDuckTestDatabase : public ::testing::Environment {
+ public:
+  void SetUp() override {
+    if (!Configured()) return;
+    ASSERT_NO_FATAL_FAILURE(Execute("DROP DATABASE IF EXISTS " + catalog_));
+    ASSERT_NO_FATAL_FAILURE(Execute("CREATE DATABASE " + catalog_));
+  }
+
+  void TearDown() override {
+    if (!Configured()) return;
+    ASSERT_NO_FATAL_FAILURE(Execute("DROP DATABASE IF EXISTS " + catalog_));
+  }
+
+ private:
+  bool Configured() {
+    const char* setup_uri = std::getenv("MOTHERDUCK_TEST_SETUP_URI");
+    const char* catalog = std::getenv("MOTHERDUCK_TEST_CATALOG");
+    if (!setup_uri || !catalog) return false;
+    setup_uri_ = setup_uri;
+    catalog_ = quirks_.QuoteIdentifier(catalog);
+    return true;
+  }
+
+  void Execute(const std::string& query) {
+    Handle<struct AdbcError> error;
+    Handle<struct AdbcDatabase> database;
+    Handle<struct AdbcConnection> connection;
+    Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error.value), IsOkStatus(&error.value));
+    ASSERT_THAT(quirks_.SetupDatabase(&database.value, setup_uri_.c_str(), &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcConnectionNew(&connection.value, &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(
+        AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error.value),
+        IsOkStatus(&error.value));
+  }
+
+  PostgresQuirks quirks_;
+  std::string setup_uri_;
+  std::string catalog_;
+};
+
+[[maybe_unused]] static const auto* kMotherDuckTestDatabase =
+    ::testing::AddGlobalTestEnvironment(new MotherDuckTestDatabase);
 
 class PostgresDatabaseTest : public ::testing::Test,
                              public adbc_validation::DatabaseTest {
@@ -284,7 +379,10 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   adbc_validation::Handle<struct AdbcStatement> statement;
 
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "adbc.postgresql.type_resolver_mode",
+                                    "builtin", &error),
+              IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   use_copy = adbc_validation::DatabaseGetOption(&database.value, key, &error);
   EXPECT_THAT(use_copy, ::testing::Optional("true"s));
@@ -322,10 +420,51 @@ TEST_F(PostgresDatabaseTest, TypeResolverModeOptionDefault) {
 
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   type_resolver_mode = adbc_validation::DatabaseGetOption(&database.value, key, &error);
   EXPECT_THAT(type_resolver_mode, ::testing::Optional("server"s));
+}
+
+// https://github.com/adbc-drivers/motherduck/issues/10: the default server type
+// resolver fails on NULL OIDs in pg_type.
+TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+}
+
+// https://github.com/adbc-drivers/motherduck/issues/11: by default, results come
+// through binary COPY TO STDOUT.
+TEST_F(PostgresDatabaseTest, MotherDuckDefaultsSelect) {
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  adbc_validation::Handle<struct AdbcStatement> statement;
+
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
+  // Isolate from https://github.com/adbc-drivers/motherduck/issues/10.
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "adbc.postgresql.type_resolver_mode",
+                                    "builtin", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, "SELECT 42 AS x", &error),
+              IsOkStatus(&error));
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NE(nullptr, reader.array->release);
+  ASSERT_EQ(1, reader.array->length);
 }
 
 int Canary(const struct AdbcError*) { return 0; }
@@ -445,12 +584,11 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogs) {
   ASSERT_NE(*get_objects_data, nullptr)
       << "could not initialize the AdbcGetObjectsData object";
 
-  auto catalogs = {"postgres", "template0", "template1"};
-  for (auto catalog : catalogs) {
-    struct AdbcGetObjectsCatalog* cat =
-        InternalAdbcGetObjectsDataGetCatalogByName(*get_objects_data, catalog);
-    ASSERT_NE(cat, nullptr) << "catalog " << catalog << " not found";
-  }
+  // With `md:`, every database the account can see is a catalog.
+  const std::string catalog = quirks()->catalog();
+  struct AdbcGetObjectsCatalog* cat =
+      InternalAdbcGetObjectsDataGetCatalogByName(*get_objects_data, catalog.c_str());
+  ASSERT_NE(cat, nullptr) << "catalog " << catalog << " not found";
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
@@ -471,9 +609,9 @@ TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
   ASSERT_NE(*get_objects_data, nullptr)
       << "could not initialize the AdbcGetObjectsData object";
 
-  struct AdbcGetObjectsSchema* schema =
-      InternalAdbcGetObjectsDataGetSchemaByName(*get_objects_data, "postgres", "public");
-  ASSERT_NE(schema, nullptr) << "schema public not found";
+  struct AdbcGetObjectsSchema* schema = InternalAdbcGetObjectsDataGetSchemaByName(
+      *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str());
+  ASSERT_NE(schema, nullptr) << "schema " << quirks()->db_schema() << " not found";
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsSchemaFilterFindsTablesOutsideSearchPath) {
@@ -486,7 +624,7 @@ TEST_F(PostgresConnectionTest, GetObjectsSchemaFilterFindsTablesOutsideSearchPat
   // Ensure the schema is not part of the current search_path.
   ASSERT_THAT(
       AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
-                              "public", &error),
+                              quirks()->db_schema().c_str(), &error),
       IsOkStatus(&error));
 
   ASSERT_THAT(quirks()->EnsureDbSchema(&connection, schema_name, &error),
@@ -543,7 +681,7 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsPrimaryKey) {
   {
     ASSERT_THAT(
         AdbcStatementSetSqlQuery(
-            &statement, "CREATE TABLE adbc_pkey_test (ints INT, id SERIAL PRIMARY KEY)",
+            &statement, "CREATE TABLE adbc_pkey_test (ints INT, id INTEGER PRIMARY KEY)",
             &error),
         IsOkStatus(&error));
     adbc_validation::StreamReader reader;
@@ -572,12 +710,14 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsPrimaryKey) {
       << "could not initialize the AdbcGetObjectsData object";
 
   struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
-      *get_objects_data, "postgres", "public", "adbc_pkey_test");
+      *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+      "adbc_pkey_test");
   ASSERT_NE(table, nullptr) << "could not find adbc_pkey_test table";
 
   ASSERT_EQ(table->n_table_columns, 2);
   struct AdbcGetObjectsColumn* column = InternalAdbcGetObjectsDataGetColumnByName(
-      *get_objects_data, "postgres", "public", "adbc_pkey_test", "id");
+      *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+      "adbc_pkey_test", "id");
   ASSERT_NE(column, nullptr) << "could not find id column on adbc_pkey_test table";
   auto xdbc_type_name =
       std::string(column->xdbc_type_name.data, column->xdbc_type_name.size_bytes);
@@ -588,9 +728,9 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsPrimaryKey) {
       << table->n_table_constraints;
 
   struct AdbcGetObjectsConstraint* constraint =
-      InternalAdbcGetObjectsDataGetConstraintByName(*get_objects_data, "postgres",
-                                                    "public", "adbc_pkey_test",
-                                                    "adbc_pkey_test_pkey");
+      InternalAdbcGetObjectsDataGetConstraintByName(
+          *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+          "adbc_pkey_test", "adbc_pkey_test_pkey");
   ASSERT_NE(constraint, nullptr) << "could not find adbc_pkey_test_pkey constraint";
 
   auto constraint_type = std::string(constraint->constraint_type.data,
@@ -669,7 +809,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
       << "could not initialize the AdbcGetInfoData object";
 
   struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
-      *get_objects_data, "postgres", "public", "adbc_fkey_test");
+      *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+      "adbc_fkey_test");
   ASSERT_NE(table, nullptr) << "could not find adbc_fkey_test table";
   ASSERT_EQ(table->n_table_constraints, 1)
       << "expected 1 constraint on adbc_fkey_test table, found: "
@@ -680,7 +821,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
       version < "120000" ? "adbc_fkey_test_fid1_fkey" : "adbc_fkey_test_fid1_fid2_fkey";
   struct AdbcGetObjectsConstraint* constraint =
       InternalAdbcGetObjectsDataGetConstraintByName(
-          *get_objects_data, "postgres", "public", "adbc_fkey_test", search_name.c_str());
+          *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+          "adbc_fkey_test", search_name.c_str());
   ASSERT_NE(constraint, nullptr) << "could not find " << search_name << " constraint";
 
   auto constraint_type = std::string(constraint->constraint_type.data,
@@ -708,10 +850,10 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
   for (auto i = 0; i < 2; i++) {
     struct AdbcGetObjectsUsage* usage = constraint->constraint_column_usages[i];
     auto catalog_str = std::string(usage->fk_catalog.data, usage->fk_catalog.size_bytes);
-    ASSERT_EQ(catalog_str, "postgres");
+    ASSERT_EQ(catalog_str, quirks()->catalog());
     auto schema_str =
         std::string(usage->fk_db_schema.data, usage->fk_db_schema.size_bytes);
-    ASSERT_EQ(schema_str, "public");
+    ASSERT_EQ(schema_str, quirks()->db_schema());
     auto table_str = std::string(usage->fk_table.data, usage->fk_table.size_bytes);
     ASSERT_EQ(table_str, "adbc_fkey_test_base");
 
@@ -782,11 +924,13 @@ TEST_F(PostgresConnectionTest, GetObjectsTableTypesFilter) {
       << "could not initialize the AdbcGetInfoData object";
 
   struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
-      *get_objects_data, "postgres", "public", "adbc_table_types_table_test");
+      *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+      "adbc_table_types_table_test");
   ASSERT_EQ(table, nullptr) << "unexpected table adbc_table_types_table_test found";
 
   struct AdbcGetObjectsTable* view = InternalAdbcGetObjectsDataGetTableByName(
-      *get_objects_data, "postgres", "public", "adbc_table_types_view_test");
+      *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+      "adbc_table_types_view_test");
   ASSERT_NE(view, nullptr) << "did not find view adbc_table_types_view_test";
 }
 
@@ -1245,6 +1389,7 @@ TEST_F(PostgresStatementTest, TransactionStatus) {
 }
 
 TEST_F(PostgresStatementTest, RollbackDoesNotChainTransaction) {
+  GTEST_SKIP() << "Relies on SET TRANSACTION READ ONLY, which DuckDB doesn't have";
   ASSERT_THAT(AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_AUTOCOMMIT,
                                       ADBC_OPTION_VALUE_DISABLED, &error),
               IsOkStatus(&error));
@@ -1295,6 +1440,8 @@ TEST_F(PostgresConnectionTest, GetObjectsStartsTransaction) {
 }
 
 TEST_F(PostgresStatementTest, IsolationLevels) {
+  GTEST_SKIP()
+      << "DuckDB has a single isolation level; the endpoint rejects SET TRANSACTION";
   ASSERT_THAT(AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_ISOLATION_LEVEL,
                                       ADBC_OPTION_ISOLATION_LEVEL_SERIALIZABLE, &error),
               IsOkStatus(&error));
@@ -1371,6 +1518,7 @@ TEST_F(PostgresStatementTest, SqlIngestSchema) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestTemporaryTable) {
+  GTEST_SKIP() << "The Postgres endpoint rejects CREATE TEMP TABLE";
   ASSERT_THAT(quirks()->DropTempTable(&connection, "temptable", &error),
               IsOkStatus(&error));
 
@@ -1857,6 +2005,7 @@ TEST_F(PostgresStatementTest, SqlIngestJsonInvalid) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestJsonb) {
+  GTEST_SKIP() << "JSONB is PostgreSQL-only";
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   std::string drop = "DROP TABLE IF EXISTS jsontable";
@@ -1929,10 +2078,9 @@ TEST_F(PostgresStatementTest, SqlReadIntervalOverflow) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   {
-    ASSERT_THAT(
-        AdbcStatementSetSqlQuery(
-            &statement, "SELECT CAST('P0Y0M0DT2562048H0M0S' AS INTERVAL)", &error),
-        IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(
+                    &statement, "SELECT CAST('2562048 hours' AS INTERVAL)", &error),
+                IsOkStatus(&error));
     adbc_validation::StreamReader reader;
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
@@ -1948,10 +2096,9 @@ TEST_F(PostgresStatementTest, SqlReadIntervalOverflow) {
   }
 
   {
-    ASSERT_THAT(
-        AdbcStatementSetSqlQuery(
-            &statement, "SELECT CAST('P0Y0M0DT-2562048H0M0S' AS INTERVAL)", &error),
-        IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(
+                    &statement, "SELECT CAST('-2562048 hours' AS INTERVAL)", &error),
+                IsOkStatus(&error));
     adbc_validation::StreamReader reader;
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
@@ -1975,7 +2122,7 @@ TEST_F(PostgresStatementTest, UpdateInExecuteQuery) {
   {
     ASSERT_THAT(AdbcStatementSetSqlQuery(
                     &statement,
-                    "CREATE TABLE adbc_test (ints INT, id SERIAL PRIMARY KEY)", &error),
+                    "CREATE TABLE adbc_test (ints INT, id INTEGER PRIMARY KEY)", &error),
                 IsOkStatus(&error));
     adbc_validation::StreamReader reader;
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
@@ -1989,9 +2136,10 @@ TEST_F(PostgresStatementTest, UpdateInExecuteQuery) {
 
   {
     // Use INSERT INTO
-    ASSERT_THAT(AdbcStatementSetSqlQuery(
-                    &statement, "INSERT INTO adbc_test (ints) VALUES (1), (2)", &error),
-                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcStatementSetSqlQuery(
+            &statement, "INSERT INTO adbc_test (ints, id) VALUES (1, 1), (2, 2)", &error),
+        IsOkStatus(&error));
     adbc_validation::StreamReader reader;
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
@@ -2006,7 +2154,8 @@ TEST_F(PostgresStatementTest, UpdateInExecuteQuery) {
     // Use INSERT INTO ... RETURNING
     ASSERT_THAT(AdbcStatementSetSqlQuery(
                     &statement,
-                    "INSERT INTO adbc_test (ints) VALUES (3), (4) RETURNING id", &error),
+                    "INSERT INTO adbc_test (ints, id) VALUES (3, 3), (4, 4) RETURNING id",
+                    &error),
                 IsOkStatus(&error));
     adbc_validation::StreamReader reader;
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
@@ -2436,6 +2585,7 @@ TEST_F(PostgresStatementTest, BindUpsertWithSlicedListParameter) {
 }
 
 TEST_F(PostgresStatementTest, SqlExecuteCopyZeroRowOutputError) {
+  GTEST_SKIP() << "Uses JSONB and the COPY result path, both PostgreSQL-only";
   ASSERT_THAT(quirks()->DropTable(&connection, "adbc_test", &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
@@ -2565,13 +2715,15 @@ TEST_F(PostgresStatementTest, AdbcErrorBackwardsCompatibility) {
 TEST_F(PostgresStatementTest, Cancel) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
-  const char* query = R"(DROP TABLE IF EXISTS test_cancel;
-            CREATE TABLE test_cancel (ints INT);
-            INSERT INTO test_cancel (ints)
-            SELECT g :: INT FROM GENERATE_SERIES(1, 65536) temp(g);)";
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
-              IsOkStatus(&error));
+  // One statement per query; MultipleStatementsSingleQuery covers batches.
+  for (const char* query :
+       {"DROP TABLE IF EXISTS test_cancel", "CREATE TABLE test_cancel (ints INT)",
+        "INSERT INTO test_cancel (ints) "
+        "SELECT g :: INT FROM GENERATE_SERIES(1, 65536) temp(g)"}) {
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
 
   ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT * FROM test_cancel", &error),
               IsOkStatus(&error));
@@ -2626,19 +2778,20 @@ TEST_F(PostgresStatementTest, MultipleStatementsSingleQuery) {
 TEST_F(PostgresStatementTest, SetUseCopyFalse) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
-  const char* query = R"(DROP TABLE IF EXISTS test_query_set_copy_false;
-            CREATE TABLE test_query_set_copy_false (ints INT);
-            INSERT INTO test_query_set_copy_false VALUES((1));
-            INSERT INTO test_query_set_copy_false VALUES((NULL));
-            INSERT INTO test_query_set_copy_false VALUES((3));)";
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
-              IsOkStatus(&error));
+  // One statement per query; MultipleStatementsSingleQuery covers batches.
+  for (const char* query :
+       {"DROP TABLE IF EXISTS test_query_set_copy_false",
+        "CREATE TABLE test_query_set_copy_false (ints INT)",
+        "INSERT INTO test_query_set_copy_false VALUES (1), (NULL), (3)"}) {
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
 
-  // Check option setting/getting
+  // Check option setting/getting; the test setup turns COPY off.
   ASSERT_EQ(
       adbc_validation::StatementGetOption(&statement, "adbc.postgresql.use_copy", &error),
-      "true");
+      "false");
 
   ASSERT_THAT(AdbcStatementSetOption(&statement, "adbc.postgresql.use_copy",
                                      "not true or false", &error),
@@ -2684,6 +2837,7 @@ TEST_F(PostgresStatementTest, SetUseCopyFalse) {
 }
 
 TEST_F(PostgresStatementTest, SqlQueryInt2vector) {
+  GTEST_SKIP() << "int2vector is PostgreSQL-only";
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   const char* query = R"(SELECT CAST('-1 42 0' AS int2vector) AS thevector;)";
@@ -2723,6 +2877,7 @@ TEST_F(PostgresStatementTest, SqlQueryInt2vector) {
 }
 
 TEST_F(PostgresStatementTest, UnknownOid) {
+  GTEST_SKIP() << "Reads PostgreSQL-only pg_type.typacl";
   // Regression test for https://github.com/apache/arrow-adbc/issues/2448
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementSetSqlQuery(
@@ -2746,6 +2901,7 @@ TEST_F(PostgresStatementTest, UnknownOid) {
 }
 
 TEST_F(PostgresStatementTest, SqlQueryJsonb) {
+  GTEST_SKIP() << "JSONB is PostgreSQL-only";
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   // Setup table
@@ -2870,7 +3026,27 @@ class PostgresTypeTest : public ::testing::TestWithParam<TypeTestCase> {
   struct AdbcStatement statement_ = {};
 };
 
+static std::optional<std::string> PostgresOnlyTypeCase(const std::string& name) {
+  if (name == "MONEY" || name == "SERIAL" || name == "BIGSERIAL") {
+    return name + " is PostgreSQL-only";
+  }
+  if (name == "NUMERIC_NAN" || name == "NUMERIC_NINF" || name == "NUMERIC_PINF") {
+    return "DuckDB DECIMAL has no NaN or infinity";
+  }
+  if (name.size() > 5 && name.rfind("TIME_", 0) == 0 && std::isdigit(name[5])) {
+    return "DuckDB TIME takes no precision";
+  }
+  if (name.rfind("TIMESTAMP_", 0) == 0 && name.size() > 10 && std::isdigit(name[10]) &&
+      name.find("_WITH_TIME_ZONE") != std::string::npos) {
+    return "DuckDB TIMESTAMP WITH TIME ZONE takes no precision";
+  }
+  return std::nullopt;
+}
+
 TEST_P(PostgresTypeTest, SelectValue) {
+  if (auto reason = PostgresOnlyTypeCase(GetParam().name)) {
+    GTEST_SKIP() << *reason;
+  }
   std::string value = GetParam().sql_literal;
   if ((value == "'-inf'") || (value == "'inf'")) {
     const std::string version = adbc_validation::GetDriverVendorVersion(&connection_);
@@ -2966,10 +3142,11 @@ static std::initializer_list<TypeTestCase> kBoolTypeCases = {
     {"BOOL_FALSE", "BOOLEAN", "FALSE", NANOARROW_TYPE_BOOL, false},
 };
 static std::initializer_list<TypeTestCase> kBinaryTypeCases = {
-    {"BYTEA", "BYTEA", R"('\000\001\002\003\004\005\006\007'::bytea)"s,
+    {"BYTEA", "BYTEA", R"('\x00\x01\x02\x03\x04\x05\x06\x07'::bytea)"s,
      NANOARROW_TYPE_BINARY, std::string("\x00\x01\x02\x03\x04\x05\x06\x07", 8)},
     {"TEXT", "TEXT", "'foobar'", NANOARROW_TYPE_STRING, "foobar"s},
-    {"CHAR6_1", "CHAR(6)", "'foo'", NANOARROW_TYPE_STRING, "foo   "s},
+    // DuckDB doesn't blank-pad CHAR(n).
+    {"CHAR6_1", "CHAR(6)", "'foo'", NANOARROW_TYPE_STRING, "foo"s},
     {"CHAR6_2", "CHAR(6)", "'foobar'", NANOARROW_TYPE_STRING, "foobar"s},
     {"VARCHAR", "VARCHAR", "'foobar'", NANOARROW_TYPE_STRING, "foobar"s},
 };
@@ -2990,9 +3167,11 @@ static std::initializer_list<TypeTestCase> kIntTypeCases = {
      NANOARROW_TYPE_INT64, std::numeric_limits<int64_t>::max()},
 };
 static std::initializer_list<TypeTestCase> kNumericTypeCases = {
-    {"NUMERIC_TRAILING0", "NUMERIC", "1000000", NANOARROW_TYPE_STRING, "1000000"s},
-    {"NUMERIC_LEADING0", "NUMERIC", "0.00001234", NANOARROW_TYPE_STRING, "0.00001234"s},
-    {"NUMERIC_TRAILING02", "NUMERIC", "'1.0000'", NANOARROW_TYPE_STRING, "1.0000"s},
+    // DuckDB's unqualified NUMERIC is DECIMAL(18,3).
+    {"NUMERIC_TRAILING0", "NUMERIC", "1000000", NANOARROW_TYPE_STRING, "1000000.000"s},
+    {"NUMERIC_LEADING0", "NUMERIC(10, 8)", "0.00001234", NANOARROW_TYPE_STRING,
+     "0.00001234"s},
+    {"NUMERIC_TRAILING02", "NUMERIC(5, 4)", "'1.0000'", NANOARROW_TYPE_STRING, "1.0000"s},
     {"NUMERIC_NEGATIVE", "NUMERIC", "-123.456", NANOARROW_TYPE_STRING, "-123.456"s},
     {"NUMERIC_POSITIVE", "NUMERIC", "123.456", NANOARROW_TYPE_STRING, "123.456"s},
     {"NUMERIC_NAN", "NUMERIC", "'nan'", NANOARROW_TYPE_STRING, "nan"s},
@@ -3005,53 +3184,54 @@ static std::initializer_list<TypeTestCase> kDateTypeCases = {
     {"DATE1", "DATE", "'2000-01-01'", NANOARROW_TYPE_DATE32, int64_t(10957)},
     {"DATE2", "DATE", "'1950-01-01'", NANOARROW_TYPE_DATE32, int64_t(-7305)},
 };
+// DuckDB doesn't parse ISO 8601 intervals and ignores field qualifiers.
 static std::initializer_list<TypeTestCase> kIntervalTypeCases = {
     {
         "INTERVAL",
         "INTERVAL",
-        "'P-1Y2M42DT1H1M1S'",
+        "'-1 year 2 months 42 days 01:01:01'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(-10, 42, (1LL * 60 * 60 + 60LL + 1LL) * 1'000'000'000),
     },
     {
         "INTERVAL2",
         "INTERVAL",
-        "'P0Y0M0DT0H0M0.1S'",
+        "'0.1 seconds'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, 100LL * 1'000'000),
     },
     {
         "INTERVAL3",
         "INTERVAL",
-        "'P0Y0M0DT0H0M0.01S'",
+        "'0.01 seconds'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, 10LL * 1'000'000),
     },
     {
         "INTERVAL4",
         "INTERVAL",
-        "'P0Y0M0DT0H0M0.001S'",
+        "'0.001 seconds'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, 1LL * 1'000'000),
     },
     {
         "INTERVAL5",
         "INTERVAL",
-        "'P0Y0M0DT0H0M0.0001S'",
+        "'0.0001 seconds'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, 100'000LL),
     },
     {
         "INTERVAL6",
         "INTERVAL",
-        "'P0Y0M0DT0H0M0.00001S'",
+        "'0.00001 seconds'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, 10'000LL),
     },
     {
         "INTERVAL7",
         "INTERVAL",
-        "'P0Y0M0DT0H0M0.000001S'",
+        "'0.000001 seconds'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, 1'000LL),
     },
@@ -3065,7 +3245,7 @@ static std::initializer_list<TypeTestCase> kIntervalTypeCases = {
     {
         "INTERVAL_MONTH",
         "INTERVAL MONTH",
-        "'P0Y-2M0D'",
+        "'-2 months'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(-2, 0, 0),
     },
@@ -3086,63 +3266,63 @@ static std::initializer_list<TypeTestCase> kIntervalTypeCases = {
     {
         "INTERVAL_MINUTE",
         "INTERVAL MINUTE",
-        "'P0Y0M0DT0H-5M0S'",
+        "'-5 minutes'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, -5LL * 60 * 1'000'000'000),
     },
     {
         "INTERVAL_SECOND",
         "INTERVAL SECOND",
-        "'P0Y0M0DT0H0M42S'",
+        "'42 seconds'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, 42LL * 1'000'000'000),
     },
     {
         "INTERVAL_YEAR_TO_MONTH",
         "INTERVAL YEAR TO MONTH",
-        "'P1Y1M0D'",
+        "'1 year 1 month'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(13, 0, 0),
     },
     {
         "INTERVAL_DAY_TO_HOUR",
         "INTERVAL DAY TO HOUR",
-        "'P0Y0M1DT-2H0M0S'",
+        "'1 day -2 hours'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 1, -2LL * 60 * 60 * 1'000'000'000),
     },
     {
         "INTERVAL_DAY_TO_MINUTE",
         "INTERVAL DAY TO MINUTE",
-        "'P0Y0M1DT-2H1M0S'",
+        "'1 day -2 hours 1 minute'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 1, (-2LL * 60 + 1LL) * 60 * 1'000'000'000),
     },
     {
         "INTERVAL_DAY_TO_SECOND",
         "INTERVAL DAY TO SECOND",
-        "'P0Y0M1DT-2H1M-1S'",
+        "'1 day -2 hours 1 minute -1 second'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 1, ((-2LL * 60 + 1LL) * 60 - 1LL) * 1'000'000'000),
     },
     {
         "INTERVAL_HOUR_TO_MINUTE",
         "INTERVAL HOUR TO MINUTE",
-        "'P0Y0M0DT-2H1M0S'",
+        "'-2 hours 1 minute'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, (-2LL * 60 + 1LL) * 60 * 1'000'000'000),
     },
     {
         "INTERVAL_HOUR_TO_SECOND",
         "INTERVAL HOUR TO SECOND",
-        "'P0Y0M0DT-2H1M-1S'",
+        "'-2 hours 1 minute -1 second'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, ((-2LL * 60 + 1LL) * 60 - 1LL) * 1'000'000'000),
     },
     {
         "INTERVAL_MINUTE_TO_SECOND",
         "INTERVAL MINUTE TO SECOND",
-        "'P0Y0M0DT0H1M-1S'",
+        "'1 minute -1 second'",
         NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO,
         MonthDayNano(0, 0, 59LL * 1'000'000'000),
     },
@@ -3181,6 +3361,8 @@ static std::initializer_list<TypeTestCase> kTimeTypeCases = {
     {"TIME_0_WITHOUT_TIME_ZONE_VAL", "TIME (0) WITHOUT TIME ZONE", "'01:02:03.123123'",
      NANOARROW_TYPE_TIME64, int64_t(3'723'000'000)},
 };
+// DuckDB maps TIMESTAMP (0) to TIMESTAMP_S, (1)-(3) to TIMESTAMP_MS and (4)-(6) to
+// TIMESTAMP, truncating rather than rounding.
 static std::initializer_list<TypeTestCase> kTimestampTypeCases = {
     {"TIMESTAMP_WITHOUT_TIME_ZONE", "TIMESTAMP WITHOUT TIME ZONE",
      "'1970-01-01 00:00:00.000000'", NANOARROW_TYPE_TIMESTAMP, int64_t(0)},
@@ -3193,11 +3375,11 @@ static std::initializer_list<TypeTestCase> kTimestampTypeCases = {
     {"TIMESTAMP_5_WITHOUT_TIME_ZONE", "TIMESTAMP (5) WITHOUT TIME ZONE",
      "'1970-01-01 00:00:00.000000'", NANOARROW_TYPE_TIMESTAMP, int64_t(0)},
     {"TIMESTAMP_5_WITHOUT_TIME_ZONE_VAL", "TIMESTAMP (5) WITHOUT TIME ZONE",
-     "'1970-01-02 03:04:05.123123'", NANOARROW_TYPE_TIMESTAMP, int64_t(97'445'123'120)},
+     "'1970-01-02 03:04:05.123123'", NANOARROW_TYPE_TIMESTAMP, int64_t(97'445'123'123)},
     {"TIMESTAMP_4_WITHOUT_TIME_ZONE", "TIMESTAMP (4) WITHOUT TIME ZONE",
      "'1970-01-01 00:00:00.000000'", NANOARROW_TYPE_TIMESTAMP, int64_t(0)},
     {"TIMESTAMP_4_WITHOUT_TIME_ZONE_VAL", "TIMESTAMP (4) WITHOUT TIME ZONE",
-     "'1970-01-02 03:04:05.123123'", NANOARROW_TYPE_TIMESTAMP, int64_t(97'445'123'100)},
+     "'1970-01-02 03:04:05.123123'", NANOARROW_TYPE_TIMESTAMP, int64_t(97'445'123'123)},
     {"TIMESTAMP_3_WITHOUT_TIME_ZONE", "TIMESTAMP (3) WITHOUT TIME ZONE",
      "'1970-01-01 00:00:00.000000'", NANOARROW_TYPE_TIMESTAMP, int64_t(0)},
     {"TIMESTAMP_3_WITHOUT_TIME_ZONE_VAL", "TIMESTAMP (3) WITHOUT TIME ZONE",
@@ -3205,11 +3387,11 @@ static std::initializer_list<TypeTestCase> kTimestampTypeCases = {
     {"TIMESTAMP_2_WITHOUT_TIME_ZONE", "TIMESTAMP (2) WITHOUT TIME ZONE",
      "'1970-01-01 00:00:00.000000'", NANOARROW_TYPE_TIMESTAMP, int64_t(0)},
     {"TIMESTAMP_2_WITHOUT_TIME_ZONE_VAL", "TIMESTAMP (2) WITHOUT TIME ZONE",
-     "'1970-01-02 03:04:05.123123'", NANOARROW_TYPE_TIMESTAMP, int64_t(97'445'120'000)},
+     "'1970-01-02 03:04:05.123123'", NANOARROW_TYPE_TIMESTAMP, int64_t(97'445'123'000)},
     {"TIMESTAMP_1_WITHOUT_TIME_ZONE", "TIMESTAMP (1) WITHOUT TIME ZONE",
      "'1970-01-01 00:00:00.000000'", NANOARROW_TYPE_TIMESTAMP, int64_t(0)},
     {"TIMESTAMP_1_WITHOUT_TIME_ZONE_VAL", "TIMESTAMP (1) WITHOUT TIME ZONE",
-     "'1970-01-02 03:04:05.123123'", NANOARROW_TYPE_TIMESTAMP, int64_t(97'445'100'000)},
+     "'1970-01-02 03:04:05.123123'", NANOARROW_TYPE_TIMESTAMP, int64_t(97'445'123'000)},
     {"TIMESTAMP_0_WITHOUT_TIME_ZONE", "TIMESTAMP (0) WITHOUT TIME ZONE",
      "'1970-01-01 00:00:00.000000'", NANOARROW_TYPE_TIMESTAMP, int64_t(0)},
     {"TIMESTAMP_0_WITHOUT_TIME_ZONE_VAL", "TIMESTAMP (0) WITHOUT TIME ZONE",
@@ -3421,6 +3603,9 @@ TEST_P(PostgresDecimalTest, SelectValue) {
 
   const enum ArrowType type = GetParam().type;
   const int32_t precision = GetParam().precision;
+  if (precision > 38) {
+    GTEST_SKIP() << "DuckDB DECIMAL precision is at most 38";
+  }
   const int32_t scale = GetParam().scale;
   const auto data = GetParam().data;
   const auto expected = GetParam().expected;

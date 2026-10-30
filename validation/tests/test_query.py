@@ -36,7 +36,7 @@ from . import postgresql
 
 
 def pytest_generate_tests(metafunc) -> None:
-    quirks = [postgresql.PostgreSQLQuirks()]
+    quirks = [postgresql.get_quirks(metafunc.config.getoption("vendor_version"))]
     if not metafunc.definition.name.startswith("test_hypothesis_"):
         return generate_tests(quirks, metafunc)
     return adbc_drivers_validation.utils.generate_tests_by_marks(quirks, metafunc)
