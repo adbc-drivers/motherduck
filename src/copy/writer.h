@@ -1030,12 +1030,8 @@ class PostgresCopyTimestampFieldWriter : public PostgresCopyFieldWriter {
   }
 };
 
-// The type a value written by MakeCopyFieldWriter is encoded as, given the
-// type its Arrow type maps to and the target column's type (or null): the
-// target's where the writer encodes as it (numeric, jsonb, arrays) or the two
-// share an encoding (timestamps; raw bytes for text, json and bytea), and
-// otherwise the Arrow type's. Declaring a bound value as this type stores it
-// as COPY would rather than casting it on the server.
+// The type MakeCopyFieldWriter's output is encoded as: the target's when the
+// writer encodes as it or the two share an encoding, else the source's.
 static inline const PostgresType& CopyFieldEncodedType(const PostgresType& type,
                                                        const PostgresType* target) {
   if (target == nullptr) return type;

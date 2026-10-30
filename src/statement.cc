@@ -62,9 +62,7 @@
 namespace adbcpq {
 
 namespace {
-// DuckDB reads a bare numeric as DECIMAL(18,3), so give an Arrow decimal a
-// width and scale that hold all of its values. DuckDB allows at most 38
-// digits, with a scale from 0 up to the width.
+// A bare numeric is DECIMAL(18,3) in DuckDB, so size it to fit (max width 38).
 Status DecimalTypeName(const struct ArrowSchemaView& view, std::string* out) {
   const int32_t scale = (std::max)(view.decimal_scale, 0);
   const int32_t width =
@@ -82,8 +80,7 @@ bool IsDecimal(const struct ArrowSchemaView& view) {
   return view.type == NANOARROW_TYPE_DECIMAL128 || view.type == NANOARROW_TYPE_DECIMAL256;
 }
 
-// The type to create an ingested column with: pg_type's name, except that
-// decimals and lists of decimals keep their precision and scale.
+// pg_type's name, keeping precision and scale for (lists of) decimals.
 Status ColumnTypeName(const PostgresType& pg_type, const struct ArrowSchema& field,
                       const struct ArrowSchemaView& view, std::string* out) {
   if (IsDecimal(view)) return DecimalTypeName(view, out);
@@ -539,8 +536,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(
                     PostgresType::FromSchema(*type_resolver_, source_schema.children[i],
                                              &pg_type, &na_error),
                     &na_error, error);
-    // Appending creates nothing, so the column type to create doesn't matter
-    // (and a decimal too wide to create may still fit the existing column).
+    // Append creates no table; a too-wide decimal may still fit the column.
     if (ingest_.mode != IngestMode::kAppend) {
       std::string type_name;
       RAISE_STATUS(error, ColumnTypeName(pg_type, *source_schema.children[i],

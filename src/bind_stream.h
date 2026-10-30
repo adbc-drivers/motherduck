@@ -241,10 +241,8 @@ struct BindStream {
     return Status::Ok();
   }
 
-  // Append the current row's values to param_buffer as the parameters
-  // starting at first_param, recording each one's offset into the buffer
-  // (-1 for null) and its length. Offsets rather than pointers, since the
-  // buffer may move as it grows.
+  // Append the current row to param_buffer from first_param on, recording
+  // offsets (-1 for null; the buffer may move as it grows) and lengths.
   Status AppendCurrentRow(int64_t first_param, std::vector<int64_t>* offsets,
                           std::vector<int>* lengths) {
     for (int64_t col = 0; col < array_view->n_children; col++) {
@@ -362,9 +360,8 @@ struct BindStream {
     return Status::Ok();
   }
 
-  // Bulk ingest without COPY FROM STDIN, which MotherDuck's endpoint doesn't
-  // support (#31): send the rows as multi-row INSERTs with binary parameters,
-  // all through one pipeline so they run in one implicit transaction.
+  // Ingest via pipelined multi-row INSERTs with binary parameters, since
+  // MotherDuck doesn't support COPY FROM STDIN (#31).
   Status ExecuteInsert(PGconn* pg_conn, const PostgresTypeResolver& type_resolver,
                        const std::string& escaped_table,
                        const std::string& escaped_field_list,
@@ -384,8 +381,7 @@ struct BindStream {
                                     " columns, not ", n_cols);
     }
 
-    // Encode each column as COPY would, and declare the type it is encoded as.
-    // The server casts that to the column's type where they differ.
+    // Encode as COPY would; the server casts to the column type if needed.
     std::vector<Oid> row_types(n_cols);
     bind_field_writers.resize(n_cols);
     for (int64_t i = 0; i < n_cols; i++) {
@@ -406,8 +402,7 @@ struct BindStream {
       row_types[i] = CopyFieldEncodedType(type, target_type).oid();
     }
 
-    // MotherDuck rejects protocol messages over 16 MiB, so cap each batch's
-    // values below that, leaving room for the rest of the Bind message.
+    // MotherDuck rejects messages over 16 MiB; leave room for the rest of Bind.
     constexpr int64_t kMaxInsertBytes = 15 * 1024 * 1024;
     constexpr int64_t kMaxRowsPerInsert = 1000;
     const int64_t rows_per_insert = (std::min)(kMaxRowsPerInsert, kMaxParams / n_cols);
@@ -441,8 +436,8 @@ struct BindStream {
     int64_t rows_sent = 0;
     bool finished = false;
     bool row_pending = false;  // the current row didn't fit in the last batch
-    // Full batches all share one statement, so parse it once: the first full
-    // batch is held back while the statement is prepared, then sent with it.
+    // Full batches share one prepared statement; the first is held back
+    // until it's prepared.
     bool prepared = false;
     int64_t held_rows = 0;
     Status status;
@@ -453,7 +448,7 @@ struct BindStream {
           int64_t n_rows = held_rows;
           held_rows = 0;
           if (n_rows == 0) {
-            // Serialize up to rows_per_insert rows, which may span arrays.
+            // Up to rows_per_insert rows, possibly spanning arrays.
             param_buffer->size_bytes = 0;
             while (!finished && n_rows < rows_per_insert) {
               if (!row_pending) {
@@ -498,12 +493,10 @@ struct BindStream {
             }
           }
 
-          // The buffer may have moved while growing, so point into it only now.
+          // Point into the buffer only now that it's done growing.
           const int n_params = static_cast<int>(n_rows * n_cols);
           PointAtParams(offsets, n_params, &values);
-          // libpq copies the parameters, so the buffer can be reused. A
-          // partial batch replaces the unnamed prepared statement, so the next
-          // full batch prepares it again.
+          // A partial batch replaces the unnamed statement, so re-prepare.
           int sent_ok;
           if (n_rows == rows_per_insert) {
             sent_ok =
@@ -533,7 +526,7 @@ struct BindStream {
           PQclear(result);
         });
 
-    // A statement's own error explains more than the pipeline failing after it.
+    // Prefer the statement's own error over the pipeline's.
     UNWRAP_STATUS(status);
     UNWRAP_STATUS(pipeline_status);
     if (rows_affected) *rows_affected = rows_sent;

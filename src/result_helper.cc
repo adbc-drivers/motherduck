@@ -472,9 +472,7 @@ Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_n
         }
         sent_count++;
         group++;
-        // Stop queueing once the socket can't take more: commands can be
-        // large (a batch of ingested rows), and libpq would otherwise hold a
-        // whole group of them in memory.
+        // Don't buffer a whole group of large commands in libpq.
         if (PQflush(conn) != 0) break;
       }
       if (!sending) {

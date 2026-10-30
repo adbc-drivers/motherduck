@@ -2287,19 +2287,14 @@ TEST_F(PostgresStatementTest, SqlIngestJsonInvalid) {
   ASSERT_THAT(error.message, ::testing::HasSubstr("invalid input syntax for type json"));
 }
 
-// Ingest sends rows as multi-row INSERTs: full batches share a prepared
-// statement, a batch is cut early once its values pass a byte limit (which
-// replaces the prepared statement, so the next full batch prepares it again),
-// and the last batch is partial. Exercise all of these and check every row
-// arrives.
+// Covers full prepared batches, a batch cut by the byte limit, and a partial
+// last batch.
 TEST_F(PostgresStatementTest, SqlIngestInsertBatching) {
   ASSERT_THAT(quirks()->DropTable(&connection, "bulk_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
-  // 1000 rows make a full batch; the one-MiB values at rows 1500-1519 pass
-  // the byte limit partway through the second, so it ends near row 1515. Two
-  // full batches follow, then a partial one.
+  // The one-MiB values at rows 1500-1519 cut the second batch short.
   constexpr int64_t kRows = 3600;
   const std::string big(1 << 20, 'x');
   std::vector<std::optional<std::string>> values;
@@ -2377,9 +2372,7 @@ TEST_F(PostgresStatementTest, SqlIngestRowTooLarge) {
   ASSERT_THAT(error.message, ::testing::HasSubstr("fit in one message"));
 }
 
-// A list of decimals keeps its precision and scale, as a decimal does, rather
-// than becoming DuckDB's default DECIMAL(18,3). This checks only the created
-// column: MotherDuck can't bind binary numeric arrays, so no rows are sent.
+// Checks only the column type: MotherDuck can't bind binary numeric[] (#37).
 TEST_F(PostgresStatementTest, SqlIngestListOfDecimalColumnType) {
   ASSERT_THAT(quirks()->DropTable(&connection, "bulk_ingest", &error),
               IsOkStatus(&error));
@@ -4529,8 +4522,7 @@ TEST_P(PostgresDecimalFixtureRoundTripTest, Decimal128FixtureRoundTrip) {
     ASSERT_THAT(
         AdbcStatementSetSqlQuery(
             &statement_,
-            // DuckDB's DECIMAL has a fixed scale and drops the 0 before the point
-            // when the scale is the width; the fixtures expect PostgreSQL's text.
+            // Normalize DuckDB's fixed-scale text to PostgreSQL's.
             "SELECT CASE WHEN t LIKE '%.%' THEN rtrim(rtrim(t, '0'), '.') ELSE t END "
             "AS amount FROM (SELECT regexp_replace(amount::text, '^(-?)\\.', '\\10.') "
             "AS t, rowid AS r FROM bulk_ingest) ORDER BY r",
