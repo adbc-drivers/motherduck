@@ -23,14 +23,17 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -2844,6 +2847,342 @@ TEST_F(PostgresStatementTest, MultipleStatementsSingleQuery) {
   reader.GetSchema();
   ASSERT_THAT(reader.MaybeNext(), adbc_validation::IsOkErrno());
   ASSERT_EQ(reader.array->length, 3);
+}
+
+TEST_F(PostgresStatementTest, MultipleStatementsSingleQueryError) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // The failing statement reports its own error and stops the ones after it.
+  const char* query = R"(DROP TABLE IF EXISTS test_query_statements_error;
+            SELECT * FROM test_query_statements_missing;
+            CREATE TABLE test_query_statements_error (ints INT);)";
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  ASSERT_EQ("42P01", std::string_view(error.sqlstate, 5));
+  error.release(&error);
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "SELECT * FROM test_query_statements_error", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  error.release(&error);
+}
+
+TEST_F(PostgresStatementTest, MultipleStatementsSingleQueryQuoting) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // Semicolons inside literals don't split statements, and the batch reports
+  // the last statement's row count.
+  const char* query = R"(DROP TABLE IF EXISTS test_query_statements_quoting;
+            CREATE TABLE test_query_statements_quoting (strs TEXT);
+            INSERT INTO test_query_statements_quoting VALUES ('a;b'), ('it''s; here');)";
+  int64_t rows_affected = 0;
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, &rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(2, rows_affected);
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "SELECT * FROM test_query_statements_quoting "
+                                       "WHERE strs IN ('a;b', 'it''s; here')",
+                                       &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  reader.GetSchema();
+  ASSERT_THAT(reader.MaybeNext(), adbc_validation::IsOkErrno());
+  ASSERT_EQ(reader.array->length, 2);
+}
+
+TEST_F(PostgresStatementTest, MultipleStatementsSingleQueryCopy) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // A COPY in a batch fails cleanly and leaves the connection usable.
+  for (const char* query : {"SELECT 1; COPY (SELECT 1) TO STDOUT",
+                            "DROP TABLE IF EXISTS test_query_statements_copy; "
+                            "CREATE TABLE test_query_statements_copy (ints INT); "
+                            "COPY test_query_statements_copy FROM STDIN"}) {
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+                ::testing::Not(IsOkStatus(&error)));
+    error.release(&error);
+  }
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1; SELECT 2", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+}
+
+// Bind values as the single BIGINT parameter $1, one row per value.
+void BindInt64Params(struct AdbcStatement* statement,
+                     const std::vector<std::optional<int64_t>>& values,
+                     struct AdbcError* error) {
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ASSERT_THAT(
+      adbc_validation::MakeSchema(&schema.value, {{"ints", NANOARROW_TYPE_INT64}}),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT(
+      adbc_validation::MakeBatch<int64_t>(
+          &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr), values),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT(AdbcStatementBind(statement, &batch.value, &schema.value, error),
+              IsOkStatus(error));
+}
+
+void ExecuteEach(struct AdbcStatement* statement, std::vector<const char*> queries,
+                 struct AdbcError* error) {
+  for (const char* query : queries) {
+    ASSERT_THAT(AdbcStatementSetSqlQuery(statement, query, error), IsOkStatus(error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(statement, nullptr, nullptr, error),
+                IsOkStatus(error));
+  }
+}
+
+// Read the first column of a single-row query's result as text.
+void QueryScalar(struct AdbcStatement* statement, const char* query, std::string* out,
+                 struct AdbcError* error) {
+  ASSERT_THAT(AdbcStatementSetSqlQuery(statement, query, error), IsOkStatus(error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(statement, &reader.stream.value,
+                                        &reader.rows_affected, error),
+              IsOkStatus(error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NE(nullptr, reader.array->release);
+  ASSERT_EQ(1, reader.array->length);
+  struct ArrowStringView value =
+      ArrowArrayViewGetStringUnsafe(reader.array_view->children[0], 0);
+  out->assign(value.data, static_cast<size_t>(value.size_bytes));
+}
+
+// PostgreSQL rolls back a pipeline's implicit transaction when a command in it
+// fails; MotherDuck keeps what ran before the failure. MotherDuck's version()
+// also starts with "PostgreSQL", so go by the server the tests connect to.
+bool RollsBackFailedPipelines() {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  return uri == nullptr || std::strstr(uri, "motherduck.com") == nullptr;
+}
+
+void CountRows(struct AdbcStatement* statement, const std::string& table,
+               std::string* out, struct AdbcError* error) {
+  const std::string query = "SELECT CAST(count(*) AS TEXT) FROM " + table;
+  ASSERT_NO_FATAL_FAILURE(QueryScalar(statement, query.c_str(), out, error));
+}
+
+// A bind stream that yields one batch of $1 values and then fails, as a
+// broken upstream reader would.
+struct FailingBindStream {
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  bool sent_batch = false;
+
+  static void Make(const std::vector<std::optional<int64_t>>& values,
+                   struct ArrowArrayStream* out) {
+    auto* data = new FailingBindStream();
+    ASSERT_THAT(adbc_validation::MakeSchema(&data->schema.value,
+                                            {{"ints", NANOARROW_TYPE_INT64}}),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT(adbc_validation::MakeBatch<int64_t>(
+                    &data->schema.value, &data->batch.value,
+                    static_cast<struct ArrowError*>(nullptr), values),
+                adbc_validation::IsOkErrno());
+    out->private_data = data;
+    out->get_schema = [](struct ArrowArrayStream* stream, struct ArrowSchema* schema) {
+      auto* data = static_cast<FailingBindStream*>(stream->private_data);
+      return ArrowSchemaDeepCopy(&data->schema.value, schema);
+    };
+    out->get_next = [](struct ArrowArrayStream* stream, struct ArrowArray* array) {
+      auto* data = static_cast<FailingBindStream*>(stream->private_data);
+      if (data->sent_batch) return EIO;
+      data->sent_batch = true;
+      ArrowArrayMove(&data->batch.value, array);
+      return 0;
+    };
+    out->get_last_error = [](struct ArrowArrayStream*) -> const char* {
+      return "the bind stream failed";
+    };
+    out->release = [](struct ArrowArrayStream* stream) {
+      delete static_cast<FailingBindStream*>(stream->private_data);
+      stream->release = nullptr;
+    };
+  }
+};
+
+TEST_F(PostgresStatementTest, ExecuteManyRows) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(&statement,
+                                      {"DROP TABLE IF EXISTS test_execute_many",
+                                       "CREATE TABLE test_execute_many (ints BIGINT)"},
+                                      &error));
+
+  // MotherDuck spends ~20 ms on each INSERT, so keep this small.
+  constexpr int64_t kRows = 500;
+  std::vector<std::optional<int64_t>> values;
+  for (int64_t i = 0; i < kRows; i++) values.push_back(i);
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "INSERT INTO test_execute_many VALUES ($1)", &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(BindInt64Params(&statement, values, &error));
+  int64_t rows_affected = 0;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, &rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(kRows, rows_affected);
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "SELECT ints FROM test_execute_many ORDER BY ints", &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  int64_t seen = 0;
+  while (true) {
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    if (!reader.array->release) break;
+    for (int64_t i = 0; i < reader.array->length; i++) {
+      ASSERT_EQ(seen, ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], i));
+      seen++;
+    }
+  }
+  ASSERT_EQ(kRows, seen);
+}
+
+TEST_F(PostgresStatementTest, ExecuteManyLargeResults) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // About 32 MB of results that nothing reads: enough to fill both ends'
+  // socket buffers, so the driver must read while it's still sending rows.
+  std::vector<std::optional<int64_t>> values;
+  for (int64_t i = 0; i < 500; i++) values.push_back(i);
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, "SELECT CAST($1 AS BIGINT) + 1, repeat('x', 65536)", &error),
+      IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(BindInt64Params(&statement, values, &error));
+
+  // A deadlock would hang here, so fail fast rather than at ctest's timeout.
+  // The stuck worker can't be joined or safely detached, so exit outright;
+  // gtest prints the failure as it's recorded.
+  std::promise<AdbcStatusCode> executed;
+  std::future<AdbcStatusCode> code = executed.get_future();
+  std::thread worker([&] {
+    executed.set_value(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error));
+  });
+  if (code.wait_for(std::chrono::seconds(120)) != std::future_status::ready) {
+    ADD_FAILURE() << "No result after 120 s; the pipeline deadlocked?";
+    std::_Exit(1);
+  }
+  worker.join();
+  ASSERT_THAT(code.get(), IsOkStatus(&error));
+}
+
+TEST_F(PostgresStatementTest, ExecuteManyError) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(
+      ExecuteEach(&statement,
+                  {"DROP TABLE IF EXISTS test_execute_many_error",
+                   "CREATE TABLE test_execute_many_error (ints BIGINT PRIMARY KEY)"},
+                  &error));
+
+  // The second row breaks the primary key; the error comes back and the
+  // connection stays usable.
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "INSERT INTO test_execute_many_error VALUES ($1)", &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(BindInt64Params(&statement, {1, 1, 2}, &error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              ::testing::Not(IsOkStatus(&error)));
+  error.release(&error);
+
+  // The rows share one implicit transaction, so the first row goes too.
+  std::string rows;
+  ASSERT_NO_FATAL_FAILURE(
+      CountRows(&statement, "test_execute_many_error", &rows, &error));
+  if (RollsBackFailedPipelines()) ASSERT_EQ("0", rows);
+}
+
+TEST_F(PostgresStatementTest, ExecuteManyStreamError) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(
+      ExecuteEach(&statement,
+                  {"DROP TABLE IF EXISTS test_execute_many_stream_error",
+                   "CREATE TABLE test_execute_many_stream_error (ints BIGINT)"},
+                  &error));
+
+  // The first batch goes out before the stream fails; like a failed row, the
+  // failure keeps those rows from being committed.
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, "INSERT INTO test_execute_many_stream_error VALUES ($1)", &error),
+      IsOkStatus(&error));
+  struct ArrowArrayStream stream = {};
+  ASSERT_NO_FATAL_FAILURE(FailingBindStream::Make({1, 2, 3}, &stream));
+  ASSERT_THAT(AdbcStatementBindStream(&statement, &stream, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              ::testing::Not(IsOkStatus(&error)));
+  ASSERT_THAT(error.message, ::testing::HasSubstr("the bind stream failed"));
+  error.release(&error);
+
+  std::string rows;
+  ASSERT_NO_FATAL_FAILURE(
+      CountRows(&statement, "test_execute_many_stream_error", &rows, &error));
+  if (RollsBackFailedPipelines()) ASSERT_EQ("0", rows);
+}
+
+TEST_F(PostgresStatementTest, ExecuteManyTimestampTzError) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(
+      &statement,
+      {"DROP TABLE IF EXISTS test_execute_many_tz_error",
+       "CREATE TABLE test_execute_many_tz_error (ts TIMESTAMPTZ PRIMARY KEY)"},
+      &error));
+  std::string time_zone;
+  ASSERT_NO_FATAL_FAILURE(QueryScalar(&statement,
+                                      "SELECT CAST(current_setting('TimeZone') AS TEXT)",
+                                      &time_zone, &error));
+
+  // Binding a TIMESTAMPTZ under autocommit runs inside a transaction that sets
+  // the time zone to UTC. When a row fails, both are undone and the
+  // connection is left usable.
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ArrowSchemaInit(&schema.value);
+  ASSERT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIMESTAMP,
+                                         NANOARROW_TIME_UNIT_MICRO, "UTC"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(schema->children[0], "ts"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(
+      (adbc_validation::MakeBatch<int64_t>(
+          &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr), {0, 0})),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, "INSERT INTO test_execute_many_tz_error VALUES ($1)", &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              ::testing::Not(IsOkStatus(&error)));
+  error.release(&error);
+
+  std::string time_zone_after;
+  ASSERT_NO_FATAL_FAILURE(QueryScalar(&statement,
+                                      "SELECT CAST(current_setting('TimeZone') AS TEXT)",
+                                      &time_zone_after, &error));
+  ASSERT_EQ(time_zone, time_zone_after);
+  std::string rows;
+  ASSERT_NO_FATAL_FAILURE(
+      CountRows(&statement, "test_execute_many_tz_error", &rows, &error));
+  ASSERT_EQ("0", rows);
 }
 
 TEST_F(PostgresStatementTest, SetUseCopyFalse) {
