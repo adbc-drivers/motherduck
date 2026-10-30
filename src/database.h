@@ -36,9 +36,14 @@
 
 #define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
 #define ADBC_MOTHERDUCK_OPTION_SESSION_NAME "adbc.motherduck.session_name"
+#define ADBC_MOTHERDUCK_OPTION_REGION "adbc.motherduck.region"
 
 namespace adbcpq {
 using adbc::driver::Status;
+
+/// \brief The Postgres endpoint host for a MotherDuck region, e.g.
+/// pg.us-east-1-aws.motherduck.com for us-east-1.
+std::string RegionHost(std::string_view region);
 
 /// \brief Append --<name>=<value> to libpq session options.
 ///
@@ -88,6 +93,7 @@ class PostgresDatabase {
   bool use_copy_ = true;
   std::string attach_mode_ = "single";
   std::string session_name_;
+  std::string region_;
   std::string username_;
   std::string password_;
 };

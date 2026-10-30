@@ -540,6 +540,40 @@ TEST_F(PostgresDatabaseTest, IgnoresPostgresPasswords) {
   }
 }
 
+TEST_F(PostgresDatabaseTest, RegionOption) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  // Take the region from the test URI's host, then drop the host.
+  std::string hostless = uri;
+  size_t start = hostless.find('@');
+  ASSERT_NE(start, std::string::npos) << "Test URI must be postgresql://user@host...";
+  start++;
+  size_t end = hostless.find_first_of(":/?", start);
+  std::string host = hostless.substr(start, end - start);
+  constexpr std::string_view kPrefix = "pg.";
+  constexpr std::string_view kSuffix = "-aws.motherduck.com";
+  if (host.size() <= kPrefix.size() + kSuffix.size() || host.rfind(kPrefix, 0) != 0 ||
+      host.compare(host.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+    GTEST_SKIP() << "Test host " << host << " isn't a MotherDuck region host";
+  }
+  std::string region =
+      host.substr(kPrefix.size(), host.size() - kPrefix.size() - kSuffix.size());
+  hostless.erase(start, end - start);
+
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&database.value, hostless.c_str(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
+                                    region.c_str(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+              IsOkStatus(&error));
+}
+
 TEST_F(PostgresDatabaseTest, SessionNameOption) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   adbc_validation::Handle<struct AdbcConnection> connection;
@@ -734,6 +768,68 @@ TEST(MotherDuckSessionNameTest, OptionInvalid) {
       IsStatus(ADBC_STATUS_NOT_FOUND, &error));
   EXPECT_THAT(error.message, ::testing::HasSubstr("is not set"));
   if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckRegionTest, RegionHost) {
+  EXPECT_EQ("pg.us-east-1-aws.motherduck.com", adbcpq::RegionHost("us-east-1"));
+  EXPECT_EQ("pg.eu-central-1-aws.motherduck.com", adbcpq::RegionHost("eu-central-1"));
+}
+
+TEST(MotherDuckRegionTest, OptionSetGet) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_REGION, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
+                                    "us-west-2", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(&database.value,
+                                                 ADBC_MOTHERDUCK_OPTION_REGION, &error),
+              ::testing::Optional("us-west-2"s));
+  // An empty value unsets it.
+  ASSERT_THAT(
+      AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION, "", &error),
+      IsOkStatus(&error));
+  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_REGION, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckRegionTest, OptionInvalid) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const char* value :
+       {"US-EAST-1", "us east 1", "us-east-1.example.com", "us-east-1/x", "us_east_1"}) {
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
+                                      value, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_REGION, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckRegionTest, ConflictsWithHost) {
+  // Fails before connecting, so this needs no server.
+  for (const char* uri : {"postgresql://postgres@localhost:1/db",
+                          "host=localhost dbname=db", "hostaddr=127.0.0.1 dbname=db"}) {
+    struct AdbcError error = {};
+    adbc_validation::Handle<struct AdbcDatabase> database;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", uri, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
+                                      "us-east-1", &error),
+                IsOkStatus(&error));
+    EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    EXPECT_THAT(error.message, ::testing::HasSubstr("not both"));
+    if (error.release) error.release(&error);
+  }
 }
 
 TEST(MotherDuckUsernameTest, OptionSetGet) {

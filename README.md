@@ -98,6 +98,17 @@ libpq, so `PGPASSWORD` and password files (`~/.pgpass`, `PGPASSFILE`) are never
 used. Without a token, connecting fails with `UNAUTHENTICATED`.
 The standard ADBC `username` database option, if set, replaces the URI's user.
 
+`adbc.motherduck.region` (database option) sets the host from a MotherDuck
+region, so the URI can leave it out: `us-east-1` connects to
+`pg.us-east-1-aws.motherduck.com`. Find your region with `md_user_info()`. The
+region must be lowercase letters, digits and dashes. Setting it together with a
+host (or `hostaddr`) in the URI is an error; when it's set, `PGHOST` is ignored.
+For example, with `region` set to `us-east-1`:
+
+```text
+postgresql://postgres@/my_db?sslmode=verify-full&sslrootcert=system
+```
+
 libpq connection service files (`~/.pg_service.conf`, `service=`, or
 `PGSERVICE`) aren't supported: the driver always passes `options`, which
 replaces any `options` a service file sets. Put connection settings in the

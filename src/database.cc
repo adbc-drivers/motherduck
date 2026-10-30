@@ -88,6 +88,13 @@ bool SetsSessionOption(std::string_view options, std::string_view name) {
 }
 }  // namespace
 
+std::string RegionHost(std::string_view region) {
+  std::string host = "pg.";
+  host += region;
+  host += "-aws.motherduck.com";
+  return host;
+}
+
 std::string AddSessionOption(std::string_view options, std::string_view name,
                              std::string_view value) {
   std::string result(options);
@@ -118,6 +125,12 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
       return ADBC_STATUS_NOT_FOUND;
     }
     output = session_name_;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
+    if (region_.empty()) {
+      InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
+      return ADBC_STATUS_NOT_FOUND;
+    }
+    output = region_;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     if (username_.empty()) {
       InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
@@ -209,6 +222,16 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
       }
     }
     session_name_ = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
+    // The region becomes part of a hostname, e.g. us-east-1.
+    for (const char* c = value; *c != '\0'; c++) {
+      if (!(std::islower(static_cast<unsigned char>(*c)) ||
+            std::isdigit(static_cast<unsigned char>(*c)) || *c == '-')) {
+        InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
+        return ADBC_STATUS_INVALID_ARGUMENT;
+      }
+    }
+    region_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
     username_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0) {
@@ -256,14 +279,20 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
   }
 
   // Merge the MotherDuck settings into the session options from the URI (or
-  // PGOPTIONS), apply the username option, and fill in the token. The driver always
-  // passes a password, so libpq never falls back to PGPASSWORD or a password file.
+  // PGOPTIONS), apply the region and username options, and fill in the token. The driver
+  // always passes a password, so libpq never falls back to PGPASSWORD or a password file.
   std::vector<const char*> keywords;
   std::vector<const char*> values;
   const char* options = std::getenv("PGOPTIONS");
   const char* password = nullptr;
+  bool uri_sets_host = false;
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
     if (option->val == nullptr) continue;
+    if ((std::strcmp(option->keyword, "host") == 0 ||
+         std::strcmp(option->keyword, "hostaddr") == 0) &&
+        *option->val != '\0') {
+      uri_sets_host = true;
+    }
     if (std::strcmp(option->keyword, "options") == 0) {
       options = option->val;
       continue;
@@ -275,6 +304,20 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
     if (std::strcmp(option->keyword, "user") == 0 && !username_.empty()) continue;
     keywords.push_back(option->keyword);
     values.push_back(option->val);
+  }
+  std::string host;
+  if (!region_.empty()) {
+    if (uri_sets_host) {
+      PQconninfoFree(conninfo);
+      InternalAdbcSetError(error,
+                           "[libpq] Set either a host in the URI or database "
+                           "option '%s', not both",
+                           ADBC_MOTHERDUCK_OPTION_REGION);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    host = RegionHost(region_);
+    keywords.push_back("host");
+    values.push_back(host.c_str());
   }
   if (!password_.empty()) password = password_.c_str();
   if (password == nullptr || *password == '\0')
