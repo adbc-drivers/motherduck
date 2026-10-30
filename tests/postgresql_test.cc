@@ -1341,17 +1341,29 @@ class PostgresStatementTest : public ::testing::Test,
 ADBCV_TEST_STATEMENT(PostgresStatementTest)
 
 // Every column type MotherDuck reports should be in the built-in type table, so
-// none should come back as an unnamed opaque type.
+// none should come back as an unnamed opaque type. The query covers each type in
+// DuckDB's data type overview, plus the TIMESTAMP and TIME precision variants,
+// ENUM and fixed-size ARRAY.
 TEST_F(PostgresStatementTest, MotherDuckTypesResolve) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
   ASSERT_THAT(
       AdbcStatementSetSqlQuery(
           &statement,
-          "SELECT 1::INTEGER AS i, 1::UBIGINT AS ub, 1.5::DECIMAL(10, 2) AS d, "
-          "[1, 2] AS l, 'x' AS v, 'x'::BLOB AS b, true AS bo, 1.5::DOUBLE AS f, "
-          "DATE '2020-01-01' AS dt, TIMESTAMPTZ '2020-01-01 00:00:00+00' AS ts, "
-          "INTERVAL 1 DAY AS iv, gen_random_uuid() AS u, '{}'::JSON AS j, "
-          "{'a': 1} AS s, MAP {'a': 1} AS m, 'a'::ENUM('a', 'b') AS e, "
+          "SELECT 1::TINYINT AS ti, 1::SMALLINT AS si, 1::INTEGER AS i, "
+          "1::BIGINT AS bi, 1::HUGEINT AS hi, 1::UTINYINT AS uti, "
+          "1::USMALLINT AS usi, 1::UINTEGER AS ui, 1::UBIGINT AS ub, "
+          "1::UHUGEINT AS uhi, 1::BIGNUM AS bn, 1.5::DECIMAL(10, 2) AS d, "
+          "1.5::FLOAT AS fl, 1.5::DOUBLE AS f, true AS bo, '101'::BIT AS bt, "
+          "'x' AS v, 'x'::BLOB AS b, gen_random_uuid() AS u, '{}'::JSON AS j, "
+          "DATE '2020-01-01' AS dt, TIME '12:00:00' AS tm, "
+          "TIMETZ '12:00:00+01' AS ttz, '12:00:00'::TIME_NS AS tmns, "
+          "TIMESTAMP '2020-01-01 00:00:00' AS tsl, "
+          "TIMESTAMP_S '2020-01-01 00:00:00' AS tss, "
+          "TIMESTAMP_MS '2020-01-01 00:00:00' AS tsms, "
+          "TIMESTAMPTZ '2020-01-01 00:00:00+00' AS ts, INTERVAL 1 DAY AS iv, "
+          "'POINT(1 2)'::GEOMETRY AS g, [1, 2] AS l, [1, 2, 3]::INTEGER[3] AS a, "
+          "{'a': 1} AS s, ROW(1, 'a') AS r, MAP {'a': 1} AS m, "
+          "union_value(n := 1) AS un, 1::VARIANT AS va, 'a'::ENUM('a', 'b') AS e, "
           "[[1, 2]] AS nl, '2020-01-01 00:00:00.123456789'::TIMESTAMP_NS AS tns, "
           "[{'a': 1}] AS ls",
           &error),
