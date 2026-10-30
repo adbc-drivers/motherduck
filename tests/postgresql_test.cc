@@ -660,17 +660,84 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogs) {
   ASSERT_NE(*get_objects_data, nullptr)
       << "could not initialize the AdbcGetObjectsData object";
 
-  // With the default attach_mode=single, only the connected database is listed,
-  // along with the built-in md_information_schema, system, and temp catalogs.
-  std::vector<std::string> catalogs;
+  const std::string catalog = quirks()->catalog();
+  struct AdbcGetObjectsCatalog* cat =
+      InternalAdbcGetObjectsDataGetCatalogByName(*get_objects_data, catalog.c_str());
+  ASSERT_NE(cat, nullptr) << "catalog " << catalog << " not found";
+}
+
+namespace {
+AdbcStatusCode ExecuteSql(struct AdbcDatabase* database, const std::string& query,
+                          struct AdbcError* error) {
+  Handle<struct AdbcConnection> connection;
+  Handle<struct AdbcStatement> statement;
+  AdbcStatusCode status = AdbcConnectionNew(&connection.value, error);
+  if (status != ADBC_STATUS_OK) return status;
+  status = AdbcConnectionInit(&connection.value, database, error);
+  if (status != ADBC_STATUS_OK) return status;
+  status = AdbcStatementNew(&connection.value, &statement.value, error);
+  if (status != ADBC_STATUS_OK) return status;
+  status = AdbcStatementSetSqlQuery(&statement.value, query.c_str(), error);
+  if (status != ADBC_STATUS_OK) return status;
+  return AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, error);
+}
+
+// The catalogs GetObjects lists on a new connection to the database.
+void ListCatalogs(struct AdbcDatabase* database, std::vector<std::string>* catalogs) {
+  Handle<struct AdbcError> error;
+  Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error.value),
+              IsOkStatus(&error.value));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, database, &error.value),
+              IsOkStatus(&error.value));
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcConnectionGetObjects(&connection.value, ADBC_OBJECT_DEPTH_CATALOGS,
+                                       nullptr, nullptr, nullptr, nullptr, nullptr,
+                                       &reader.stream.value, &error.value),
+              IsOkStatus(&error.value));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NE(nullptr, reader.array->release);
+  auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+  ASSERT_NE(*get_objects_data, nullptr)
+      << "could not initialize the AdbcGetObjectsData object";
   for (int i = 0; i < (*get_objects_data)->n_catalogs; i++) {
     const struct ArrowStringView name = (*get_objects_data)->catalogs[i]->catalog_name;
-    catalogs.emplace_back(name.data, name.size_bytes);
+    catalogs->emplace_back(name.data, name.size_bytes);
   }
+}
+}  // namespace
+
+// With the default attach_mode=single, other databases in the account aren't
+// catalogs; with workspace, they are.
+TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
+  Handle<struct AdbcDatabase> workspace;
+  ASSERT_THAT(AdbcDatabaseNew(&workspace.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&workspace.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&workspace.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                    "workspace", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&workspace.value, &error), IsOkStatus(&error));
+
   const std::string catalog = quirks()->catalog();
-  EXPECT_THAT(catalogs, ::testing::Contains(catalog));
-  EXPECT_THAT(catalogs, ::testing::Each(::testing::AnyOf(catalog, "md_information_schema",
-                                                         "system", "temp")));
+  const std::string other = catalog + "_other";
+  const std::string drop = "DROP DATABASE IF EXISTS " + quirks_.QuoteIdentifier(other);
+  ASSERT_THAT(ExecuteSql(&workspace.value, drop, &error), IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&workspace.value,
+                         "CREATE DATABASE " + quirks_.QuoteIdentifier(other), &error),
+              IsOkStatus(&error));
+
+  std::vector<std::string> workspace_catalogs;
+  std::vector<std::string> single_catalogs;
+  ListCatalogs(&workspace.value, &workspace_catalogs);
+  ListCatalogs(&database, &single_catalogs);
+  EXPECT_THAT(ExecuteSql(&workspace.value, drop, &error), IsOkStatus(&error));
+  if (HasFatalFailure()) return;
+
+  EXPECT_THAT(workspace_catalogs, ::testing::IsSupersetOf({catalog, other}));
+  EXPECT_THAT(single_catalogs, ::testing::Contains(catalog));
+  EXPECT_THAT(single_catalogs, ::testing::Not(::testing::Contains(other)));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
