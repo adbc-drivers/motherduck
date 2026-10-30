@@ -56,7 +56,7 @@ target_link_libraries(motherduck_driver_test PRIVATE adbc_driver_motherduck
 # Compile the complete inherited test suites even when no PostgreSQL server is
 # configured. The default test run exercises their server-independent cases.
 add_executable(motherduck_postgresql_test error_test.cc postgres_type_test.cc
-                                          postgresql_test.cc)
+                                          postgresql_test.cc result_helper_test.cc)
 target_link_libraries(motherduck_postgresql_test
                       PRIVATE adbc_driver_motherduck adbc_driver_motherduck_impl
                               adbc_validation GTest::gmock_main)
@@ -65,7 +65,7 @@ target_compile_definitions(motherduck_postgresql_test
 )
 add_test(NAME postgresql_unit
          COMMAND motherduck_postgresql_test
-                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*-PostgresTypeTest.BuiltinResolver
+                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:SplitStatementsTest.*:IsCopyStatementTest.*-PostgresTypeTest.BuiltinResolver
 )
 # Keep the server-independent run from creating a MotherDuck test database.
 set_tests_properties(postgresql_unit
