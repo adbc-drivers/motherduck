@@ -426,12 +426,20 @@ TEST_F(PostgresDatabaseTest, TypeResolverModeOptionIgnored) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
+  // The warning is once per process, and no other test sets this option
   ::testing::internal::CaptureStderr();
   AdbcStatusCode status = AdbcDatabaseSetOption(&database.value, key, "server", &error);
   std::string warning = ::testing::internal::GetCapturedStderr();
   ASSERT_THAT(status, IsOkStatus(&error));
   EXPECT_THAT(warning, ::testing::HasSubstr("ignoring database option " +
                                             std::string(key) + "=server"));
+
+  ::testing::internal::CaptureStderr();
+  status = AdbcDatabaseSetOption(&database.value, key, "builtin", &error);
+  warning = ::testing::internal::GetCapturedStderr();
+  ASSERT_THAT(status, IsOkStatus(&error));
+  EXPECT_EQ(warning, "");
+
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
 }
 

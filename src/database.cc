@@ -27,6 +27,7 @@
 
 #include "database.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -110,11 +111,16 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
   } else if (std::strcmp(key, "adbc.postgresql.type_resolver_mode") == 0) {
-    // Accepted for compatibility with the PostgreSQL driver, but ignored
-    std::fprintf(stderr,
-                 "[motherduck] warning: ignoring database option %s=%s; the driver "
-                 "always uses its built-in type table\n",
-                 key, value);
+    // Accepted for compatibility with the PostgreSQL driver, but ignored. Warn once
+    // per process so connection pools don't repeat it.
+    // TODO(https://github.com/adbc-drivers/motherduck/issues/29): use a logger
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      std::fprintf(stderr,
+                   "[motherduck] warning: ignoring database option %s=%s; the driver "
+                   "always uses its built-in type table\n",
+                   key, value);
+    }
   } else {
     InternalAdbcSetError(error, "%s%s", "[libpq] Unknown database option ", key);
     return ADBC_STATUS_NOT_IMPLEMENTED;
