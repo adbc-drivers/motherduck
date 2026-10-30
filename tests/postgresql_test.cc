@@ -25,7 +25,6 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -2998,13 +2997,15 @@ TEST_F(PostgresStatementTest, ExecuteManyLargeResults) {
   ASSERT_NO_FATAL_FAILURE(BindInt64Params(&statement, values, &error));
 
   // A deadlock would hang here, so fail fast rather than at ctest's timeout.
+  // The stuck worker can't be joined or safely detached, so exit outright;
+  // gtest prints the failure as it's recorded.
   std::promise<AdbcStatusCode> executed;
   std::future<AdbcStatusCode> code = executed.get_future();
   std::thread worker([&] {
     executed.set_value(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error));
   });
   if (code.wait_for(std::chrono::seconds(120)) != std::future_status::ready) {
-    std::fprintf(stderr, "ExecuteManyLargeResults: no result after 120 s; deadlocked?\n");
+    ADD_FAILURE() << "No result after 120 s; the pipeline deadlocked?";
     std::_Exit(1);
   }
   worker.join();
