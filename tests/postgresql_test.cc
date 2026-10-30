@@ -1779,10 +1779,11 @@ TEST_F(PostgresStatementTest, SqlIngestAppendIntegerListIntoNumericArray) {
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
               IsOkStatus(&error));
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &statement,
-                  "SELECT amounts::text FROM numeric_array_ingest ORDER BY ctid", &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, "SELECT amounts::text FROM numeric_array_ingest ORDER BY rowid",
+          &error),
+      IsOkStatus(&error));
 
   adbc_validation::StreamReader reader;
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
@@ -1844,7 +1845,7 @@ TEST_F(PostgresStatementTest, SqlIngestAppendIntegerBoundsIntoNumeric) {
   ASSERT_THAT(
       AdbcStatementSetSqlQuery(&statement,
                                "SELECT signed_amount::text, unsigned_amount::text "
-                               "FROM numeric_ingest ORDER BY ctid",
+                               "FROM numeric_ingest ORDER BY rowid",
                                &error),
       IsOkStatus(&error));
 
@@ -4189,7 +4190,12 @@ TEST_P(PostgresDecimalFixtureRoundTripTest, Decimal128FixtureRoundTrip) {
 
     ASSERT_THAT(
         AdbcStatementSetSqlQuery(
-            &statement_, "SELECT amount::text AS amount FROM bulk_ingest ORDER BY ctid",
+            &statement_,
+            // DuckDB's DECIMAL has a fixed scale and drops the 0 before the point
+            // when the scale is the width; the fixtures expect PostgreSQL's text.
+            "SELECT CASE WHEN t LIKE '%.%' THEN rtrim(rtrim(t, '0'), '.') ELSE t END "
+            "AS amount FROM (SELECT regexp_replace(amount::text, '^(-?)\\.', '\\10.') "
+            "AS t, rowid AS r FROM bulk_ingest) ORDER BY r",
             &error_),
         IsOkStatus(&error_));
 
@@ -4248,7 +4254,8 @@ static std::initializer_list<DecimalTestCase> kDecimal128Cases = {
      38,
      8,
      kDecimalData,
-     {"-123.456", "0.00001234", "1", "123.456", "1000000",
+     // DuckDB's DECIMAL has a fixed scale, so its text keeps trailing zeros.
+     {"-123.45600000", "0.00001234", "1.00000000", "123.45600000", "1000000.00000000",
       "23423942305922323.49023094"}}};
 
 static std::initializer_list<DecimalTestCase> kDecimal128NoScaleCases = {
@@ -4264,7 +4271,8 @@ static std::initializer_list<DecimalTestCase> kDecimal256Cases = {
      38,
      8,
      kDecimalData,
-     {"-123.456", "0.00001234", "1", "123.456", "1000000",
+     // DuckDB's DECIMAL has a fixed scale, so its text keeps trailing zeros.
+     {"-123.45600000", "0.00001234", "1.00000000", "123.45600000", "1000000.00000000",
       "23423942305922323.49023094"}}};
 
 static std::initializer_list<DecimalTestCase> kDecimal256NoScaleCases = {

@@ -506,6 +506,23 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                              &pg_type, &na_error),
                     &na_error, error);
     create += " " + pg_type.sql_type_name();
+
+    // DuckDB reads a bare numeric as DECIMAL(18,3), so give it a width and
+    // scale that hold every value of the Arrow decimal, where DuckDB can (at
+    // most 38 digits, with a scale from 0 up to the width).
+    struct ArrowSchemaView field_view;
+    CHECK_NA_DETAIL(
+        INTERNAL, ArrowSchemaViewInit(&field_view, source_schema.children[i], &na_error),
+        &na_error, error);
+    if (field_view.type == NANOARROW_TYPE_DECIMAL128 ||
+        field_view.type == NANOARROW_TYPE_DECIMAL256) {
+      const int32_t scale = (std::max)(field_view.decimal_scale, 0);
+      const int32_t width =
+          (std::max)(field_view.decimal_precision - field_view.decimal_scale, 0) + scale;
+      if (width <= 38) {
+        create += "(" + std::to_string(width) + ", " + std::to_string(scale) + ")";
+      }
+    }
   }
 
   if (ingest_.mode == IngestMode::kAppend) {
@@ -771,26 +788,11 @@ AdbcStatusCode PostgresStatement::ExecuteIngest(struct ArrowArrayStream* stream,
     return Status::FromAdbc(status_code, tmp_error);
   }));
 
-  std::string query = "COPY ";
-  query += escaped_table;
-  query += " (";
-  query += escaped_field_list;
-  query += ") FROM STDIN WITH (FORMAT binary)";
-  PGresult* result = PQexec(connection_->conn(), query.c_str());
-  if (PQresultStatus(result) != PGRES_COPY_IN) {
-    AdbcStatusCode code =
-        MakeStatus(result, "[libpq] COPY query failed: {}\nQuery was: {}",
-                   PQerrorMessage(connection_->conn()), query)
-            .ToAdbc(error);
-    PQclear(result);
-    return code;
-  }
-
-  PQclear(result);
   RAISE_STATUS(
-      error, bind_stream.ExecuteCopy(connection_->conn(), *connection_->type_resolver(),
-                                     has_copy_target_types ? &copy_target_types : nullptr,
-                                     disable_decimal_fast_path_, rows_affected));
+      error, bind_stream.ExecuteInsert(
+                 connection_->conn(), *connection_->type_resolver(), escaped_table,
+                 escaped_field_list, has_copy_target_types ? &copy_target_types : nullptr,
+                 disable_decimal_fast_path_, rows_affected));
   return ADBC_STATUS_OK;
 }
 

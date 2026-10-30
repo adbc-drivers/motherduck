@@ -355,84 +355,160 @@ struct BindStream {
     return Status::Ok();
   }
 
-  Status ExecuteCopy(PGconn* pg_conn, const PostgresTypeResolver& type_resolver,
-                     const PostgresType* target_types, bool disable_decimal_fast_path,
-                     int64_t* rows_affected) {
+  // Bulk ingest without COPY FROM STDIN, which MotherDuck's endpoint doesn't
+  // support (#31): send the rows as multi-row INSERTs with binary parameters,
+  // all through one pipeline so they run in one implicit transaction.
+  Status ExecuteInsert(PGconn* pg_conn, const PostgresTypeResolver& type_resolver,
+                       const std::string& escaped_table,
+                       const std::string& escaped_field_list,
+                       const PostgresType* target_types, bool disable_decimal_fast_path,
+                       int64_t* rows_affected) {
     if (rows_affected) *rows_affected = 0;
 
-    PostgresCopyStreamWriter writer;
-    UNWRAP_ERRNO(Internal, writer.Init(&bind_schema.value));
-    UNWRAP_NANOARROW(na_error, Internal,
-                     writer.InitFieldWriters(type_resolver, target_types,
-                                             disable_decimal_fast_path, &na_error));
+    const int64_t n_cols = bind_schema->n_children;
+    if (n_cols == 0) {
+      return Status::NotImplemented("[libpq] Bulk ingest requires at least one column");
+    }
 
-    UNWRAP_NANOARROW(na_error, Internal, writer.WriteHeader(&na_error));
-
-    while (true) {
-      UNWRAP_STATUS(PullNextArray());
-      if (!current->release) break;
-
-      UNWRAP_ERRNO(Internal, writer.SetArray(&current.value));
-
-      // build writer buffer
-      int write_result;
-      do {
-        write_result = writer.WriteRecord(&na_error);
-      } while (write_result == NANOARROW_OK);
-
-      // check if not ENODATA at exit
-      if (write_result != ENODATA) {
-        return Status::IO("Error occurred writing COPY data: ", PQerrorMessage(pg_conn));
+    // Encode each column as COPY would, and declare the type it is encoded as.
+    // The server casts that to the column's type where they differ.
+    std::vector<Oid> row_types(n_cols);
+    bind_field_writers.resize(n_cols);
+    for (int64_t i = 0; i < n_cols; i++) {
+      const PostgresType* target_type = nullptr;
+      if (target_types != nullptr && i < target_types->n_children()) {
+        target_type = &target_types->child(i);
       }
+      UNWRAP_NANOARROW(
+          na_error, Internal,
+          MakeCopyFieldWriter(bind_schema->children[i], array_view->children[i],
+                              type_resolver, target_type, &bind_field_writers[i],
+                              disable_decimal_fast_path, &na_error));
 
-      UNWRAP_STATUS(FlushCopyWriterToConn(pg_conn, writer));
-
-      if (rows_affected) *rows_affected += current->length;
-      writer.Rewind();
-    }
-
-    // If there were no arrays in the stream, we haven't flushed yet
-    UNWRAP_STATUS(FlushCopyWriterToConn(pg_conn, writer));
-
-    if (PQputCopyEnd(pg_conn, NULL) <= 0) {
-      return Status::IO("Error message returned by PQputCopyEnd: ",
-                        PQerrorMessage(pg_conn));
-    }
-
-    PGresult* result = PQgetResult(pg_conn);
-    ExecStatusType pg_status = PQresultStatus(result);
-    if (pg_status != PGRES_COMMAND_OK) {
-      Status status =
-          MakeStatus(result, "[libpq] Failed to execute COPY statement: {} {}",
-                     PQresStatus(pg_status), PQerrorMessage(pg_conn));
-      PQclear(result);
-      return status;
-    }
-
-    PQclear(result);
-    return Status::Ok();
-  }
-
-  Status FlushCopyWriterToConn(PGconn* pg_conn, const PostgresCopyStreamWriter& writer) {
-    // https://github.com/apache/arrow-adbc/issues/1921: PostgreSQL has a max
-    // size for a single message that we need to respect (1 GiB - 1).  Since
-    // the buffer can be chunked up as much as we want, go for 16 MiB as our
-    // limit.
-    // https://github.com/postgres/postgres/blob/23c5a0e7d43bc925c6001538f04a458933a11fc1/src/common/stringinfo.c#L28
-    constexpr int64_t kMaxCopyBufferSize = 0x1000000;
-    ArrowBuffer buffer = writer.WriteBuffer();
-
-    auto* data = reinterpret_cast<char*>(buffer.data);
-    int64_t remaining = buffer.size_bytes;
-    while (remaining > 0) {
-      int64_t to_write = std::min<int64_t>(remaining, kMaxCopyBufferSize);
-      if (PQputCopyData(pg_conn, data, to_write) <= 0) {
-        return Status::IO("Error writing tuple field data: ", PQerrorMessage(pg_conn));
+      PostgresType type;
+      UNWRAP_NANOARROW(na_error, Internal,
+                       PostgresType::FromSchema(type_resolver, bind_schema->children[i],
+                                                &type, &na_error));
+      // The writers that encode as the column's type rather than the Arrow
+      // type's (see MakeCopyFieldWriter).
+      if (target_type != nullptr && (target_type->type_id() == PostgresTypeId::kNumeric ||
+                                     (target_type->type_id() == PostgresTypeId::kJsonb &&
+                                      type.type_id() == PostgresTypeId::kJson))) {
+        type = *target_type;
       }
-      remaining -= to_write;
-      data += to_write;
+      row_types[i] = type.oid();
     }
 
+    // The protocol counts parameters in an int16.
+    constexpr int64_t kMaxParams = 65535;
+    constexpr int64_t kMaxRowsPerInsert = 1000;
+    const int64_t rows_per_insert =
+        std::max<int64_t>(1, std::min(kMaxRowsPerInsert, kMaxParams / n_cols));
+
+    const std::string insert_prefix =
+        "INSERT INTO " + escaped_table + " (" + escaped_field_list + ") VALUES ";
+    auto make_insert = [&](int64_t n_rows) {
+      std::string query = insert_prefix;
+      int64_t param = 1;
+      for (int64_t row = 0; row < n_rows; row++) {
+        query += row == 0 ? "(" : ", (";
+        for (int64_t col = 0; col < n_cols; col++) {
+          if (col > 0) query += ", ";
+          query += "$" + std::to_string(param++);
+        }
+        query += ")";
+      }
+      return query;
+    };
+    const std::string full_insert = make_insert(rows_per_insert);
+
+    std::vector<Oid> types;
+    types.reserve(rows_per_insert * n_cols);
+    for (int64_t row = 0; row < rows_per_insert; row++) {
+      types.insert(types.end(), row_types.begin(), row_types.end());
+    }
+    std::vector<int> formats(types.size(), kPgBinaryFormat);
+    std::vector<int64_t> offsets(types.size());  // -1 for null
+    std::vector<int> lengths(types.size());
+    std::vector<const char*> values(types.size());
+
+    int64_t rows_sent = 0;
+    bool finished = false;
+    Status status;
+    Status pipeline_status = RunPipeline(
+        pg_conn,
+        [&](bool* sent) -> Status {
+          // Serialize up to rows_per_insert rows, which may span arrays.
+          param_buffer->size_bytes = 0;
+          int64_t n_rows = 0;
+          while (!finished && n_rows < rows_per_insert) {
+            UNWRAP_STATUS(EnsureNextRow());
+            if (current->release == nullptr) {
+              finished = true;
+              break;
+            }
+            for (int64_t col = 0; col < n_cols; col++) {
+              const int64_t param = n_rows * n_cols + col;
+              if (ArrowArrayViewIsNull(array_view->children[col], current_row)) {
+                offsets[param] = -1;
+                lengths[param] = 0;
+                continue;
+              }
+              // Write() prefixes the value with its int32 length, as in COPY.
+              const int64_t start = param_buffer->size_bytes + sizeof(int32_t);
+              UNWRAP_NANOARROW(na_error, Internal,
+                               bind_field_writers[col]->Write(&param_buffer.value,
+                                                              current_row, &na_error));
+              const int64_t length = param_buffer->size_bytes - start;
+              if (length > (std::numeric_limits<int>::max)()) {
+                return Status::Internal("Column ", col, " serialized to >2GB of binary");
+              }
+              offsets[param] = start;
+              lengths[param] = static_cast<int>(length);
+            }
+            n_rows++;
+          }
+
+          *sent = n_rows > 0;
+          if (!*sent) return Status::Ok();
+
+          // The buffer may have moved while growing, so point into it only now.
+          const int n_params = static_cast<int>(n_rows * n_cols);
+          for (int i = 0; i < n_params; i++) {
+            values[i] =
+                offsets[i] < 0
+                    ? nullptr
+                    : reinterpret_cast<const char*>(param_buffer->data) + offsets[i];
+          }
+          // libpq copies the parameters, so the buffer can be reused.
+          const std::string tail_insert =
+              n_rows == rows_per_insert ? std::string() : make_insert(n_rows);
+          if (PQsendQueryParams(
+                  pg_conn,
+                  n_rows == rows_per_insert ? full_insert.c_str() : tail_insert.c_str(),
+                  n_params, types.data(), values.data(), lengths.data(), formats.data(),
+                  kPgBinaryFormat) != 1) {
+            return MakeStatus(nullptr, "[libpq] Failed to send INSERT: {}",
+                              PQerrorMessage(pg_conn));
+          }
+          rows_sent += n_rows;
+          return Status::Ok();
+        },
+        [&](size_t, PGresult* result) {
+          // MotherDuck answers an INSERT with a Count row; PostgreSQL with a tag.
+          const ExecStatusType result_status = PQresultStatus(result);
+          if (result_status != PGRES_COMMAND_OK && result_status != PGRES_TUPLES_OK &&
+              result_status != PGRES_PIPELINE_ABORTED && status.ok()) {
+            status = MakeStatus(result, "[libpq] Failed to execute INSERT: {} {}",
+                                PQresStatus(result_status), PQresultErrorMessage(result));
+          }
+          PQclear(result);
+        });
+
+    // A statement's own error explains more than the pipeline failing after it.
+    UNWRAP_STATUS(status);
+    UNWRAP_STATUS(pipeline_status);
+    if (rows_affected) *rows_affected = rows_sent;
     return Status::Ok();
   }
 };
