@@ -87,14 +87,16 @@ Single mode needs a named database; to connect to `md:`, set `workspace`.
 [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name),
 which routes connections with the same name to the same replica under read
 scaling and appears in query history. The driver adds `--session_name=<name>`
-to libpq's `options` the same way, escaping whitespace and backslashes. It's
-unset by default; an empty value unsets it.
+to libpq's `options` the same way. The name can't contain whitespace or
+backslashes, which libpq treats specially in `options`. It's unset by default;
+an empty value unsets it.
 
 The MotherDuck token is the connection's password. The driver takes it from,
 in order: the standard ADBC `password` database option, a password in the URI,
 and the `MOTHERDUCK_TOKEN` environment variable. It always passes the token to
 libpq, so `PGPASSWORD` and password files (`~/.pgpass`, `PGPASSFILE`) are never
 used. Without a token, connecting fails with `UNAUTHENTICATED`.
+The standard ADBC `username` database option, if set, replaces the URI's user.
 
 libpq connection service files (`~/.pg_service.conf`, `service=`, or
 `PGSERVICE`) aren't supported: the driver always passes `options`, which

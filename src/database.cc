@@ -59,6 +59,7 @@ bool SetsSessionOption(std::string_view options, std::string_view name) {
   underscores += '=';
   dashes += '=';
   // Split on whitespace, as libpq does, keeping backslash escapes in each arg.
+  bool after_c = false;
   size_t i = 0;
   while (i < options.size()) {
     if (std::isspace(static_cast<unsigned char>(options[i]))) {
@@ -71,7 +72,14 @@ bool SetsSessionOption(std::string_view options, std::string_view name) {
       i++;
     }
     std::string_view arg = options.substr(start, i - start);
-    if (arg.substr(0, 2) == "--" || arg.substr(0, 2) == "-c") arg.remove_prefix(2);
+    // A bare <name>=<value> only counts as a setting right after -c.
+    bool setting_arg = after_c;
+    after_c = arg == "-c";
+    if (arg.substr(0, 2) == "--" || arg.substr(0, 2) == "-c") {
+      arg.remove_prefix(2);
+      setting_arg = true;
+    }
+    if (!setting_arg) continue;
     for (std::string_view setting : {underscores, dashes}) {
       if (arg.substr(0, setting.size()) == setting) return true;
     }
@@ -88,11 +96,7 @@ std::string AddSessionOption(std::string_view options, std::string_view name,
   result += "--";
   result += name;
   result += '=';
-  // libpq splits options on whitespace unless it's escaped with a backslash.
-  for (char c : value) {
-    if (c == '\\' || std::isspace(static_cast<unsigned char>(c))) result += '\\';
-    result += c;
-  }
+  result += value;
   return result;
 }
 
@@ -108,9 +112,18 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
     output = use_copy_ ? ADBC_OPTION_VALUE_ENABLED : ADBC_OPTION_VALUE_DISABLED;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
     output = attach_mode_;
-  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0 &&
-             !session_name_.empty()) {
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
+    if (session_name_.empty()) {
+      InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
+      return ADBC_STATUS_NOT_FOUND;
+    }
     output = session_name_;
+  } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
+    if (username_.empty()) {
+      InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
+      return ADBC_STATUS_NOT_FOUND;
+    }
+    output = username_;
   } else {
     InternalAdbcSetError(error, "[libpq] unknown database option '%s'", option);
     return ADBC_STATUS_NOT_FOUND;
@@ -184,7 +197,20 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
     }
     attach_mode_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
+    // libpq splits options on whitespace, and MotherDuck isn't documented to
+    // honor libpq's backslash escapes, so neither can appear in the name.
+    for (const char* c = value; *c != '\0'; c++) {
+      if (*c == '\\' || std::isspace(static_cast<unsigned char>(*c))) {
+        InternalAdbcSetError(error,
+                             "[libpq] Invalid value for option %s=%s: whitespace and "
+                             "backslashes aren't allowed",
+                             key, value);
+        return ADBC_STATUS_INVALID_ARGUMENT;
+      }
+    }
     session_name_ = value;
+  } else if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
+    username_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0) {
     password_ = value;
   } else {
@@ -230,8 +256,8 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
   }
 
   // Merge the MotherDuck settings into the session options from the URI (or
-  // PGOPTIONS), and fill in the token. The driver always passes a password, so
-  // libpq never falls back to PGPASSWORD or a password file.
+  // PGOPTIONS), apply the username option, and fill in the token. The driver always
+  // passes a password, so libpq never falls back to PGPASSWORD or a password file.
   std::vector<const char*> keywords;
   std::vector<const char*> values;
   const char* options = std::getenv("PGOPTIONS");
@@ -246,6 +272,7 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
       password = option->val;
       continue;
     }
+    if (std::strcmp(option->keyword, "user") == 0 && !username_.empty()) continue;
     keywords.push_back(option->keyword);
     values.push_back(option->val);
   }
@@ -261,6 +288,10 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
   }
   keywords.push_back("password");
   values.push_back(password);
+  if (!username_.empty()) {
+    keywords.push_back("user");
+    values.push_back(username_.c_str());
+  }
   std::string session_options =
       AddSessionOption(options ? options : "", "attach_mode", attach_mode_);
   if (!session_name_.empty()) {

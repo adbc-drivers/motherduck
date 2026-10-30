@@ -65,7 +65,7 @@ target_compile_definitions(motherduck_postgresql_test
 )
 add_test(NAME postgresql_unit
          COMMAND motherduck_postgresql_test
-                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:MotherDuckAttachModeTest.*:MotherDuckSessionNameTest.*:MotherDuckPasswordTest.*:SplitStatementsTest.*:IsCopyStatementTest.*
+                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:MotherDuckAttachModeTest.*:MotherDuckSessionNameTest.*:MotherDuckPasswordTest.*:MotherDuckUsernameTest.*:SplitStatementsTest.*:IsCopyStatementTest.*
 )
 # Keep the server-independent run from creating a MotherDuck test database.
 set_tests_properties(postgresql_unit

@@ -32,6 +32,7 @@
 #include <future>
 #include <limits>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -434,6 +435,9 @@ TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
 }
 
 // Sets an environment variable for the life of the object, then restores it.
+// On Windows, the CRT can't hold an empty variable (_putenv_s with "" removes
+// it), so an empty value is set, and restored, as unset. The driver treats an
+// empty MOTHERDUCK_TOKEN as unset, so the tests don't depend on the difference.
 class ScopedEnv {
  public:
   ScopedEnv(const char* name, const char* value) : name_(name) {
@@ -458,6 +462,24 @@ class ScopedEnv {
 
   std::string name_;
   std::optional<std::string> old_;
+};
+
+// A uniquely named file in the temp directory, removed when the object is.
+class ScopedTempFile {
+ public:
+  explicit ScopedTempFile(std::string_view prefix) {
+    std::random_device random;
+    path_ = std::filesystem::temp_directory_path() /
+            (std::string(prefix) + "_" + std::to_string(random()));
+  }
+  ~ScopedTempFile() {
+    std::error_code ec;
+    std::filesystem::remove(path_, ec);
+  }
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
 };
 
 TEST_F(PostgresDatabaseTest, PasswordOption) {
@@ -498,7 +520,8 @@ TEST_F(PostgresDatabaseTest, IgnoresPostgresPasswords) {
   const std::string token = motherduck_token;
 
   // A valid token in PGPASSWORD or a password file doesn't rescue a bad one.
-  auto passfile = std::filesystem::temp_directory_path() / "adbc_motherduck_pgpass";
+  ScopedTempFile scoped_passfile("adbc_motherduck_pgpass");
+  const std::filesystem::path& passfile = scoped_passfile.path();
   {
     std::ofstream out(passfile);
     out << "*:*:*:*:" << token << "\n";
@@ -515,7 +538,6 @@ TEST_F(PostgresDatabaseTest, IgnoresPostgresPasswords) {
     EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
                 IsStatus(ADBC_STATUS_IO, &error));
   }
-  std::filesystem::remove(passfile);
 }
 
 TEST_F(PostgresDatabaseTest, SessionNameOption) {
@@ -523,9 +545,8 @@ TEST_F(PostgresDatabaseTest, SessionNameOption) {
   adbc_validation::Handle<struct AdbcConnection> connection;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
-  // A space checks that the endpoint accepts libpq's escaping.
   ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME,
-                                    "adbc session", &error),
+                                    "adbc_session", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
@@ -659,9 +680,11 @@ TEST(MotherDuckAttachModeTest, AddSessionOption) {
   EXPECT_EQ("--session_name=a\\ attach_mode=x --attach_mode=single",
             adbcpq::AddSessionOption("--session_name=a\\ attach_mode=x", "attach_mode",
                                      "single"));
-  // libpq would split whitespace, so it's escaped, as are backslashes.
-  EXPECT_EQ("--session_name=a\\ b\\\\c",
-            adbcpq::AddSessionOption("", "session_name", "a b\\c"));
+  // A bare <name>=<value> isn't a setting unless it follows -c.
+  EXPECT_EQ("attach_mode=x --attach_mode=single",
+            adbcpq::AddSessionOption("attach_mode=x", "attach_mode", "single"));
+  EXPECT_EQ("-c foo=1 attach_mode=x --attach_mode=single",
+            adbcpq::AddSessionOption("-c foo=1 attach_mode=x", "attach_mode", "single"));
 }
 
 // The status of getting a database option, for options that may be unset.
@@ -694,6 +717,38 @@ TEST(MotherDuckSessionNameTest, OptionSetGet) {
       GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME, &error),
       IsStatus(ADBC_STATUS_NOT_FOUND, &error));
   if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckSessionNameTest, OptionInvalid) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const char* value : {"a b", "a\tb", "a\\b"}) {
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value,
+                                      ADBC_MOTHERDUCK_OPTION_SESSION_NAME, value, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+  EXPECT_THAT(
+      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME, &error),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  EXPECT_THAT(error.message, ::testing::HasSubstr("is not set"));
+  if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckUsernameTest, OptionSetGet) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_USERNAME, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+  ASSERT_THAT(
+      AdbcDatabaseSetOption(&database.value, ADBC_OPTION_USERNAME, "postgres", &error),
+      IsOkStatus(&error));
+  EXPECT_THAT(
+      adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
+      ::testing::Optional("postgres"s));
 }
 
 TEST(MotherDuckPasswordTest, RequiresToken) {
