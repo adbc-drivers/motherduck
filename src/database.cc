@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -45,6 +46,35 @@
 
 namespace adbcpq {
 
+namespace {
+// Whether libpq session options set attach_mode, as --attach_mode=<mode> or
+// -c attach_mode=<mode> (or attach-mode).
+bool SetsAttachMode(std::string_view options) {
+  constexpr std::string_view kWhitespace = " \t\n\r\f\v";
+  constexpr std::string_view kSettings[] = {"attach_mode=", "attach-mode="};
+  size_t start = options.find_first_not_of(kWhitespace);
+  while (start != std::string_view::npos) {
+    size_t end = options.find_first_of(kWhitespace, start);
+    std::string_view arg = options.substr(start, end - start);
+    if (arg.substr(0, 2) == "--" || arg.substr(0, 2) == "-c") arg.remove_prefix(2);
+    for (std::string_view setting : kSettings) {
+      if (arg.substr(0, setting.size()) == setting) return true;
+    }
+    start = options.find_first_not_of(kWhitespace, end);
+  }
+  return false;
+}
+}  // namespace
+
+std::string AddAttachMode(std::string_view options, std::string_view attach_mode) {
+  std::string result(options);
+  if (SetsAttachMode(options)) return result;
+  if (!result.empty()) result += ' ';
+  result += "--attach_mode=";
+  result += attach_mode;
+  return result;
+}
+
 PostgresDatabase::PostgresDatabase() : open_connections_(0) {
   type_resolver_ = std::make_shared<PostgresTypeResolver>();
 }
@@ -55,6 +85,8 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
   std::string output;
   if (std::strcmp(option, ADBC_POSTGRESQL_OPTION_USE_COPY) == 0) {
     output = use_copy_ ? ADBC_OPTION_VALUE_ENABLED : ADBC_OPTION_VALUE_DISABLED;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
+    output = attach_mode_;
   } else {
     InternalAdbcSetError(error, "[libpq] unknown database option '%s'", option);
     return ADBC_STATUS_NOT_FOUND;
@@ -121,6 +153,12 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
                    "always uses its built-in type table\n",
                    key, value);
     }
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
+    if (std::strcmp(value, "single") != 0 && std::strcmp(value, "workspace") != 0) {
+      InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    attach_mode_ = value;
   } else {
     InternalAdbcSetError(error, "%s%s", "[libpq] Unknown database option ", key);
     return ADBC_STATUS_NOT_IMPLEMENTED;
@@ -153,7 +191,37 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
         "[libpq] Must set database option 'uri' before creating a connection");
     return ADBC_STATUS_INVALID_STATE;
   }
-  *conn = PQconnectdb(uri_.c_str());
+
+  char* parse_error = nullptr;
+  PQconninfoOption* conninfo = PQconninfoParse(uri_.c_str(), &parse_error);
+  if (conninfo == nullptr) {
+    InternalAdbcSetError(error, "%s%s", "[libpq] Failed to connect: ",
+                         parse_error ? parse_error : "out of memory");
+    PQfreemem(parse_error);
+    return ADBC_STATUS_IO;
+  }
+
+  // Merge attach_mode into the session options from the URI (or PGOPTIONS).
+  std::vector<const char*> keywords;
+  std::vector<const char*> values;
+  const char* options = std::getenv("PGOPTIONS");
+  for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
+    if (option->val == nullptr) continue;
+    if (std::strcmp(option->keyword, "options") == 0) {
+      options = option->val;
+      continue;
+    }
+    keywords.push_back(option->keyword);
+    values.push_back(option->val);
+  }
+  std::string session_options = AddAttachMode(options ? options : "", attach_mode_);
+  keywords.push_back("options");
+  values.push_back(session_options.c_str());
+  keywords.push_back(nullptr);
+  values.push_back(nullptr);
+
+  *conn = PQconnectdbParams(keywords.data(), values.data(), /*expand_dbname=*/0);
+  PQconninfoFree(conninfo);
   if (PQstatus(*conn) != CONNECTION_OK) {
     InternalAdbcSetError(error, "%s%s",
                          "[libpq] Failed to connect: ", PQerrorMessage(*conn));

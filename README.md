@@ -73,39 +73,56 @@ ctest --test-dir build/debug --output-on-failure
 cmake --install build/debug --prefix build/install
 ```
 
+## Options
+
+`adbc.motherduck.attach_mode` (database option) sets the MotherDuck
+[attach mode](https://motherduck.com/docs/sql-reference/postgres-endpoint/#session-options):
+`single` (the default) attaches only the database named in the connection,
+and `workspace` attaches every database in the account. The driver adds
+`--attach_mode=<mode>` to libpq's `options`, after any session options from
+the URI or `PGOPTIONS`. If those already set `attach_mode`, they win.
+Single mode needs a named database; to connect to `md:`, set `workspace`.
+
+libpq connection service files (`~/.pg_service.conf`, `service=`, or
+`PGSERVICE`) aren't supported: the driver always passes `options`, which
+replaces any `options` a service file sets. Put connection settings in the
+URI instead.
+
 ## Inherited tests
 
-The complete upstream C++ test suites are compiled in test builds. Linux test
-builds enable PostgreSQL integration tests by default; macOS and Windows run
-server-independent tests by default. Use the disposable Compose service locally:
+The complete upstream C++ test suites are compiled in test builds. The
+integration tests and the Python validation suite run against MotherDuck's
+Postgres endpoint; plain PostgreSQL isn't supported, because every connection
+sets `attach_mode`. Linux test builds enable the integration tests by default,
+and macOS and Windows run only server-independent tests unless you set
+`MOTHERDUCK_TEST_POSTGRESQL=ON` when building.
+
+To run them locally, export a MotherDuck token and let `ci/scripts/pre-test.sh`
+write the connection settings to `.env.override` (it needs `pixi install` for
+its CA bundle):
 
 ```sh
-docker compose up --detach --wait test-service
+export MOTHERDUCK_TOKEN=...
+./ci/scripts/pre-test.sh macos arm64
 set -a
-source .env.linux
+source .env.override
 set +a
-./ci/scripts/build.sh test linux amd64
-./ci/scripts/test.sh linux amd64
-docker compose down --volumes
+MOTHERDUCK_TEST_POSTGRESQL=ON ./ci/scripts/build.sh test macos arm64
+./ci/scripts/test.sh macos arm64
+pixi run validate
 ```
 
-The service uses `postgres:latest` with database/user `postgres` and password
-`password` on localhost port 5432. Set `MOTHERDUCK_TEST_POSTGRESQL=OFF` when
-building to disable database tests, or `ON` to enable them on another platform
-with an available PostgreSQL server. CI starts the service and loads `.env.linux`
-only on Linux.
-
-In CI, the C++ tests and the Python validation suite run against MotherDuck's
-Postgres endpoint instead of the Compose service. The test and validate jobs use
-the `MOTHERDUCK_TOKEN` secret from the `test` GitHub environment;
-`ci/scripts/pre-test.sh` builds the connection URI from it. Each job gets a
-fresh database, `adbc_ci_<run>_<job>_<platform>_<arch>`, which the tests
-create before they start and drop when they finish, so
-concurrent jobs and runs don't share tables. Test connections use
+By default each run gets a fresh database, `adbc_ci_<run>_<job>_<platform>_<arch>`,
+which the tests create before they start and drop when they finish, so
+concurrent jobs and runs don't share tables. Set `MOTHERDUCK_TEST_DATABASE` to
+an existing database to use it instead; the tests leave it in place.
+`MOTHERDUCK_PG_HOST` overrides the default host
+(`pg.us-east-1-aws.motherduck.com`). Test connections use the driver's default
 `attach_mode=single`, so other databases in the account stay out of catalog
-queries. `MOTHERDUCK_PG_HOST` overrides the default host
-(`pg.us-east-1-aws.motherduck.com`); `MOTHERDUCK_TEST_DATABASE` names an
-existing database to use instead, which the tests leave in place.
+queries.
+
+CI does the same, using the `MOTHERDUCK_TOKEN` secret from the `test` GitHub
+environment.
 
 The validation suite's quirks in `validation/tests/postgresql.py` describe
 MotherDuck: its catalog, `main` schema, no temporary tables, and the vendor
