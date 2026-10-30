@@ -48,6 +48,7 @@
 #include "adbc_driver_motherduck_config.h"
 #include "common/options.h"
 #include "common/utils.h"
+#include "database.h"
 #include "validation/adbc_validation.h"
 #include "validation/adbc_validation_util.h"
 
@@ -226,10 +227,14 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return ddl;
   }
 
-  // For `md:` connections, the account's default database.
+  // The database the test URI connects to.
   std::string catalog() const override {
     const char* catalog = std::getenv("MOTHERDUCK_TEST_CATALOG");
-    return catalog ? catalog : "my_db";
+    if (!catalog) {
+      ADD_FAILURE() << "Must provide env var MOTHERDUCK_TEST_CATALOG";
+      return "";
+    }
+    return catalog;
   }
   std::string db_schema() const override { return "main"; }
 
@@ -293,6 +298,10 @@ class MotherDuckTestDatabase : public ::testing::Environment {
     Handle<struct AdbcStatement> statement;
     ASSERT_THAT(AdbcDatabaseNew(&database.value, &error.value), IsOkStatus(&error.value));
     ASSERT_THAT(quirks_.SetupDatabase(&database.value, setup_uri_.c_str(), &error.value),
+                IsOkStatus(&error.value));
+    // Single attach mode can't connect to md:.
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      "workspace", &error.value),
                 IsOkStatus(&error.value));
     ASSERT_THAT(AdbcDatabaseInit(&database.value, &error.value),
                 IsOkStatus(&error.value));
@@ -490,6 +499,66 @@ TEST_F(PostgresDatabaseTest, AdbcDriverBackwardsCompatibility) {
               IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
 }
 
+TEST(MotherDuckAttachModeTest, OptionDefault) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
+              ::testing::Optional("single"s));
+}
+
+TEST(MotherDuckAttachModeTest, OptionSetGet) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const std::string value : {"workspace", "single"}) {
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      value.c_str(), &error),
+                IsOkStatus(&error));
+    EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                    &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
+                ::testing::Optional(value));
+  }
+}
+
+TEST(MotherDuckAttachModeTest, OptionInvalid) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const char* value : {"", "SINGLE", "multi"}) {
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      value, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
+              ::testing::Optional("single"s));
+}
+
+TEST(MotherDuckAttachModeTest, AddAttachMode) {
+  EXPECT_EQ("--attach_mode=single", adbcpq::AddAttachMode("", "single"));
+  EXPECT_EQ("--session_name=x --attach_mode=workspace",
+            adbcpq::AddAttachMode("--session_name=x", "workspace"));
+  // Options from the URI win.
+  EXPECT_EQ("--attach_mode=workspace",
+            adbcpq::AddAttachMode("--attach_mode=workspace", "single"));
+  EXPECT_EQ("-c attach_mode=workspace",
+            adbcpq::AddAttachMode("-c attach_mode=workspace", "single"));
+  EXPECT_EQ("-cattach_mode=workspace",
+            adbcpq::AddAttachMode("-cattach_mode=workspace", "single"));
+  EXPECT_EQ("--attach-mode=workspace",
+            adbcpq::AddAttachMode("--attach-mode=workspace", "single"));
+  EXPECT_EQ("-c attach-mode=workspace",
+            adbcpq::AddAttachMode("-c attach-mode=workspace", "single"));
+  // Other options that mention attach_mode don't count.
+  EXPECT_EQ("--session_name=attach_mode=x --attach_mode=single",
+            adbcpq::AddAttachMode("--session_name=attach_mode=x", "single"));
+  EXPECT_EQ("--session_name=attach_mode --attach_mode=single",
+            adbcpq::AddAttachMode("--session_name=attach_mode", "single"));
+}
+
 class PostgresConnectionTest : public ::testing::Test,
                                public adbc_validation::ConnectionTest {
  public:
@@ -591,11 +660,84 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogs) {
   ASSERT_NE(*get_objects_data, nullptr)
       << "could not initialize the AdbcGetObjectsData object";
 
-  // With `md:`, every database the account can see is a catalog.
   const std::string catalog = quirks()->catalog();
   struct AdbcGetObjectsCatalog* cat =
       InternalAdbcGetObjectsDataGetCatalogByName(*get_objects_data, catalog.c_str());
   ASSERT_NE(cat, nullptr) << "catalog " << catalog << " not found";
+}
+
+namespace {
+AdbcStatusCode ExecuteSql(struct AdbcDatabase* database, const std::string& query,
+                          struct AdbcError* error) {
+  Handle<struct AdbcConnection> connection;
+  Handle<struct AdbcStatement> statement;
+  AdbcStatusCode status = AdbcConnectionNew(&connection.value, error);
+  if (status != ADBC_STATUS_OK) return status;
+  status = AdbcConnectionInit(&connection.value, database, error);
+  if (status != ADBC_STATUS_OK) return status;
+  status = AdbcStatementNew(&connection.value, &statement.value, error);
+  if (status != ADBC_STATUS_OK) return status;
+  status = AdbcStatementSetSqlQuery(&statement.value, query.c_str(), error);
+  if (status != ADBC_STATUS_OK) return status;
+  return AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, error);
+}
+
+// The catalogs GetObjects lists on a new connection to the database.
+void ListCatalogs(struct AdbcDatabase* database, std::vector<std::string>* catalogs) {
+  Handle<struct AdbcError> error;
+  Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error.value),
+              IsOkStatus(&error.value));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, database, &error.value),
+              IsOkStatus(&error.value));
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcConnectionGetObjects(&connection.value, ADBC_OBJECT_DEPTH_CATALOGS,
+                                       nullptr, nullptr, nullptr, nullptr, nullptr,
+                                       &reader.stream.value, &error.value),
+              IsOkStatus(&error.value));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NE(nullptr, reader.array->release);
+  auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+  ASSERT_NE(*get_objects_data, nullptr)
+      << "could not initialize the AdbcGetObjectsData object";
+  for (int i = 0; i < (*get_objects_data)->n_catalogs; i++) {
+    const struct ArrowStringView name = (*get_objects_data)->catalogs[i]->catalog_name;
+    catalogs->emplace_back(name.data, name.size_bytes);
+  }
+}
+}  // namespace
+
+// With the default attach_mode=single, other databases in the account aren't
+// catalogs; with workspace, they are.
+TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
+  Handle<struct AdbcDatabase> workspace;
+  ASSERT_THAT(AdbcDatabaseNew(&workspace.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&workspace.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&workspace.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                    "workspace", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&workspace.value, &error), IsOkStatus(&error));
+
+  const std::string catalog = quirks()->catalog();
+  const std::string other = catalog + "_other";
+  const std::string drop = "DROP DATABASE IF EXISTS " + quirks_.QuoteIdentifier(other);
+  ASSERT_THAT(ExecuteSql(&workspace.value, drop, &error), IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&workspace.value,
+                         "CREATE DATABASE " + quirks_.QuoteIdentifier(other), &error),
+              IsOkStatus(&error));
+
+  std::vector<std::string> workspace_catalogs;
+  std::vector<std::string> single_catalogs;
+  ListCatalogs(&workspace.value, &workspace_catalogs);
+  ListCatalogs(&database, &single_catalogs);
+  EXPECT_THAT(ExecuteSql(&workspace.value, drop, &error), IsOkStatus(&error));
+  if (HasFatalFailure()) return;
+
+  EXPECT_THAT(workspace_catalogs, ::testing::IsSupersetOf({catalog, other}));
+  EXPECT_THAT(single_catalogs, ::testing::Contains(catalog));
+  EXPECT_THAT(single_catalogs, ::testing::Not(::testing::Contains(other)));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
@@ -1601,6 +1743,60 @@ TEST_F(PostgresStatementTest, SqlIngestSchema) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
                 IsOkStatus(&error));
   }
+}
+
+TEST_F(PostgresStatementTest, SqlIngestReplaceRecreatesTable) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "CREATE OR REPLACE TABLE ingest_replace_ddl "
+                                       "(old_col INTEGER)",
+                                       &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+
+  {
+    adbc_validation::Handle<struct ArrowSchema> schema;
+    adbc_validation::Handle<struct ArrowArray> batch;
+
+    ArrowSchemaInit(&schema.value);
+    ASSERT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowSchemaSetName(schema->children[0], "ints"),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT((adbc_validation::MakeBatch<int64_t>(
+                    &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr),
+                    {1, 2})),
+                adbc_validation::IsOkErrno());
+
+    ASSERT_THAT(AdbcStatementSetOption(&statement, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                       "ingest_replace_ddl", &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetOption(&statement, ADBC_INGEST_OPTION_MODE,
+                                       ADBC_INGEST_OPTION_MODE_REPLACE, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+                IsOkStatus(&error));
+    int64_t rows_affected = 0;
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, &rows_affected, &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(rows_affected, 2);
+  }
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "SELECT * FROM ingest_replace_ddl ORDER BY ints", &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_EQ(reader.schema->n_children, 1);
+  EXPECT_STREQ(reader.schema->children[0]->name, "ints");
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NO_FATAL_FAILURE(
+      adbc_validation::CompareArray<int64_t>(reader.array_view->children[0], {1, 2}));
 }
 
 TEST_F(PostgresStatementTest, SqlIngestTemporaryTable) {

@@ -62,13 +62,6 @@
 namespace adbcpq {
 
 namespace {
-// MotherDuck answers DDL with an empty result set (a Count or Success column)
-// instead of a command tag, so PGRES_TUPLES_OK means success here too.
-bool IsDdlSuccess(PGresult* result) {
-  ExecStatusType status = PQresultStatus(result);
-  return status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK;
-}
-
 // DuckDB reads a bare numeric as DECIMAL(18,3), so give an Arrow decimal a
 // width and scale that hold all of its values. DuckDB allows at most 38
 // digits, with a scale from 0 up to the width.
@@ -502,7 +495,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(
                                       /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
                                       /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                                       /*resultFormat=*/1 /*(binary)*/);
-      if (!IsDdlSuccess(result)) {
+      if (!IsResultOk(result)) {
         AdbcStatusCode code =
             MakeStatus(result, "[libpq] Failed to drop table: {}\nQuery was: {}",
                        PQerrorMessage(conn), drop)
@@ -568,7 +561,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(
                                   /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
                                   /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                                   /*resultFormat=*/1 /*(binary)*/);
-  if (!IsDdlSuccess(result)) {
+  if (!IsResultOk(result)) {
     AdbcStatusCode code =
         MakeStatus(result, "[libpq] Failed to create table: {}\nQuery was: {}",
                    PQerrorMessage(conn), create)

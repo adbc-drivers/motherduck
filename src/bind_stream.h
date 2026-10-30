@@ -567,10 +567,10 @@ struct BindStream {
           return Status::Ok();
         },
         [&](size_t, PGresult* result) {
-          // MotherDuck answers an INSERT with a Count row; PostgreSQL with a tag.
+          // A failure aborts the statements after it; report only the first.
           const ExecStatusType result_status = PQresultStatus(result);
-          if (result_status != PGRES_COMMAND_OK && result_status != PGRES_TUPLES_OK &&
-              result_status != PGRES_PIPELINE_ABORTED && status.ok()) {
+          if (!IsResultOk(result) && result_status != PGRES_PIPELINE_ABORTED &&
+              status.ok()) {
             status = MakeStatus(result, "[libpq] Failed to execute INSERT: {} {}",
                                 PQresStatus(result_status), PQresultErrorMessage(result));
           }

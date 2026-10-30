@@ -99,4 +99,17 @@ TEST(IsCopyStatementTest, NotCopy) {
   EXPECT_FALSE(IsCopyStatement("-- COPY t FROM STDIN\nSELECT 1"));
 }
 
+TEST(IsResultOkTest, Statuses) {
+  for (ExecStatusType status : {PGRES_COMMAND_OK, PGRES_TUPLES_OK, PGRES_EMPTY_QUERY,
+                                PGRES_FATAL_ERROR, PGRES_COPY_IN}) {
+    PGresult* result = PQmakeEmptyPGresult(nullptr, status);
+    ASSERT_NE(result, nullptr);
+    // MotherDuck answers DDL with PGRES_TUPLES_OK.
+    EXPECT_EQ(IsResultOk(result),
+              status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK)
+        << PQresStatus(status);
+    PQclear(result);
+  }
+}
+
 }  // namespace adbcpq
