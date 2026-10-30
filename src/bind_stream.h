@@ -55,7 +55,8 @@ struct BindStream {
 
   // OIDs for parameter types
   std::vector<uint32_t> param_types;
-  std::vector<char*> param_values;
+  std::vector<const char*> param_values;
+  std::vector<int64_t> param_offsets;
   std::vector<int> param_formats;
   std::vector<int> param_lengths;
   Handle<struct ArrowBuffer> param_buffer;
@@ -240,52 +241,58 @@ struct BindStream {
     return Status::Ok();
   }
 
-  // Serialize the current row into param_values and param_lengths.
-  Status SerializeCurrentRow() {
-    param_buffer->size_bytes = 0;
-    int64_t last_offset = 0;
-    std::vector<bool> is_null_param(array_view->n_children);
-
+  // Append the current row's values to param_buffer as the parameters
+  // starting at first_param, recording each one's offset into the buffer
+  // (-1 for null) and its length. Offsets rather than pointers, since the
+  // buffer may move as it grows.
+  Status AppendCurrentRow(int64_t first_param, std::vector<int64_t>* offsets,
+                          std::vector<int>* lengths) {
     for (int64_t col = 0; col < array_view->n_children; col++) {
-      is_null_param[col] = ArrowArrayViewIsNull(array_view->children[col], current_row);
+      const int64_t param = first_param + col;
+      if (ArrowArrayViewIsNull(array_view->children[col], current_row)) {
+        (*offsets)[param] = -1;
+        (*lengths)[param] = 0;
+        continue;
+      }
 
       // Safety check: NA type arrays should only contain nulls
-      if (bind_schema_fields[col].type == NANOARROW_TYPE_NA && !is_null_param[col]) {
+      if (bind_schema_fields[col].type == NANOARROW_TYPE_NA) {
         return Status::InvalidArgument(
             "Parameter $", col + 1,
             " has null type but contains a non-null value at row ", current_row);
       }
 
-      if (!is_null_param[col]) {
-        // Note that this Write() call currently writes the (int32_t) byte size of the
-        // field in addition to the serialized value.
-        UNWRAP_NANOARROW(
-            na_error, Internal,
-            bind_field_writers[col]->Write(&param_buffer.value, current_row, &na_error));
-      } else {
-        UNWRAP_ERRNO(Internal, ArrowBufferAppendInt32(&param_buffer.value, 0));
+      // Write() prefixes the value with its int32 length, as in COPY.
+      const int64_t start = param_buffer->size_bytes + sizeof(int32_t);
+      UNWRAP_NANOARROW(
+          na_error, Internal,
+          bind_field_writers[col]->Write(&param_buffer.value, current_row, &na_error));
+      const int64_t length = param_buffer->size_bytes - start;
+      if (length > (std::numeric_limits<int>::max)()) {
+        return Status::Internal("Parameter ", col, " serialized to >2GB of binary");
       }
-
-      int64_t param_length = param_buffer->size_bytes - last_offset - sizeof(int32_t);
-      if (param_length > (std::numeric_limits<int>::max)()) {
-        return Status::Internal("Parameter ", col, "serialized to >2GB of binary");
-      }
-
-      param_lengths[col] = static_cast<int>(param_length);
-      last_offset = param_buffer->size_bytes;
+      (*offsets)[param] = start;
+      (*lengths)[param] = static_cast<int>(length);
     }
+    return Status::Ok();
+  }
 
-    last_offset = 0;
-    for (int64_t col = 0; col < array_view->n_children; col++) {
-      last_offset += sizeof(int32_t);
-      if (is_null_param[col]) {
-        param_values[col] = nullptr;
-      } else {
-        param_values[col] = reinterpret_cast<char*>(param_buffer->data) + last_offset;
-      }
-      last_offset += param_lengths[col];
+  // Point values at the parameters AppendCurrentRow wrote to param_buffer.
+  void PointAtParams(const std::vector<int64_t>& offsets, int64_t n_params,
+                     std::vector<const char*>* values) {
+    for (int64_t i = 0; i < n_params; i++) {
+      (*values)[i] = offsets[i] < 0
+                         ? nullptr
+                         : reinterpret_cast<const char*>(param_buffer->data) + offsets[i];
     }
+  }
 
+  // Serialize the current row into param_values and param_lengths.
+  Status SerializeCurrentRow() {
+    param_buffer->size_bytes = 0;
+    param_offsets.resize(array_view->n_children);
+    UNWRAP_STATUS(AppendCurrentRow(0, &param_offsets, &param_lengths));
+    PointAtParams(param_offsets, array_view->n_children, &param_values);
     return Status::Ok();
   }
 
@@ -355,55 +362,6 @@ struct BindStream {
     return Status::Ok();
   }
 
-  // Whether to declare a parameter as its target column's type rather than
-  // its Arrow type's: where MakeCopyFieldWriter encodes as the column's type
-  // (numeric, jsonb and arrays), and for timestamps, whose encodings match,
-  // so the value lands as COPY would have stored it rather than being cast
-  // through the session time zone.
-  static bool DeclareAsTarget(const PostgresType& type, const PostgresType& target) {
-    switch (target.type_id()) {
-      case PostgresTypeId::kNumeric:
-        return true;
-      case PostgresTypeId::kArray:
-        return type.type_id() == PostgresTypeId::kArray;
-      case PostgresTypeId::kJsonb:
-        return type.type_id() == PostgresTypeId::kJson;
-      case PostgresTypeId::kTimestamp:
-      case PostgresTypeId::kTimestamptz:
-        return type.type_id() == PostgresTypeId::kTimestamp ||
-               type.type_id() == PostgresTypeId::kTimestamptz;
-      default:
-        return false;
-    }
-  }
-
-  // Serialize the current row's values into param_buffer for the parameters
-  // starting at first_param, recording each one's offset (-1 for null) and
-  // length.
-  Status AppendCurrentRow(int64_t first_param, std::vector<int64_t>* offsets,
-                          std::vector<int>* lengths) {
-    for (int64_t col = 0; col < array_view->n_children; col++) {
-      const int64_t param = first_param + col;
-      if (ArrowArrayViewIsNull(array_view->children[col], current_row)) {
-        (*offsets)[param] = -1;
-        (*lengths)[param] = 0;
-        continue;
-      }
-      // Write() prefixes the value with its int32 length, as in COPY.
-      const int64_t start = param_buffer->size_bytes + sizeof(int32_t);
-      UNWRAP_NANOARROW(
-          na_error, Internal,
-          bind_field_writers[col]->Write(&param_buffer.value, current_row, &na_error));
-      const int64_t length = param_buffer->size_bytes - start;
-      if (length > (std::numeric_limits<int>::max)()) {
-        return Status::Internal("Column ", col, " serialized to >2GB of binary");
-      }
-      (*offsets)[param] = start;
-      (*lengths)[param] = static_cast<int>(length);
-    }
-    return Status::Ok();
-  }
-
   // Bulk ingest without COPY FROM STDIN, which MotherDuck's endpoint doesn't
   // support (#31): send the rows as multi-row INSERTs with binary parameters,
   // all through one pipeline so they run in one implicit transaction.
@@ -445,10 +403,7 @@ struct BindStream {
       UNWRAP_NANOARROW(na_error, Internal,
                        PostgresType::FromSchema(type_resolver, bind_schema->children[i],
                                                 &type, &na_error));
-      if (target_type != nullptr && DeclareAsTarget(type, *target_type)) {
-        type = *target_type;
-      }
-      row_types[i] = type.oid();
+      row_types[i] = CopyFieldEncodedType(type, target_type).oid();
     }
 
     // MotherDuck rejects protocol messages over 16 MiB, so cap each batch's
@@ -511,7 +466,13 @@ struct BindStream {
               row_pending = false;
               const int64_t row_start = param_buffer->size_bytes;
               UNWRAP_STATUS(AppendCurrentRow(n_rows * n_cols, &offsets, &lengths));
-              if (param_buffer->size_bytes > kMaxInsertBytes && n_rows > 0) {
+              if (param_buffer->size_bytes > kMaxInsertBytes) {
+                if (n_rows == 0) {
+                  return Status::InvalidArgument(
+                      "[libpq] Row ", rows_sent, " takes ", param_buffer->size_bytes,
+                      " bytes, more than the ", kMaxInsertBytes,
+                      " that fit in one message to MotherDuck");
+                }
                 // Send this row with the next batch instead.
                 param_buffer->size_bytes = row_start;
                 row_pending = true;
@@ -539,12 +500,7 @@ struct BindStream {
 
           // The buffer may have moved while growing, so point into it only now.
           const int n_params = static_cast<int>(n_rows * n_cols);
-          for (int i = 0; i < n_params; i++) {
-            values[i] =
-                offsets[i] < 0
-                    ? nullptr
-                    : reinterpret_cast<const char*>(param_buffer->data) + offsets[i];
-          }
+          PointAtParams(offsets, n_params, &values);
           // libpq copies the parameters, so the buffer can be reused. A
           // partial batch replaces the unnamed prepared statement, so the next
           // full batch prepares it again.

@@ -1030,6 +1030,50 @@ class PostgresCopyTimestampFieldWriter : public PostgresCopyFieldWriter {
   }
 };
 
+// The type a value written by MakeCopyFieldWriter is encoded as, given the
+// type its Arrow type maps to and the target column's type (or null): the
+// target's where the writer encodes as it (numeric, jsonb, arrays) or the two
+// share an encoding (timestamps; raw bytes for text, json and bytea), and
+// otherwise the Arrow type's. Declaring a bound value as this type stores it
+// as COPY would rather than casting it on the server.
+static inline const PostgresType& CopyFieldEncodedType(const PostgresType& type,
+                                                       const PostgresType* target) {
+  if (target == nullptr) return type;
+  auto is_raw_bytes = [](PostgresTypeId id) {
+    switch (id) {
+      case PostgresTypeId::kText:
+      case PostgresTypeId::kVarchar:
+      case PostgresTypeId::kBpchar:
+      case PostgresTypeId::kJson:
+      case PostgresTypeId::kBytea:
+        return true;
+      default:
+        return false;
+    }
+  };
+  auto is_timestamp = [](PostgresTypeId id) {
+    return id == PostgresTypeId::kTimestamp || id == PostgresTypeId::kTimestamptz;
+  };
+
+  bool use_target;
+  switch (target->type_id()) {
+    case PostgresTypeId::kNumeric:
+      use_target = true;
+      break;
+    case PostgresTypeId::kArray:
+      use_target = type.type_id() == PostgresTypeId::kArray;
+      break;
+    case PostgresTypeId::kJsonb:
+      use_target = type.type_id() == PostgresTypeId::kJson;
+      break;
+    default:
+      use_target = (is_timestamp(target->type_id()) && is_timestamp(type.type_id())) ||
+                   (is_raw_bytes(target->type_id()) && is_raw_bytes(type.type_id()));
+      break;
+  }
+  return use_target ? *target : type;
+}
+
 static inline ArrowErrorCode MakeCopyFieldWriter(
     struct ArrowSchema* schema, struct ArrowArrayView* array_view,
     const PostgresTypeResolver& type_resolver, const PostgresType* target_type,

@@ -539,10 +539,14 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(
                     PostgresType::FromSchema(*type_resolver_, source_schema.children[i],
                                              &pg_type, &na_error),
                     &na_error, error);
-    std::string type_name;
-    RAISE_STATUS(error, ColumnTypeName(pg_type, *source_schema.children[i],
-                                       source_fields[i], &type_name));
-    create += " " + type_name;
+    // Appending creates nothing, so the column type to create doesn't matter
+    // (and a decimal too wide to create may still fit the existing column).
+    if (ingest_.mode != IngestMode::kAppend) {
+      std::string type_name;
+      RAISE_STATUS(error, ColumnTypeName(pg_type, *source_schema.children[i],
+                                         source_fields[i], &type_name));
+      create += " " + type_name;
+    }
   }
 
   if (ingest_.mode == IngestMode::kAppend) {

@@ -2288,16 +2288,19 @@ TEST_F(PostgresStatementTest, SqlIngestJsonInvalid) {
 }
 
 // Ingest sends rows as multi-row INSERTs: full batches share a prepared
-// statement, a batch is cut early once its values pass a byte limit, and the
-// last batch is partial. Exercise all three and check every row arrives.
+// statement, a batch is cut early once its values pass a byte limit (which
+// replaces the prepared statement, so the next full batch prepares it again),
+// and the last batch is partial. Exercise all of these and check every row
+// arrives.
 TEST_F(PostgresStatementTest, SqlIngestInsertBatching) {
   ASSERT_THAT(quirks()->DropTable(&connection, "bulk_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
-  // 1000 rows make a full batch; the 20 one-MiB values at rows 1500-1519
-  // pass the 16 MiB limit partway through the second.
-  constexpr int64_t kRows = 2500;
+  // 1000 rows make a full batch; the one-MiB values at rows 1500-1519 pass
+  // the byte limit partway through the second, so it ends near row 1515. Two
+  // full batches follow, then a partial one.
+  constexpr int64_t kRows = 3600;
   const std::string big(1 << 20, 'x');
   std::vector<std::optional<std::string>> values;
   int64_t expected_bytes = 0;
@@ -2347,6 +2350,31 @@ TEST_F(PostgresStatementTest, SqlIngestInsertBatching) {
             kRows - (kRows + 6) / 7);
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[2], 0),
             expected_bytes);
+}
+
+// A row too large for one message fails with a clear error before it's sent.
+TEST_F(PostgresStatementTest, SqlIngestRowTooLarge) {
+  ASSERT_THAT(quirks()->DropTable(&connection, "bulk_ingest", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ASSERT_THAT(adbc_validation::MakeSchema(&schema.value, {{"s", NANOARROW_TYPE_STRING}}),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT((adbc_validation::MakeBatch<std::string>(
+                  &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr),
+                  {std::string(16 << 20, 'x')})),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementSetOption(&statement, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                     "bulk_ingest", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+  ASSERT_THAT(error.message, ::testing::HasSubstr("fit in one message"));
 }
 
 // A list of decimals keeps its precision and scale, as a decimal does, rather
