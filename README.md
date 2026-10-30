@@ -83,6 +83,11 @@ and `workspace` attaches every database in the account. The driver adds
 the URI or `PGOPTIONS`. If those already set `attach_mode`, they win.
 Single mode needs a named database; to connect to `md:`, set `workspace`.
 
+libpq connection service files (`~/.pg_service.conf`, `service=`, or
+`PGSERVICE`) aren't supported: the driver always passes `options`, which
+replaces any `options` a service file sets. Put connection settings in the
+URI instead.
+
 ## Inherited tests
 
 The complete upstream C++ test suites are compiled in test builds. The
