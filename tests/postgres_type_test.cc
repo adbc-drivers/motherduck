@@ -593,4 +593,28 @@ TEST(PostgresTypeTest, PostgresTypeResolveInt2vector) {
   EXPECT_EQ(0, type.n_children());
 }
 
+TEST(PostgresTypeTest, MotherDuckTypes) {
+  PostgresTypeResolver resolver;
+  ASSERT_TRUE(InternalAdbcInitializeTypeResolver(resolver).ok());
+
+  // The standard OIDs still win the reverse lookups
+  EXPECT_EQ(resolver.GetOID(PostgresTypeId::kText), 25);
+
+  PostgresType type;
+  ASSERT_EQ(resolver.Find(17001, &type, nullptr), NANOARROW_OK);
+  EXPECT_EQ(type.type_id(), PostgresTypeId::kText);
+  EXPECT_EQ(type.typname(), "duckdb_struct");
+
+  ASSERT_EQ(resolver.Find(17002, &type, nullptr), NANOARROW_OK);
+  EXPECT_EQ(type.type_id(), PostgresTypeId::kArray);
+  EXPECT_EQ(type.typname(), "_duckdb_struct");
+  ASSERT_EQ(type.n_children(), 1);
+  EXPECT_EQ(type.child(0).oid(), 17001);
+
+  for (uint32_t oid = 17000; oid <= 17018; oid++) {
+    SCOPED_TRACE("oid = " + std::to_string(oid));
+    EXPECT_EQ(resolver.Find(oid, &type, nullptr), NANOARROW_OK);
+  }
+}
+
 }  // namespace adbcpq

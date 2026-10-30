@@ -397,8 +397,42 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
 // which MotherDuck only partially populates.
 TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
   adbc_validation::Handle<struct AdbcDatabase> database;
+  adbc_validation::Handle<struct AdbcConnection> connection;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+              IsOkStatus(&error));
+}
+
+TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  // A password in the URI takes precedence over PGPASSWORD.
+  std::string bad_uri = uri;
+  bad_uri += std::strchr(uri, '?') ? "&password=invalid" : "?password=invalid";
+
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error),
+              IsStatus(ADBC_STATUS_IO, &error));
+}
+
+TEST_F(PostgresDatabaseTest, TypeResolverModeOptionIgnored) {
+  const char* key = "adbc.postgresql.type_resolver_mode";
+
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
+  ::testing::internal::CaptureStderr();
+  AdbcStatusCode status = AdbcDatabaseSetOption(&database.value, key, "server", &error);
+  std::string warning = ::testing::internal::GetCapturedStderr();
+  ASSERT_THAT(status, IsOkStatus(&error));
+  EXPECT_THAT(warning, ::testing::HasSubstr("ignoring database option " +
+                                            std::string(key) + "=server"));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
 }
 
@@ -1305,6 +1339,76 @@ class PostgresStatementTest : public ::testing::Test,
   PostgresQuirks quirks_;
 };
 ADBCV_TEST_STATEMENT(PostgresStatementTest)
+
+// Every column type MotherDuck reports should be in the built-in type table, so
+// none should come back as an unnamed opaque type.
+TEST_F(PostgresStatementTest, MotherDuckTypesResolve) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement,
+          "SELECT 1::INTEGER AS i, 1::UBIGINT AS ub, 1.5::DECIMAL(10, 2) AS d, "
+          "[1, 2] AS l, 'x' AS v, 'x'::BLOB AS b, true AS bo, 1.5::DOUBLE AS f, "
+          "DATE '2020-01-01' AS dt, TIMESTAMPTZ '2020-01-01 00:00:00+00' AS ts, "
+          "INTERVAL 1 DAY AS iv, gen_random_uuid() AS u, '{}'::JSON AS j, "
+          "{'a': 1} AS s, MAP {'a': 1} AS m, 'a'::ENUM('a', 'b') AS e, "
+          "[[1, 2]] AS nl, '2020-01-01 00:00:00.123456789'::TIMESTAMP_NS AS tns, "
+          "[{'a': 1}] AS ls",
+          &error),
+      IsOkStatus(&error));
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  for (int64_t i = 0; i < reader.schema->n_children; i++) {
+    const ArrowSchema* child = reader.schema->children[i];
+    SCOPED_TRACE(child->name);
+    // Unresolved OIDs are labelled unnamed<oid:N>
+    ArrowStringView typname = {nullptr, 0};
+    ASSERT_EQ(ArrowMetadataGetValue(child->metadata,
+                                    ArrowCharView("ADBC:postgresql:typname"), &typname),
+              NANOARROW_OK);
+    if (typname.data != nullptr) {
+      EXPECT_THAT(std::string(typname.data, static_cast<size_t>(typname.size_bytes)),
+                  ::testing::Not(::testing::StartsWith("unnamed")));
+    }
+  }
+
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->length, 1);
+
+  // DuckDB-only types come through as their DuckDB text rendering.
+  const std::vector<std::pair<std::string, std::string>> expected_text = {
+      {"s", "{'a': 1}"},
+      {"m", "{a=1}"},
+      {"e", "a"},
+      {"nl", "[[1, 2]]"},
+      {"tns", "2020-01-01 00:00:00.123456789"},
+  };
+  for (const auto& [name, expected] : expected_text) {
+    SCOPED_TRACE(name);
+    int64_t index = -1;
+    for (int64_t i = 0; i < reader.schema->n_children; i++) {
+      if (name == reader.schema->children[i]->name) index = i;
+    }
+    ASSERT_GE(index, 0);
+    ASSERT_STREQ(reader.schema->children[index]->format, "u");
+    ArrowStringView view =
+        ArrowArrayViewGetStringUnsafe(reader.array_view->children[index], 0);
+    EXPECT_EQ(std::string_view(view.data, static_cast<size_t>(view.size_bytes)),
+              expected);
+  }
+
+  const int64_t ls_index = reader.schema->n_children - 1;
+  ASSERT_STREQ(reader.schema->children[ls_index]->format, "+l");
+  ASSERT_STREQ(reader.schema->children[ls_index]->children[0]->format, "u");
+  const ArrowArrayView* ls_values = reader.array_view->children[ls_index]->children[0];
+  ArrowStringView ls_view = ArrowArrayViewGetStringUnsafe(ls_values, 0);
+  EXPECT_EQ(std::string_view(ls_view.data, static_cast<size_t>(ls_view.size_bytes)),
+            "{'a': 1}");
+}
 
 TEST_F(PostgresStatementTest, TransactionStatus) {
   using adbc_validation::ConnectionGetOption;

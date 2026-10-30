@@ -28,6 +28,7 @@
 #include "database.h"
 
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -77,19 +78,14 @@ AdbcStatusCode PostgresDatabase::GetOptionDouble(const char* option, double* val
 }
 
 AdbcStatusCode PostgresDatabase::Init(struct AdbcError* error) {
-  if (uri_.empty()) {
-    InternalAdbcSetError(
-        error, "%s",
-        "[libpq] Must set database option 'uri' before creating a connection");
-    return ADBC_STATUS_INVALID_STATE;
-  }
+  // Connect once so a bad URI or token fails here rather than at the first
+  // AdbcConnectionInit
+  PGconn* conn = nullptr;
+  RAISE_ADBC(Connect(&conn, error));
+  RAISE_ADBC(Disconnect(&conn, error));
 
-  auto resolver = std::make_shared<PostgresTypeResolver>();
-  Status status = InitializeTypeResolver(*resolver);
-  if (!status.ok()) return status.ToAdbc(error);
-
-  type_resolver_ = std::move(resolver);
-  return ADBC_STATUS_OK;
+  Status status = SharedTypeResolver(&type_resolver_);
+  return status.ToAdbc(error);
 }
 
 AdbcStatusCode PostgresDatabase::Release(struct AdbcError* error) {
@@ -114,6 +110,13 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
       InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
+  } else if (std::strcmp(key, "adbc.postgresql.type_resolver_mode") == 0) {
+    // Accepted so settings carried over from the PostgreSQL driver keep working,
+    // but MotherDuck always uses the built-in type table.
+    std::fprintf(stderr,
+                 "[motherduck] warning: ignoring database option %s=%s; the driver "
+                 "always uses its built-in type table\n",
+                 key, value);
   } else {
     InternalAdbcSetError(error, "%s%s", "[libpq] Unknown database option ", key);
     return ADBC_STATUS_NOT_IMPLEMENTED;

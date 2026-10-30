@@ -22,16 +22,20 @@
 
 #pragma once
 
+#include <memory>
+
 #include "driver/framework/status.h"
 #include "postgres_type.h"
 
 namespace adbcpq {
 
 // MotherDuck reports the standard PostgreSQL OIDs for the types it shares with
-// PostgreSQL, so the built-in table resolves them without querying pg_type (which
-// MotherDuck only partially populates). DuckDB-only types use OIDs outside the
-// table and come back as opaque binary.
+// PostgreSQL and fixed OIDs for DuckDB-only types, so a built-in table resolves
+// them without querying pg_type (which MotherDuck only partially populates).
 adbc::driver::Status InitializeTypeResolver(PostgresTypeResolver& resolver);
+
+// The built-in table, built once and shared. Callers must not modify it.
+adbc::driver::Status SharedTypeResolver(std::shared_ptr<PostgresTypeResolver>* out);
 
 }  // namespace adbcpq
 
