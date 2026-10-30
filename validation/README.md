@@ -22,41 +22,39 @@
   under the License.
 -->
 
-# PostgreSQL ADBC Driver Validation Suite
+# MotherDuck ADBC Driver Validation Suite
 
-This directory contains a Python-based validation suite for the PostgreSQL ADBC driver.
+This directory contains a Python-based validation suite for the MotherDuck ADBC
+driver. It runs against MotherDuck's Postgres endpoint; validating against
+PostgreSQL itself is not a goal of this repository.
 
 ## Testing
 
-A running instance of PostgreSQL is required.  For example, using Docker:
+You need a MotherDuck token whose account can create and drop databases, and a
+build of the driver in `build/`:
 
 ```shell
-$ docker run -it --rm \
-    -e POSTGRES_PASSWORD=password \
-    -e POSTGRES_DB=postgres \
-    -p 5432:5432 \
-    postgres
+$ pixi run adbc-make build DEBUG=true
+$ export MOTHERDUCK_TOKEN=...
 ```
 
-Alternatively use the `docker compose` provided by ADBC to manage the test
-database container.
+`ci/scripts/pre-test.sh` writes the connection settings to `.env.override`.
+Pass your platform and architecture; they only go into the database name.
+Setting `GITHUB_JOB=validate` keeps the name distinct from the C++ tests'.
 
 ```shell
-$ docker compose up postgres-test
-# When finished:
-# docker compose down postgres-test
+$ GITHUB_JOB=validate ./ci/scripts/pre-test.sh macos arm64
+$ set -a; source .env.override; set +a
 ```
 
-Then, to run the tests, set the environment variable specifying the
-PostgreSQL URI before running tests:
+Then run the suite from the repository root:
 
 ```shell
-$ export ADBC_POSTGRESQL_TEST_URI=postgresql://localhost:5432/postgres?user=postgres&password=password
+$ pixi run validate
 ```
 
-### 5. Run Tests
-
-```bash
-cd c/driver/postgresql/validation
-uv run pytest
-```
+The suite creates a fresh database before it starts and drops it when it
+finishes. To use an existing database instead, which the suite leaves in place,
+set `MOTHERDUCK_TEST_DATABASE` before running `pre-test.sh`.
+`MOTHERDUCK_PG_HOST` overrides the default endpoint,
+`pg.us-east-1-aws.motherduck.com`.
