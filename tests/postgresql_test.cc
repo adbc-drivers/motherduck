@@ -75,8 +75,8 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return SetupDatabase(database, uri, error);
   }
 
-  // Works around https://github.com/adbc-drivers/motherduck/issues/11 so other tests
-  // reach their own assertions; MotherDuckDefaultsSelect covers the default.
+  // Works around https://github.com/adbc-drivers/motherduck/issues/11;
+  // MotherDuckDefaultsSelect covers the default.
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database, const char* uri,
                                struct AdbcError* error) const {
     AdbcStatusCode status = AdbcDatabaseSetOption(database, "uri", uri, error);
@@ -393,8 +393,7 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 }
 
-// https://github.com/adbc-drivers/motherduck/issues/10: Init used to read pg_type,
-// which MotherDuck only partially populates.
+// https://github.com/adbc-drivers/motherduck/issues/10
 TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   adbc_validation::Handle<struct AdbcConnection> connection;
@@ -1340,10 +1339,7 @@ class PostgresStatementTest : public ::testing::Test,
 };
 ADBCV_TEST_STATEMENT(PostgresStatementTest)
 
-// Every column type MotherDuck reports should be in the built-in type table, so
-// none should come back as an unnamed opaque type. The query covers each type in
-// DuckDB's data type overview, plus the TIMESTAMP and TIME precision variants,
-// ENUM and fixed-size ARRAY.
+// Every documented DuckDB type should resolve to a known type, not unnamed<oid:N>
 TEST_F(PostgresStatementTest, MotherDuckTypesResolve) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
   ASSERT_THAT(
@@ -1391,7 +1387,7 @@ TEST_F(PostgresStatementTest, MotherDuckTypesResolve) {
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_EQ(reader.array->length, 1);
 
-  // DuckDB-only types come through as their DuckDB text rendering.
+  // DuckDB-only types arrive as text
   const std::vector<std::pair<std::string, std::string>> expected_text = {
       {"s", "{'a': 1}"},
       {"m", "{a=1}"},

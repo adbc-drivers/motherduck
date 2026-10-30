@@ -35,10 +35,8 @@ namespace adbcpq {
 
 namespace {
 
-// DuckDB-only types on MotherDuck's PostgreSQL endpoint. Each value arrives as
-// its DuckDB text rendering, even in binary results, and each array as a
-// standard binary array of those elements. The OIDs are fixed by the endpoint.
-// Element types come before their arrays, which Insert() requires.
+// DuckDB-only types, which MotherDuck sends as text under fixed OIDs. Elements
+// must precede their arrays.
 constexpr std::array<PostgresTypeResolver::Item, 19> kMotherDuckTypeItems = {{
     {17000, "duckdb_nested_list", "textrecv", 0, 0, 0},
     {17001, "duckdb_struct", "textrecv", 0, 0, 0},
@@ -65,8 +63,7 @@ constexpr std::array<PostgresTypeResolver::Item, 19> kMotherDuckTypeItems = {{
 
 Status InitializeTypeResolver(PostgresTypeResolver& resolver) {
   ArrowError na_error = {};
-  // The PostgreSQL types go first so that GetOID(kText) and GetOID(kArray) keep
-  // resolving to the standard OIDs.
+  // PostgreSQL types first, so GetOID() keeps returning the standard OIDs
   for (const auto& item : kBuiltinTypeItems) {
     UNWRAP_NANOARROW(na_error, Internal, resolver.Insert(item, &na_error));
   }
@@ -77,8 +74,6 @@ Status InitializeTypeResolver(PostgresTypeResolver& resolver) {
 }
 
 Status SharedTypeResolver(std::shared_ptr<PostgresTypeResolver>* out) {
-  // The table is fixed and never modified after it is built, so every database
-  // shares one copy.
   static const auto kShared =
       []() -> std::pair<std::shared_ptr<PostgresTypeResolver>, std::string> {
     auto resolver = std::make_shared<PostgresTypeResolver>();

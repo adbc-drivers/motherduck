@@ -29,12 +29,10 @@
 
 namespace adbcpq {
 
-// MotherDuck reports the standard PostgreSQL OIDs for the types it shares with
-// PostgreSQL and fixed OIDs for DuckDB-only types, so a built-in table resolves
-// them without querying pg_type (which MotherDuck only partially populates).
+// MotherDuck's type OIDs are fixed, so a built-in table replaces querying pg_type.
 adbc::driver::Status InitializeTypeResolver(PostgresTypeResolver& resolver);
 
-// The built-in table, built once and shared. Callers must not modify it.
+// The built-in table, built once and shared. Do not modify it.
 adbc::driver::Status SharedTypeResolver(std::shared_ptr<PostgresTypeResolver>* out);
 
 }  // namespace adbcpq

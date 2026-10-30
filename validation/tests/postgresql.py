@@ -29,8 +29,7 @@ from adbc_drivers_validation import model, quirks
 
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
-    # Work around https://github.com/adbc-drivers/motherduck/issues/11, as the C++
-    # tests do.
+    # Work around https://github.com/adbc-drivers/motherduck/issues/11
     "adbc.postgresql.use_copy": "false",
 }
 

@@ -78,8 +78,7 @@ AdbcStatusCode PostgresDatabase::GetOptionDouble(const char* option, double* val
 }
 
 AdbcStatusCode PostgresDatabase::Init(struct AdbcError* error) {
-  // Connect once so a bad URI or token fails here rather than at the first
-  // AdbcConnectionInit
+  // Fail fast on a bad URI or token
   PGconn* conn = nullptr;
   RAISE_ADBC(Connect(&conn, error));
   RAISE_ADBC(Disconnect(&conn, error));
@@ -111,8 +110,7 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
   } else if (std::strcmp(key, "adbc.postgresql.type_resolver_mode") == 0) {
-    // Accepted so settings carried over from the PostgreSQL driver keep working,
-    // but MotherDuck always uses the built-in type table.
+    // Accepted for compatibility with the PostgreSQL driver, but ignored
     std::fprintf(stderr,
                  "[motherduck] warning: ignoring database option %s=%s; the driver "
                  "always uses its built-in type table\n",
