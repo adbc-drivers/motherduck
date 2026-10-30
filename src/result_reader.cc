@@ -261,8 +261,13 @@ Status PqResultArrayReader::BindNextAndExecute(int64_t* affected_rows) {
     }
 
     PGresult* result;
-    UNWRAP_STATUS(bind_stream_->BindAndExecuteCurrentRow(
-        conn_, &result, /*result_format*/ kPgBinaryFormat));
+    Status status = bind_stream_->BindAndExecuteCurrentRow(
+        conn_, &result, /*result_format*/ kPgBinaryFormat);
+    if (!status.ok()) {
+      bind_stream_->Abort(conn_);
+      bind_stream_.reset();
+      return status;
+    }
     helper_.SetResult(result);
     if (affected_rows) {
       (*affected_rows) += helper_.AffectedRows();
@@ -294,13 +299,10 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
     UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
     UNWRAP_STATUS(helper_.Prepare(bind_stream_->param_types));
 
-    // Reset affected rows to zero before binding and executing any
-    if (affected_rows) {
-      (*affected_rows) = 0;
-    }
-
     // Send every row through one pipeline instead of waiting on each in turn.
     // The rows share one sync, so they run in one implicit transaction.
+    int64_t total_rows = 0;
+    bool rows_unknown = false;  // some row's command reported no count
     Status status;
     Status pipeline_status = RunPipeline(
         conn_,
@@ -314,8 +316,11 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
           const ExecStatusType result_status = PQresultStatus(result);
           if (result_status == PGRES_COMMAND_OK || result_status == PGRES_TUPLES_OK) {
             helper_.SetResult(result);
-            if (affected_rows) {
-              (*affected_rows) += helper_.AffectedRows();
+            const int64_t rows = helper_.AffectedRows();
+            if (rows < 0) {
+              rows_unknown = true;
+            } else {
+              total_rows += rows;
             }
           } else if (result_status != PGRES_PIPELINE_ABORTED && status.ok()) {
             status =
@@ -326,10 +331,18 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
             PQclear(result);
           }
         });
-    // A row's own error explains more than the pipeline failing after it.
-    UNWRAP_STATUS(status);
-    UNWRAP_STATUS(pipeline_status);
 
+    // A row's own error explains more than the pipeline failing after it.
+    if (!status.ok() || !pipeline_status.ok()) {
+      bind_stream_->Abort(conn_);
+      bind_stream_.reset();
+      if (!status.ok()) return status;
+      return pipeline_status;
+    }
+
+    if (affected_rows) {
+      *affected_rows = rows_unknown ? -1 : total_rows;
+    }
     UNWRAP_STATUS(bind_stream_->Cleanup(conn_));
     bind_stream_.reset();
   } else {

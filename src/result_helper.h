@@ -225,12 +225,8 @@ class PqResultHelper {
   Format output_format_ = Format::kText;
 
   Status PrepareInternal(int n_params, const Oid* param_oids) const;
-  // Send every statement before reading results.
-  Status ExecuteBatch(const std::vector<std::string>& statements);
-  // Read each statement's results before sending the next, so a COPY can be
-  // ended and the connection recovered.
-  Status ExecuteSequentially(const std::vector<std::string>& statements);
-  Status CollectPipelineResults(const std::string& statement, bool* ended_copy_in);
+  // Run statements in one pipeline, with at most max_in_flight unanswered.
+  Status ExecuteBatch(const std::vector<std::string>& statements, size_t max_in_flight);
   // Keep a statement's result if it's the last so far or the first error.
   void KeepPipelineResult(PGresult* result, const std::string& statement, Status* status);
 };
@@ -250,11 +246,19 @@ bool IsCopyStatement(std::string_view statement);
 // reading at the same time so neither side waits on the other. send_next
 // queues the next command (e.g. with PQsendQueryParams) and sets *sent, or
 // leaves it false once there are none left. on_result takes ownership of each
-// result other than the sync, along with the index of its command. Sending
-// stops after a command fails, since the server skips the rest anyway.
-// Commands' own errors only reach on_result; the returned status covers
-// failures to send, receive, or run the pipeline. COPY isn't supported.
+// result other than the sync, along with the index of its command. At most
+// max_in_flight commands go unanswered at a time.
+//
+// As with a multi-statement query, the commands share one implicit
+// transaction: after a command fails the server skips the rest, so sending
+// stops; if send_next fails, a failing command is sent so the commands
+// already run aren't committed either. Commands' own errors only reach
+// on_result; the returned status covers send_next's errors and failures to
+// send, receive, or run the pipeline. A COPY is ended and reported as not
+// supported; a caller that may run one passes max_in_flight = 1, since ending
+// it lets the server run whatever is queued behind it.
 Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_next,
-                   const std::function<void(size_t, PGresult*)>& on_result);
+                   const std::function<void(size_t, PGresult*)>& on_result,
+                   size_t max_in_flight = SIZE_MAX);
 
 }  // namespace adbcpq

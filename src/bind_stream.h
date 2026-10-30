@@ -326,6 +326,17 @@ struct BindStream {
     return Status::Ok();
   }
 
+  // Undo SetDatabaseTimezoneUTC after a failure. Under autocommit, rolling
+  // back the transaction it began also restores the time zone. Otherwise the
+  // user's transaction has failed, and rolling it back restores it.
+  void Abort(PGconn* pg_conn) {
+    if (has_tz_field && autocommit) {
+      PqResultHelper rollback(pg_conn, "ROLLBACK");
+      // The failure that got us here is the error worth reporting.
+      (void)rollback.Execute();
+    }
+  }
+
   Status Cleanup(PGconn* pg_conn) {
     if (has_tz_field) {
       PqResultHelper reset(pg_conn, "SET TIME ZONE '" + tz_setting + "'");
