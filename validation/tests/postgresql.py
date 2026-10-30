@@ -64,8 +64,7 @@ class PostgreSQLQuirks(model.DriverQuirks):
         statement_prepare=True,
         statement_rows_affected=True,
         statement_rows_affected_ddl=False,
-        # The database ci/scripts/pre-test.sh picks, else the account's default
-        # database for md: connections.
+        # The database ci/scripts/pre-test.sh picks.
         current_catalog=os.environ.get("MOTHERDUCK_TEST_CATALOG", "my_db"),
         current_schema="main",
         secondary_schema="secondary",

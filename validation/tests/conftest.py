@@ -76,7 +76,12 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
         with (
             adbc_driver_manager.dbapi.connect(
                 driver=driver_path,
-                db_kwargs={**db_kwargs, "uri": setup_uri},
+                # Single attach mode can't connect to md:.
+                db_kwargs={
+                    **db_kwargs,
+                    "uri": setup_uri,
+                    "adbc.motherduck.attach_mode": "workspace",
+                },
                 autocommit=True,
             ) as c,
             c.cursor() as cursor,
