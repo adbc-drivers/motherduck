@@ -1030,11 +1030,9 @@ class PostgresCopyTimestampFieldWriter : public PostgresCopyFieldWriter {
   }
 };
 
-// The type MakeCopyFieldWriter's output is encoded as: the target's when the
-// writer encodes as it or the two share an encoding, else the source's.
-static inline const PostgresType& CopyFieldEncodedType(const PostgresType& type,
-                                                       const PostgresType* target) {
-  if (target == nullptr) return type;
+// Whether COPY encodes values of the two types the same way, so a value
+// written as one can be declared as the other.
+static inline bool SharesCopyEncoding(const PostgresType& a, const PostgresType& b) {
   auto is_raw_bytes = [](PostgresTypeId id) {
     switch (id) {
       case PostgresTypeId::kText:
@@ -1050,31 +1048,25 @@ static inline const PostgresType& CopyFieldEncodedType(const PostgresType& type,
   auto is_timestamp = [](PostgresTypeId id) {
     return id == PostgresTypeId::kTimestamp || id == PostgresTypeId::kTimestamptz;
   };
+  return (is_timestamp(a.type_id()) && is_timestamp(b.type_id())) ||
+         (is_raw_bytes(a.type_id()) && is_raw_bytes(b.type_id()));
+}
 
-  bool use_target;
-  switch (target->type_id()) {
-    case PostgresTypeId::kNumeric:
-      use_target = true;
-      break;
-    case PostgresTypeId::kArray:
-      use_target = type.type_id() == PostgresTypeId::kArray;
-      break;
-    case PostgresTypeId::kJsonb:
-      use_target = type.type_id() == PostgresTypeId::kJson;
-      break;
-    default:
-      use_target = (is_timestamp(target->type_id()) && is_timestamp(type.type_id())) ||
-                   (is_raw_bytes(target->type_id()) && is_raw_bytes(type.type_id()));
-      break;
-  }
-  return use_target ? *target : type;
+// The target column for field i of target_types, or null.
+static inline const PostgresType* CopyTargetType(const PostgresType* target_types,
+                                                 int64_t i) {
+  if (target_types == nullptr || i >= target_types->n_children()) return nullptr;
+  return &target_types->child(i);
 }
 
 static inline ArrowErrorCode MakeCopyFieldWriter(
     struct ArrowSchema* schema, struct ArrowArrayView* array_view,
     const PostgresTypeResolver& type_resolver, const PostgresType* target_type,
     std::unique_ptr<PostgresCopyFieldWriter>* out, bool disable_decimal_fast_path,
-    ArrowError* error) {
+    ArrowError* error, bool* encodes_target = nullptr) {
+  // Set when the writer encodes values as target_type rather than as the
+  // type the Arrow type maps to.
+  if (encodes_target != nullptr) *encodes_target = false;
   struct ArrowSchemaView schema_view;
   NANOARROW_RETURN_NOT_OK(ArrowSchemaViewInit(&schema_view, schema, error));
 
@@ -1090,6 +1082,7 @@ static inline ArrowErrorCode MakeCopyFieldWriter(
       case NANOARROW_TYPE_STRING_VIEW: {
         using T = PostgresCopyJsonbFieldWriter;
         *out = T::Create<T>(array_view);
+        if (encodes_target != nullptr) *encodes_target = true;
         return NANOARROW_OK;
       }
       default:
@@ -1098,6 +1091,7 @@ static inline ArrowErrorCode MakeCopyFieldWriter(
   }
 
   if (target_type != nullptr && target_type->type_id() == PostgresTypeId::kNumeric) {
+    if (encodes_target != nullptr) *encodes_target = true;
     switch (schema_view.type) {
       case NANOARROW_TYPE_INT8:
       case NANOARROW_TYPE_INT16:
@@ -1312,6 +1306,7 @@ static inline ArrowErrorCode MakeCopyFieldWriter(
           target_type->n_children() == 1) {
         target_child_type = &target_type->child(0);
         child_type = *target_child_type;
+        if (encodes_target != nullptr) *encodes_target = true;
       } else {
         NANOARROW_RETURN_NOT_OK(PostgresType::FromSchema(
             type_resolver, schema->children[0], &child_type, error));
@@ -1386,13 +1381,10 @@ class PostgresCopyStreamWriter {
 
     for (int64_t i = 0; i < schema_->n_children; i++) {
       std::unique_ptr<PostgresCopyFieldWriter> child_writer;
-      const PostgresType* target_type = nullptr;
-      if (target_types != nullptr && i < target_types->n_children()) {
-        target_type = &target_types->child(i);
-      }
-      NANOARROW_RETURN_NOT_OK(MakeCopyFieldWriter(
-          schema_->children[i], array_view_->children[i], type_resolver, target_type,
-          &child_writer, disable_decimal_fast_path, error));
+      NANOARROW_RETURN_NOT_OK(
+          MakeCopyFieldWriter(schema_->children[i], array_view_->children[i],
+                              type_resolver, CopyTargetType(target_types, i),
+                              &child_writer, disable_decimal_fast_path, error));
       root_writer_->AppendChild(std::move(child_writer));
     }
 

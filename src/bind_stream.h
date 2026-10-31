@@ -385,26 +385,28 @@ struct BindStream {
     std::vector<Oid> row_types(n_cols);
     bind_field_writers.resize(n_cols);
     for (int64_t i = 0; i < n_cols; i++) {
-      const PostgresType* target_type = nullptr;
-      if (target_types != nullptr && i < target_types->n_children()) {
-        target_type = &target_types->child(i);
-      }
+      const PostgresType* target_type = CopyTargetType(target_types, i);
+      bool encodes_target;
       UNWRAP_NANOARROW(
           na_error, Internal,
           MakeCopyFieldWriter(bind_schema->children[i], array_view->children[i],
                               type_resolver, target_type, &bind_field_writers[i],
-                              disable_decimal_fast_path, &na_error));
+                              disable_decimal_fast_path, &na_error, &encodes_target));
 
       PostgresType type;
       UNWRAP_NANOARROW(na_error, Internal,
                        PostgresType::FromSchema(type_resolver, bind_schema->children[i],
                                                 &type, &na_error));
-      row_types[i] = CopyFieldEncodedType(type, target_type).oid();
+      const bool use_target = target_type != nullptr &&
+                              (encodes_target || SharesCopyEncoding(type, *target_type));
+      row_types[i] = use_target ? target_type->oid() : type.oid();
     }
 
     // MotherDuck rejects messages over 16 MiB; leave room for the rest of Bind.
     constexpr int64_t kMaxInsertBytes = 15 * 1024 * 1024;
     constexpr int64_t kMaxRowsPerInsert = 1000;
+    // Bounds how many batches libpq buffers while the server catches up.
+    constexpr size_t kMaxInsertsInFlight = 4;
     const int64_t rows_per_insert = (std::min)(kMaxRowsPerInsert, kMaxParams / n_cols);
 
     const std::string insert_prefix =
@@ -524,7 +526,8 @@ struct BindStream {
                                 PQresStatus(result_status), PQresultErrorMessage(result));
           }
           PQclear(result);
-        });
+        },
+        kMaxInsertsInFlight);
 
     // Prefer the statement's own error over the pipeline's.
     UNWRAP_STATUS(status);

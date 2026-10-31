@@ -1926,6 +1926,68 @@ TEST_F(PostgresCopyTest, PostgresCopyWriteNullDictionaryListElements) {
   }
 }
 
+// MakeCopyFieldWriter reports when it encodes values as the target column's
+// type, which ingest then declares its parameters as.
+TEST_F(PostgresCopyTest, MakeCopyFieldWriterEncodesTarget) {
+  const PostgresTypeResolver& resolver = *type_resolver_;
+  auto find = [&](PostgresTypeId id) {
+    PostgresType type;
+    EXPECT_EQ(resolver.Find(resolver.GetOID(id), &type, nullptr), NANOARROW_OK);
+    return type;
+  };
+  PostgresType numeric_array;
+  ASSERT_EQ(resolver.FindArray(resolver.GetOID(PostgresTypeId::kNumeric), &numeric_array,
+                               nullptr),
+            NANOARROW_OK);
+
+  auto encodes_target = [&](struct ArrowSchema* field, const PostgresType& target) {
+    nanoarrow::UniqueArrayView array_view;
+    EXPECT_EQ(ArrowArrayViewInitFromSchema(array_view.get(), field, nullptr),
+              NANOARROW_OK);
+    std::unique_ptr<PostgresCopyFieldWriter> writer;
+    bool encodes = false;
+    EXPECT_EQ(MakeCopyFieldWriter(field, array_view.get(), resolver, &target, &writer,
+                                  /*disable_decimal_fast_path=*/false, nullptr, &encodes),
+              NANOARROW_OK);
+    return encodes;
+  };
+
+  nanoarrow::UniqueSchema int64;
+  ASSERT_EQ(ArrowSchemaInitFromType(int64.get(), NANOARROW_TYPE_INT64), NANOARROW_OK);
+  EXPECT_TRUE(encodes_target(int64.get(), find(PostgresTypeId::kNumeric)));
+  EXPECT_FALSE(encodes_target(int64.get(), find(PostgresTypeId::kInt4)));
+
+  nanoarrow::UniqueSchema list;
+  ASSERT_EQ(ArrowSchemaInitFromType(list.get(), NANOARROW_TYPE_LIST), NANOARROW_OK);
+  ASSERT_EQ(ArrowSchemaSetType(list->children[0], NANOARROW_TYPE_INT64), NANOARROW_OK);
+  EXPECT_TRUE(encodes_target(list.get(), numeric_array));
+
+  nanoarrow::UniqueSchema string;
+  ASSERT_EQ(ArrowSchemaInitFromType(string.get(), NANOARROW_TYPE_STRING), NANOARROW_OK);
+  EXPECT_FALSE(encodes_target(string.get(), find(PostgresTypeId::kJsonb)));
+}
+
+TEST_F(PostgresCopyTest, SharesCopyEncoding) {
+  const PostgresTypeResolver& resolver = *type_resolver_;
+  auto find = [&](PostgresTypeId id) {
+    PostgresType type;
+    EXPECT_EQ(resolver.Find(resolver.GetOID(id), &type, nullptr), NANOARROW_OK);
+    return type;
+  };
+  EXPECT_TRUE(SharesCopyEncoding(find(PostgresTypeId::kTimestamptz),
+                                 find(PostgresTypeId::kTimestamp)));
+  EXPECT_TRUE(
+      SharesCopyEncoding(find(PostgresTypeId::kText), find(PostgresTypeId::kBytea)));
+  EXPECT_TRUE(
+      SharesCopyEncoding(find(PostgresTypeId::kJson), find(PostgresTypeId::kVarchar)));
+  EXPECT_FALSE(
+      SharesCopyEncoding(find(PostgresTypeId::kInt8), find(PostgresTypeId::kInt4)));
+  EXPECT_FALSE(
+      SharesCopyEncoding(find(PostgresTypeId::kText), find(PostgresTypeId::kJsonb)));
+  EXPECT_FALSE(
+      SharesCopyEncoding(find(PostgresTypeId::kDate), find(PostgresTypeId::kTimestamp)));
+}
+
 TEST_F(PostgresCopyTest, PostgresCopyWriteMultiBatch) {
   // Regression test for https://github.com/apache/arrow-adbc/issues/1310
   adbc_validation::Handle<struct ArrowSchema> schema;

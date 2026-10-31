@@ -309,8 +309,8 @@ int64_t PqResultHelper::AffectedRows() const {
 namespace {
 
 // How many commands to queue before asking the server for results and
-// checking what has come back, which bounds how long a failed command goes
-// unnoticed. A group also ends early once the socket stops taking data.
+// checking what has come back. libpq writes its buffer out in 8 KB chunks as
+// it fills, so this mostly bounds how long a failed command goes unnoticed.
 constexpr size_t kCommandsPerFlush = 64;
 
 // The longest to wait on the socket before checking libpq again. With SSL,
@@ -472,8 +472,6 @@ Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_n
         }
         sent_count++;
         group++;
-        // Don't buffer a whole group of large commands in libpq.
-        if (PQflush(conn) != 0) break;
       }
       if (!sending) {
         if (!sync()) break;

@@ -2422,6 +2422,53 @@ TEST_F(PostgresStatementTest, SqlIngestListOfDecimalColumnType) {
       reader.array_view->children[0], {"DECIMAL(38,8)[]"}));
 }
 
+// Ingested timestamptz values don't depend on the session's time zone.
+TEST_F(PostgresStatementTest, SqlIngestTimestampTzNonUtcSession) {
+  ASSERT_THAT(quirks()->DropTable(&connection, "bulk_ingest", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(&statement, "SET TimeZone = 'America/New_York'", &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ArrowSchemaInit(&schema.value);
+  ASSERT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(schema->children[0], "ts"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIMESTAMP,
+                                         NANOARROW_TIME_UNIT_MICRO, "UTC"),
+              adbc_validation::IsOkErrno());
+  constexpr int64_t kMicros = 1700000000000000;
+  ASSERT_THAT((adbc_validation::MakeBatch<int64_t>(
+                  &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr),
+                  {kMicros})),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementSetOption(&statement, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                     "bulk_ingest", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT epoch_us(ts) FROM bulk_ingest",
+                                       &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                        &reader.rows_affected, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NO_FATAL_FAILURE(
+      adbc_validation::CompareArray<int64_t>(reader.array_view->children[0], {kMicros}));
+}
+
 TEST_F(PostgresStatementTest, SqlIngestJsonb) {
   GTEST_SKIP() << "JSONB is PostgreSQL-only";
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));

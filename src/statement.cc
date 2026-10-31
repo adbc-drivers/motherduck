@@ -511,6 +511,9 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(
   create += " (";
   std::vector<std::string> source_field_names;
   source_field_names.reserve(source_schema.n_children);
+  // Create-append can't create a column of this type, but needs to only if
+  // the table doesn't exist yet.
+  Status uncreatable;
 
   for (int64_t i = 0; i < source_schema.n_children; i++) {
     if (i > 0) {
@@ -539,10 +542,27 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(
     // Append creates no table; a too-wide decimal may still fit the column.
     if (ingest_.mode != IngestMode::kAppend) {
       std::string type_name;
-      RAISE_STATUS(error, ColumnTypeName(pg_type, *source_schema.children[i],
-                                         source_fields[i], &type_name));
-      create += " " + type_name;
+      Status type_status = ColumnTypeName(pg_type, *source_schema.children[i],
+                                          source_fields[i], &type_name);
+      if (type_status.ok()) {
+        create += " " + type_name;
+      } else if (ingest_.mode == IngestMode::kCreateAppend) {
+        if (uncreatable.ok()) uncreatable = std::move(type_status);
+      } else {
+        RAISE_STATUS(error, type_status);
+      }
     }
+  }
+
+  if (!uncreatable.ok()) {
+    // Append to the table if it exists; otherwise report why it can't be made.
+    if (ResolveCopyTargetTypes(*escaped_table, source_field_names, copy_target_types,
+                               error) == ADBC_STATUS_OK) {
+      *has_copy_target_types = true;
+      return ADBC_STATUS_OK;
+    }
+    if (error != nullptr && error->release != nullptr) error->release(error);
+    RAISE_STATUS(error, uncreatable);
   }
 
   if (ingest_.mode == IngestMode::kAppend) {
