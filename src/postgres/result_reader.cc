@@ -88,13 +88,13 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
 
   // The schema and field readers were built from the first result. A later
   // result with a different shape would index past them. This runs on every
-  // call so a retry after the error below can't reach the decode loop.
+  // call, and the result is kept, so retrying after the error fails again
+  // instead of decoding it or ending the stream early.
   const size_t num_columns = static_cast<size_t>(helper_.NumColumns());
   if (num_columns != field_readers_.size()) {
     status = Status::IO("[libpq] Result for a later bind row has ", num_columns,
                         " columns, but the first result had ", field_readers_.size());
     status.ToAdbc(&error_);
-    helper_.ClearResult();
     if (bind_stream_) {
       bind_stream_->Abort(conn_);
       bind_stream_.reset();
