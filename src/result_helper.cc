@@ -115,8 +115,7 @@ Status PqResultHelper::Execute(const std::vector<std::string>& params,
                            param_formats.data(), static_cast<int>(output_format_));
   }
 
-  ExecStatusType status = PQresultStatus(result_);
-  if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
+  if (!IsResultOk(result_)) {
     return MakeStatus(result_, "[libpq] Failed to execute query '{}': {}", query_.c_str(),
                       PQerrorMessage(conn_));
   }

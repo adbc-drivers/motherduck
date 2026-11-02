@@ -452,7 +452,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                       /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
                                       /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                                       /*resultFormat=*/1 /*(binary)*/);
-      if (PQresultStatus(result) != PGRES_COMMAND_OK) {
+      if (!IsResultOk(result)) {
         AdbcStatusCode code =
             MakeStatus(result, "[libpq] Failed to drop table: {}\nQuery was: {}",
                        PQerrorMessage(conn), drop)
@@ -515,7 +515,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                   /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
                                   /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                                   /*resultFormat=*/1 /*(binary)*/);
-  if (PQresultStatus(result) != PGRES_COMMAND_OK) {
+  if (!IsResultOk(result)) {
     AdbcStatusCode code =
         MakeStatus(result, "[libpq] Failed to create table: {}\nQuery was: {}",
                    PQerrorMessage(conn), create)
