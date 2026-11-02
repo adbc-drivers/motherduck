@@ -26,6 +26,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
@@ -77,6 +79,9 @@ class PostgresDatabase {
 
   // Internal implementation
 
+  /// \brief The libpq keywords and values Connect passes, in order.
+  AdbcStatusCode ConnectParams(std::vector<std::pair<std::string, std::string>>* params,
+                               struct AdbcError* error) const;
   AdbcStatusCode Connect(PGconn** conn, struct AdbcError* error);
   AdbcStatusCode Disconnect(PGconn** conn, struct AdbcError* error);
   const std::shared_ptr<PostgresTypeResolver>& type_resolver() const {

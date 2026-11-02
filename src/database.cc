@@ -27,6 +27,7 @@
 
 #include "database.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cinttypes>
@@ -91,21 +92,25 @@ bool SetsSessionOption(std::string_view options, std::string_view name) {
 bool IsLower(char c) { return c >= 'a' && c <= 'z'; }
 bool IsDigit(char c) { return c >= '0' && c <= '9'; }
 
-// Whether value is a region: lowercase letters and digits in dash-separated
-// parts, e.g. us-east-1.
+// Whether value is a region: two or more dash-separated parts of lowercase
+// letters and digits, with a digit somewhere, e.g. us-east-1.
 bool IsRegion(std::string_view value) {
   bool part_empty = true;
+  bool has_digit = false;
+  int parts = 1;
   for (char c : value) {
     if (c == '-') {
       if (part_empty) return false;
       part_empty = true;
+      parts++;
     } else if (IsLower(c) || IsDigit(c)) {
       part_empty = false;
+      has_digit = has_digit || IsDigit(c);
     } else {
       return false;
     }
   }
-  return !part_empty;
+  return !part_empty && parts >= 2 && has_digit;
 }
 
 // Whether value can go into libpq options as is: libpq splits options on
@@ -125,9 +130,7 @@ std::string RegionHost(std::string_view region) {
   // A last part of only letters names the cloud (us-east-1-aws); otherwise
   // it's AWS.
   std::string_view last = region.substr(region.rfind('-') + 1);
-  bool names_cloud = !last.empty();
-  for (char c : last) names_cloud = names_cloud && IsLower(c);
-  if (!names_cloud) host += "-aws";
+  if (last.empty() || !std::all_of(last.begin(), last.end(), IsLower)) host += "-aws";
   host += ".motherduck.com";
   return host;
 }
@@ -164,6 +167,9 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
     optional = &region_;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     optional = &username_;
+  } else if (std::strcmp(option, ADBC_OPTION_PASSWORD) == 0) {
+    InternalAdbcSetError(error, "[libpq] database option '%s' can't be read", option);
+    return ADBC_STATUS_NOT_FOUND;
   } else {
     InternalAdbcSetError(error, "[libpq] unknown database option '%s'", option);
     return ADBC_STATUS_NOT_FOUND;
@@ -291,7 +297,9 @@ AdbcStatusCode PostgresDatabase::SetOptionInt(const char* key, int64_t value,
   return ADBC_STATUS_NOT_IMPLEMENTED;
 }
 
-AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error) {
+AdbcStatusCode PostgresDatabase::ConnectParams(
+    std::vector<std::pair<std::string, std::string>>* params,
+    struct AdbcError* error) const {
   if (uri_.empty()) {
     InternalAdbcSetError(
         error, "%s",
@@ -309,77 +317,91 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
   }
 
   // Merge the MotherDuck settings into the session options from the URI (or
-  // PGOPTIONS), apply the region and username options, and fill in the token. The driver
-  // always passes a password, so libpq never falls back to PGPASSWORD or a password file.
-  std::vector<const char*> keywords;
-  std::vector<const char*> values;
-  const char* options = std::getenv("PGOPTIONS");
-  const char* password = nullptr;
+  // PGOPTIONS), apply the region option, and fill in the user and token. The driver
+  // always passes both, so libpq never falls back to PGUSER, PGPASSWORD, or a password
+  // file.
+  params->clear();
+  const char* env_options = std::getenv("PGOPTIONS");
+  std::string options = env_options ? env_options : "";
+  std::string password;
+  std::string user;
   bool uri_sets_host = false;
+  bool uri_sets_sslmode = false;
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
     if (option->val == nullptr) continue;
-    if ((std::strcmp(option->keyword, "host") == 0 ||
-         std::strcmp(option->keyword, "hostaddr") == 0) &&
-        *option->val != '\0') {
+    std::string_view keyword = option->keyword;
+    if ((keyword == "host" || keyword == "hostaddr") && *option->val != '\0') {
       uri_sets_host = true;
     }
-    if (std::strcmp(option->keyword, "options") == 0) {
+    if (keyword == "sslmode" && *option->val != '\0') uri_sets_sslmode = true;
+    if (keyword == "options") {
       options = option->val;
-      continue;
-    }
-    if (std::strcmp(option->keyword, "password") == 0) {
+    } else if (keyword == "password") {
       password = option->val;
-      continue;
+    } else if (keyword == "user") {
+      user = option->val;
+    } else {
+      params->emplace_back(option->keyword, option->val);
     }
-    if (std::strcmp(option->keyword, "user") == 0 && !username_.empty()) continue;
-    keywords.push_back(option->keyword);
-    values.push_back(option->val);
   }
-  std::string host;
+  PQconninfoFree(conninfo);
+
   if (!region_.empty()) {
     // libpq would still apply PGHOSTADDR, connecting to that address
     // instead of the region's host.
     const char* env_hostaddr = std::getenv("PGHOSTADDR");
     if (uri_sets_host || (env_hostaddr != nullptr && *env_hostaddr != '\0')) {
-      PQconninfoFree(conninfo);
       InternalAdbcSetError(error,
                            "[libpq] Set either database option '%s' or a host "
                            "(host or hostaddr in the URI, or PGHOSTADDR), not both",
                            ADBC_MOTHERDUCK_OPTION_REGION);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    host = RegionHost(region_);
-    keywords.push_back("host");
-    values.push_back(host.c_str());
+    params->emplace_back("host", RegionHost(region_));
+    // The driver chose the host, so don't let libpq's default sslmode=prefer
+    // fall back to sending the token in plaintext.
+    const char* env_sslmode = std::getenv("PGSSLMODE");
+    if (!uri_sets_sslmode && (env_sslmode == nullptr || *env_sslmode == '\0')) {
+      params->emplace_back("sslmode", "require");
+    }
   }
-  if (!password_.empty()) password = password_.c_str();
-  if (password == nullptr || *password == '\0')
-    password = std::getenv("MOTHERDUCK_TOKEN");
-  if (password == nullptr || *password == '\0') {
-    PQconninfoFree(conninfo);
+  if (!password_.empty()) password = password_;
+  if (password.empty()) {
+    const char* token = std::getenv("MOTHERDUCK_TOKEN");
+    if (token != nullptr) password = token;
+  }
+  if (password.empty()) {
     InternalAdbcSetError(error, "%s",
                          "[libpq] No MotherDuck token: set the 'password' database "
                          "option, a password in the URI, or MOTHERDUCK_TOKEN");
     return ADBC_STATUS_UNAUTHENTICATED;
   }
-  keywords.push_back("password");
-  values.push_back(password);
-  if (!username_.empty()) {
-    keywords.push_back("user");
-    values.push_back(username_.c_str());
-  }
-  std::string session_options =
-      AddSessionOption(options ? options : "", "attach_mode", attach_mode_);
+  params->emplace_back("password", std::move(password));
+  // MotherDuck's endpoint expects the user postgres.
+  if (!username_.empty()) user = username_;
+  if (user.empty()) user = "postgres";
+  params->emplace_back("user", std::move(user));
+  options = AddSessionOption(options, "attach_mode", attach_mode_);
   if (!session_name_.empty()) {
-    session_options = AddSessionOption(session_options, "session_name", session_name_);
+    options = AddSessionOption(options, "session_name", session_name_);
   }
-  keywords.push_back("options");
-  values.push_back(session_options.c_str());
+  params->emplace_back("options", std::move(options));
+  return ADBC_STATUS_OK;
+}
+
+AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error) {
+  std::vector<std::pair<std::string, std::string>> params;
+  RAISE_ADBC(ConnectParams(&params, error));
+  std::vector<const char*> keywords;
+  std::vector<const char*> values;
+  for (const auto& [keyword, value] : params) {
+    keywords.push_back(keyword.c_str());
+    values.push_back(value.c_str());
+  }
   keywords.push_back(nullptr);
   values.push_back(nullptr);
 
   *conn = PQconnectdbParams(keywords.data(), values.data(), /*expand_dbname=*/0);
-  PQconninfoFree(conninfo);
   if (PQstatus(*conn) != CONNECTION_OK) {
     InternalAdbcSetError(error, "%s%s",
                          "[libpq] Failed to connect: ", PQerrorMessage(*conn));

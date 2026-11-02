@@ -96,19 +96,25 @@ in order: the standard ADBC `password` database option, a password in the URI,
 and the `MOTHERDUCK_TOKEN` environment variable. It always passes the token to
 libpq, so `PGPASSWORD` and password files (`~/.pgpass`, `PGPASSFILE`) are never
 used. Without a token, connecting fails with `UNAUTHENTICATED`.
-The standard ADBC `username` database option, if set, replaces the URI's user.
+
+The user is `postgres`, which MotherDuck's endpoint expects, so the URI can
+leave it out. The standard ADBC `username` database option, then a user in the
+URI, replace it. `PGUSER` is never used.
 
 `adbc.motherduck.region` (database option) sets the host from a MotherDuck
 region, so the URI can leave it out: `us-east-1` connects to
 `pg.us-east-1-aws.motherduck.com`. Find your region with `md_user_info()`. A
-region is lowercase letters and digits in dash-separated parts. It's taken to be
-on AWS unless its last part, all letters, names the cloud (`us-east-1-aws`).
-Setting it together with a host or `hostaddr` in the URI, or with `PGHOSTADDR`,
-is an error; when it's set, `PGHOST` is ignored. For example, with `region` set
-to `us-east-1`:
+region is two or more dash-separated parts of lowercase letters and digits,
+including a digit. It's taken to be on AWS unless its last part, all letters,
+names the cloud (`us-east-1-aws`). Setting it together with a host or
+`hostaddr` in the URI, or with `PGHOSTADDR`, is an error; when it's set,
+`PGHOST` is ignored. Unless the URI or `PGSSLMODE` sets `sslmode`, the driver
+uses `sslmode=require`, which encrypts the connection but doesn't verify the
+server's certificate; set `sslmode=verify-full` to verify it. For example, with
+`region` set to `us-east-1`:
 
 ```text
-postgresql://postgres@/my_db?sslmode=verify-full&sslrootcert=system
+postgresql:///my_db?sslmode=verify-full&sslrootcert=system
 ```
 
 libpq connection service files (`~/.pg_service.conf`, `service=`, or

@@ -809,7 +809,8 @@ TEST(MotherDuckRegionTest, OptionInvalid) {
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   for (const char* value :
        {"US-EAST-1", "us east 1", "us-east-1.example.com", "us-east-1/x", "us_east_1",
-        "-", "--", "-us-east-1", "us-east-1-", "us--east-1",
+        "-", "--", "-us-east-1", "us-east-1-", "us--east-1", "aws", "useast", "useast1",
+        "us-east",
         "us-\xe9"
         "ast-1"}) {
     EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
@@ -885,7 +886,89 @@ TEST(MotherDuckPasswordTest, OptionNotReadable) {
       IsOkStatus(&error));
   EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_PASSWORD, &error),
               IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  EXPECT_THAT(error.message, ::testing::HasSubstr("can't be read"));
   if (error.release) error.release(&error);
+}
+
+// The libpq parameters Connect would pass, for a database with the given URI
+// and options. Needs no server.
+class MotherDuckConnectParamsTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ASSERT_THAT(database_.SetOption(ADBC_OPTION_PASSWORD, "token", &error_),
+                IsOkStatus(&error_));
+  }
+  void TearDown() override {
+    if (error_.release) error_.release(&error_);
+  }
+
+  void SetOption(const char* key, const char* value) {
+    ASSERT_THAT(database_.SetOption(key, value, &error_), IsOkStatus(&error_));
+  }
+
+  // Every value passed for keyword, in order.
+  std::vector<std::string> Values(const char* keyword) {
+    std::vector<std::pair<std::string, std::string>> params;
+    EXPECT_THAT(database_.ConnectParams(&params, &error_), IsOkStatus(&error_));
+    std::vector<std::string> values;
+    for (const auto& [key, value] : params) {
+      if (key == keyword) values.push_back(value);
+    }
+    return values;
+  }
+
+  ScopedEnv pgoptions_{"PGOPTIONS", nullptr};
+  ScopedEnv pgsslmode_{"PGSSLMODE", nullptr};
+  ScopedEnv pguser_{"PGUSER", "someone"};
+  adbcpq::PostgresDatabase database_;
+  struct AdbcError error_ = {};
+};
+
+TEST_F(MotherDuckConnectParamsTest, UserDefaultsToPostgres) {
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("user"), ::testing::ElementsAre("postgres"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, UriUser) {
+  SetOption("uri", "postgresql://alice@localhost/db");
+  EXPECT_THAT(Values("user"), ::testing::ElementsAre("alice"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, UsernameReplacesUriUser) {
+  SetOption("uri", "postgresql://alice@localhost/db");
+  SetOption(ADBC_OPTION_USERNAME, "bob");
+  EXPECT_THAT(Values("user"), ::testing::ElementsAre("bob"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, SessionOptions) {
+  SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy");
+  SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "adbc_session");
+  EXPECT_THAT(
+      Values("options"),
+      ::testing::ElementsAre("-c x=y --attach_mode=single --session_name=adbc_session"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, RegionRequiresTls) {
+  SetOption("uri", "postgresql:///db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, RegionKeepsSslmode) {
+  SetOption("uri", "postgresql:///db?sslmode=verify-full");
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+  {
+    ScopedEnv pgsslmode("PGSSLMODE", "verify-full");
+    SetOption("uri", "postgresql:///db");
+    EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+  }
+}
+
+TEST_F(MotherDuckConnectParamsTest, NoRegionLeavesSslmode) {
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
 }
 
 class PostgresConnectionTest : public ::testing::Test,
