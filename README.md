@@ -92,10 +92,10 @@ backslashes, which libpq treats specially in `options`. It's unset by default;
 an empty value unsets it.
 
 The MotherDuck token is the connection's password. The driver takes it from,
-in order: the standard ADBC `password` database option, a password in the URI,
-and the `MOTHERDUCK_TOKEN` environment variable. It always passes the token to
-libpq, so `PGPASSWORD` and password files (`~/.pgpass`, `PGPASSFILE`) are never
-used. Without a token, connecting fails with `UNAUTHENTICATED`.
+in order: the standard ADBC `password` database option (or its alias,
+`adbc.motherduck.token`), a password in the URI, and the `MOTHERDUCK_TOKEN`
+environment variable. It always passes the token to libpq, so `PGPASSWORD` and
+password files (`~/.pgpass`, `PGPASSFILE`) are never used. Without a token, connecting fails with `UNAUTHENTICATED`.
 
 The user is `postgres`, which MotherDuck's endpoint expects, so the URI can
 leave it out. The standard ADBC `username` database option, then a user in the

@@ -167,7 +167,8 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
     optional = &region_;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     optional = &username_;
-  } else if (std::strcmp(option, ADBC_OPTION_PASSWORD) == 0) {
+  } else if (std::strcmp(option, ADBC_OPTION_PASSWORD) == 0 ||
+             std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
     InternalAdbcSetError(error, "[libpq] database option '%s' can't be read", option);
     return ADBC_STATUS_NOT_FOUND;
   } else {
@@ -270,7 +271,8 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
     region_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
     username_ = value;
-  } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0) {
+  } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0 ||
+             std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
     password_ = value;
   } else {
     InternalAdbcSetError(error, "%s%s", "[libpq] Unknown database option ", key);
@@ -372,8 +374,9 @@ AdbcStatusCode PostgresDatabase::ConnectParams(
   }
   if (password.empty()) {
     InternalAdbcSetError(error, "%s",
-                         "[libpq] No MotherDuck token: set the 'password' database "
-                         "option, a password in the URI, or MOTHERDUCK_TOKEN");
+                         "[libpq] No MotherDuck token: set the 'password' (or "
+                         "'adbc.motherduck.token') database option, a password in "
+                         "the URI, or MOTHERDUCK_TOKEN");
     return ADBC_STATUS_UNAUTHENTICATED;
   }
   params->emplace_back("password", std::move(password));

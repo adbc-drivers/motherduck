@@ -924,6 +924,17 @@ class MotherDuckConnectParamsTest : public ::testing::Test {
   struct AdbcError error_ = {};
 };
 
+TEST_F(MotherDuckConnectParamsTest, TokenAlias) {
+  SetOption("uri", "postgresql://localhost/db?password=uri");
+  SetOption(ADBC_MOTHERDUCK_OPTION_TOKEN, "alias");
+  EXPECT_THAT(Values("password"), ::testing::ElementsAre("alias"));
+  // It's the same option, so the last one set wins.
+  SetOption(ADBC_OPTION_PASSWORD, "password");
+  EXPECT_THAT(Values("password"), ::testing::ElementsAre("password"));
+  EXPECT_THAT(database_.GetOption(ADBC_MOTHERDUCK_OPTION_TOKEN, nullptr, nullptr, &error_),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error_));
+}
+
 TEST_F(MotherDuckConnectParamsTest, UserDefaultsToPostgres) {
   SetOption("uri", "postgresql://localhost/db");
   EXPECT_THAT(Values("user"), ::testing::ElementsAre("postgres"));

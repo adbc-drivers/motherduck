@@ -39,6 +39,8 @@
 #define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
 #define ADBC_MOTHERDUCK_OPTION_SESSION_NAME "adbc.motherduck.session_name"
 #define ADBC_MOTHERDUCK_OPTION_REGION "adbc.motherduck.region"
+/// An alias for the standard ADBC password option, which holds the token.
+#define ADBC_MOTHERDUCK_OPTION_TOKEN "adbc.motherduck.token"
 
 namespace adbcpq {
 using adbc::driver::Status;
