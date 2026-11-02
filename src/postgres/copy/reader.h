@@ -510,6 +510,13 @@ class PostgresCopyJsonbFieldReader : public PostgresCopyFieldReader {
       return ArrowArrayAppendNull(array, 1);
     }
 
+    // A non-NULL value must at least contain the 1-byte version header
+    if (field_size_bytes < 1) {
+      ArrowErrorSet(error, "Expected JSONB field with at least 1 byte but found %d bytes",
+                    static_cast<int>(field_size_bytes));  // NOLINT(runtime/int)
+      return EINVAL;
+    }
+
     if (field_size_bytes > data->size_bytes) {
       ArrowErrorSet(error, "Expected %d bytes of field data but got %d bytes of input",
                     static_cast<int>(field_size_bytes),
@@ -522,7 +529,7 @@ class PostgresCopyJsonbFieldReader : public PostgresCopyFieldReader {
     if (version != 1) {
       ArrowErrorSet(error, "Expected JSONB binary version 0x01 but got %d",
                     static_cast<int>(version));
-      return NANOARROW_OK;
+      return EINVAL;
     }
 
     field_size_bytes -= 1;
