@@ -132,9 +132,9 @@ be configured separately.
 
 ## Code layout
 
-The upstream driver's sources in `src/` are kept as close to Apache's as
-possible, so upstream fixes merge cleanly. MotherDuck behavior lives in
-`src/motherduck_*` files, mostly as subclasses of the upstream classes:
+The upstream driver's sources in `src/postgres/` are kept as close to
+Apache's as possible, so upstream fixes merge cleanly. MotherDuck behavior
+lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
 
 - `motherduck_database`: `MotherduckDatabase`, which adds `attach_mode`,
   ignores `adbc.postgresql.type_resolver_mode`, uses the built-in type table
@@ -150,11 +150,12 @@ possible, so upstream fixes merge cleanly. MotherDuck behavior lives in
   queries.
 - `motherduck_type_resolver`: DuckDB-only type OIDs.
 - `motherduck_factory`: the subclasses `postgresql.cc` creates.
+- `motherduck.cc`: the `AdbcDriverMotherduckInit` entry point.
 
 The upstream files still differ from Apache's in these ways:
 
 - Every file starts with the modification notice described below, and
-  includes use paths relative to `src/`.
+  includes use paths relative to `src/postgres/`.
 - Hooks for the subclasses: `virtual` methods and `protected` members in
   `PostgresDatabase`, `PostgresConnection`, `PostgresStatement`, and
   `PqResultArrayReader`;
@@ -167,7 +168,7 @@ The upstream files still differ from Apache's in these ways:
   contribute upstream, as is the `SerializeCurrentRow()` split.
 
 When merging from upstream, keep these differences and put new MotherDuck
-behavior in the `motherduck_*` files. MotherDuck's own tests are in
+behavior in `src/motherduck/`. MotherDuck's own tests are in
 `tests/motherduck_*_test.cc`; upstream tests that don't apply are skipped
 through `MOTHERDUCK_SKIPPED_UPSTREAM_TESTS` in `tests/CMakeLists.txt`.
 
@@ -178,8 +179,9 @@ The fork was extracted from `apache/arrow-adbc` at
 for the driver and its bundled Apache dependencies. The original driver
 history begins with the libpq implementation on 2022-08-26. Historical paths
 `c/drivers/postgres/`, `c/driver/postgres/`, and `c/driver/postgresql/` are all
-included. Driver sources are now in `src/`, C++ tests in `tests/`, and shared
-Apache code in `third_party/arrow-adbc/`.
+included. The extraction puts driver sources in `src/` (since moved to
+`src/postgres/`), C++ tests in `tests/`, and shared Apache code in
+`third_party/arrow-adbc/`.
 
 To reproduce the extraction in a fresh, full-history clone of Apache Arrow ADBC
 checked out at that commit, use this repository's `ci/upstream-paths.txt`:
