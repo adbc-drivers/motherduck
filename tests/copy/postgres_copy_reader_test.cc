@@ -980,6 +980,57 @@ TEST(PostgresCopyUtilsTest, JsonbOverflow) {
   ASSERT_EQ(EOVERFLOW, reader.Read(&data, field_size_bytes, array.get(), nullptr));
 }
 
+// A row whose last fixed-width field claims more bytes than remain in the
+// buffer must fail instead of reading past the end of it. Each test points at
+// a valid fixture but cuts size_bytes short partway through the first row, so
+// the bytes past the cut are still owned by the test.
+
+// Fixture offset of the first field's data: header (19 bytes), field count
+// (2 bytes), field length (4 bytes)
+constexpr int64_t kFirstFieldDataOffset = 25;
+
+void ExpectTruncatedRecordFails(const PostgresType& col_type, const uint8_t* buffer,
+                                int64_t size_bytes) {
+  PostgresType input_type(PostgresTypeId::kRecord);
+  input_type.AppendChild("col", col_type);
+
+  PostgresCopyStreamReader reader;
+  ASSERT_EQ(reader.Init(input_type), NANOARROW_OK);
+  ASSERT_EQ(reader.InferOutputSchema("PostgreSQL Tester", nullptr), NANOARROW_OK);
+  ASSERT_EQ(reader.InitFieldReaders(nullptr), NANOARROW_OK);
+
+  ArrowBufferView data;
+  data.data.as_uint8 = buffer;
+  data.size_bytes = size_bytes;
+
+  ArrowError error;
+  ASSERT_EQ(reader.ReadHeader(&data, &error), NANOARROW_OK);
+  ASSERT_EQ(reader.ReadRecord(&data, &error), EINVAL);
+  ASSERT_NE(std::string(error.message).find("Expected at least"), std::string::npos)
+      << error.message;
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedBoolean) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kBool), kTestPgCopyBoolean,
+                             kFirstFieldDataOffset);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedBigInt) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt8), kTestPgCopyBigInt,
+                             kFirstFieldDataOffset + 3);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedInterval) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInterval), kTestPgCopyInterval,
+                             kFirstFieldDataOffset + 10);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedArrayElement) {
+  // The first array is 36 bytes; cut the last 2 bytes of its last element
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt4).Array(),
+                             kTestPgCopyIntegerArray, kFirstFieldDataOffset + 36 - 2);
+}
+
 // N.B. unfortunately testing with NUMERIC is difficult since we can't add all
 // that much to the buffer on each iteration, so the unit test takes too long
 

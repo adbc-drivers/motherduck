@@ -89,6 +89,20 @@ ArrowErrorCode ReadChecked(ArrowBufferView* data, T* out, ArrowError* error) {
   return NANOARROW_OK;
 }
 
+// Check that data has at least field_size_bytes remaining before a fixed-width
+// field is read from it with ReadUnsafe()
+inline ArrowErrorCode CheckFieldAvailable(const ArrowBufferView* data,
+                                          int32_t field_size_bytes, ArrowError* error) {
+  if (data->size_bytes < static_cast<int64_t>(field_size_bytes)) {
+    ArrowErrorSet(error, "Expected at least %d bytes of field data but found %ld bytes",
+                  static_cast<int>(field_size_bytes),
+                  static_cast<long>(data->size_bytes));  // NOLINT(runtime/int)
+    return EINVAL;
+  }
+
+  return NANOARROW_OK;
+}
+
 class PostgresCopyFieldReader {
  public:
   PostgresCopyFieldReader() : validity_(nullptr), offsets_(nullptr), data_(nullptr) {
@@ -169,6 +183,8 @@ class PostgresCopyBooleanFieldReader : public PostgresCopyFieldReader {
       return EINVAL;
     }
 
+    NANOARROW_RETURN_NOT_OK(CheckFieldAvailable(data, field_size_bytes, error));
+
     int64_t bytes_required = _ArrowBytesForBits(array->length + 1);
     if (bytes_required > data_->size_bytes) {
       NANOARROW_RETURN_NOT_OK(
@@ -203,6 +219,8 @@ class PostgresCopyNetworkEndianFieldReader : public PostgresCopyFieldReader {
       return EINVAL;
     }
 
+    NANOARROW_RETURN_NOT_OK(CheckFieldAvailable(data, field_size_bytes, error));
+
     T value = kOffset + ReadUnsafe<T>(data);
     NANOARROW_RETURN_NOT_OK(ArrowBufferAppend(data_, &value, sizeof(T)));
     return AppendValid(array);
@@ -224,6 +242,8 @@ class PostgresCopyIntervalFieldReader : public PostgresCopyFieldReader {
                     static_cast<int>(field_size_bytes));  // NOLINT(runtime/int)
       return EINVAL;
     }
+
+    NANOARROW_RETURN_NOT_OK(CheckFieldAvailable(data, field_size_bytes, error));
 
     // postgres stores time as usec, arrow stores as ns
     const int64_t time_usec = ReadUnsafe<int64_t>(data);
