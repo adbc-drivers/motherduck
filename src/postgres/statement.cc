@@ -427,6 +427,12 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
       // shadowing this table
       char* escaped =
           PQescapeIdentifier(conn, current_schema.c_str(), current_schema.size());
+      if (escaped == nullptr) {
+        InternalAdbcSetError(
+            error, "[libpq] Failed to escape current schema %s for ingestion: %s",
+            current_schema.c_str(), PQerrorMessage(conn));
+        return ADBC_STATUS_INTERNAL;
+      }
       *escaped_table += escaped;
       *escaped_table += " . ";
       PQfreemem(escaped);

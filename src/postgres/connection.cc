@@ -1063,11 +1063,21 @@ AdbcStatusCode PostgresConnection::GetTableSchema(const char* catalog,
   AdbcStatusCode final_status = ADBC_STATUS_OK;
 
   char* quoted = PQescapeIdentifier(conn_, table_name, strlen(table_name));
+  if (quoted == nullptr) {
+    InternalAdbcSetError(error, "[libpq] Could not escape table name %s: %s", table_name,
+                         PQerrorMessage(conn_));
+    return ADBC_STATUS_INTERNAL;
+  }
   std::string table_name_str(quoted);
   PQfreemem(quoted);
 
   if (db_schema != nullptr) {
     quoted = PQescapeIdentifier(conn_, db_schema, strlen(db_schema));
+    if (quoted == nullptr) {
+      InternalAdbcSetError(error, "[libpq] Could not escape schema name %s: %s",
+                           db_schema, PQerrorMessage(conn_));
+      return ADBC_STATUS_INTERNAL;
+    }
     table_name_str = std::string(quoted) + "." + table_name_str;
     PQfreemem(quoted);
   }
