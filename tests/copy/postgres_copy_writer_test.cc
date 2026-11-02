@@ -1926,6 +1926,111 @@ TEST_F(PostgresCopyTest, PostgresCopyWriteNullDictionaryListElements) {
   }
 }
 
+TEST_F(PostgresCopyTest, PostgresCopyWriteDictionaryIndexOutOfRange) {
+  for (const int64_t bad_index : {int64_t{1}, int64_t{5}, int64_t{-1}}) {
+    for (const bool in_list : {false, true}) {
+      SCOPED_TRACE("index " + std::to_string(bad_index) +
+                   (in_list ? " in list" : " in column"));
+      adbc_validation::Handle<struct ArrowSchema> schema;
+      adbc_validation::Handle<struct ArrowArray> array;
+      if (in_list) {
+        ASSERT_EQ(adbc_validation::MakeSchema(
+                      &schema.value,
+                      {adbc_validation::SchemaField::Nested(
+                          "col", NANOARROW_TYPE_LIST, {{"item", NANOARROW_TYPE_INT32}})}),
+                  ADBC_STATUS_OK);
+      } else {
+        ASSERT_EQ(
+            adbc_validation::MakeSchema(&schema.value, {{"col", NANOARROW_TYPE_INT32}}),
+            ADBC_STATUS_OK);
+      }
+      struct ArrowSchema* indices_schema =
+          in_list ? schema->children[0]->children[0] : schema->children[0];
+      ASSERT_EQ(ArrowSchemaAllocateDictionary(indices_schema), 0);
+      ASSERT_EQ(
+          ArrowSchemaInitFromType(indices_schema->dictionary, NANOARROW_TYPE_STRING), 0);
+
+      ASSERT_EQ(ArrowArrayInitFromSchema(&array.value, &schema.value, nullptr), 0);
+      ASSERT_EQ(ArrowArrayStartAppending(&array.value), 0);
+      struct ArrowArray* indices =
+          in_list ? array->children[0]->children[0] : array->children[0];
+      // A dictionary with a single entry, so only index 0 is valid
+      ASSERT_EQ(ArrowArrayAppendString(indices->dictionary, ArrowCharView("x")), 0);
+      ASSERT_EQ(ArrowArrayFinishBuildingDefault(indices->dictionary, nullptr), 0);
+      ASSERT_EQ(ArrowArrayAppendInt(indices, bad_index), 0);
+      if (in_list) {
+        ASSERT_EQ(ArrowArrayFinishElement(array->children[0]), 0);
+      }
+      ASSERT_EQ(ArrowArrayFinishElement(&array.value), 0);
+      ASSERT_EQ(ArrowArrayFinishBuildingDefault(&array.value, nullptr), 0);
+
+      struct ArrowError na_error;
+      PostgresCopyStreamWriteTester tester;
+      ASSERT_EQ(tester.Init(&schema.value, &array.value, *type_resolver_, &na_error),
+                NANOARROW_OK)
+          << na_error.message;
+      ASSERT_EQ(tester.WriteAll(&na_error), EINVAL);
+      EXPECT_NE(std::string(na_error.message).find("out of range"), std::string::npos)
+          << na_error.message;
+    }
+  }
+}
+
+// A large_string whose offsets claim a value just over INT32_MAX bytes. No
+// data buffer of that size exists: the length check must reject the value
+// before any of its bytes are read.
+TEST_F(PostgresCopyTest, PostgresCopyWriteLargeStringLengthOverflow) {
+  for (const auto type : {NANOARROW_TYPE_LARGE_STRING, NANOARROW_TYPE_LARGE_BINARY}) {
+    SCOPED_TRACE(type);
+    nanoarrow::UniqueArrayView array_view;
+    ArrowArrayViewInitFromType(array_view.get(), type);
+    const int64_t offsets[] = {0, int64_t{(std::numeric_limits<int32_t>::max)()} + 1};
+    const char data[] = "x";
+    array_view->length = 1;
+    array_view->buffer_views[1].data.as_int64 = offsets;
+    array_view->buffer_views[1].size_bytes = sizeof(offsets);
+    array_view->buffer_views[2].data.as_char = data;
+    array_view->buffer_views[2].size_bytes = 1;
+
+    auto writer =
+        PostgresCopyFieldWriter::Create<PostgresCopyBinaryFieldWriter>(array_view.get());
+    nanoarrow::UniqueBuffer buffer;
+    struct ArrowError na_error;
+    ASSERT_EQ(writer->Write(buffer.get(), 0, &na_error), EOVERFLOW);
+    EXPECT_NE(std::string(na_error.message).find("too large"), std::string::npos)
+        << na_error.message;
+    // Nothing, not even a truncated length header, reached the wire
+    EXPECT_EQ(buffer->size_bytes, 0);
+  }
+}
+
+// A large_list whose offsets claim more than INT32_MAX elements. The child
+// array is empty: the check must fire before any child is read.
+TEST_F(PostgresCopyTest, PostgresCopyWriteLargeListLengthOverflow) {
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  ArrowSchemaInit(&schema.value);
+  ASSERT_EQ(ArrowSchemaSetType(&schema.value, NANOARROW_TYPE_LARGE_LIST), 0);
+  ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT32), 0);
+  ASSERT_EQ(ArrowSchemaSetName(schema->children[0], "item"), 0);
+
+  nanoarrow::UniqueArrayView array_view;
+  ASSERT_EQ(ArrowArrayViewInitFromSchema(array_view.get(), &schema.value, nullptr), 0);
+  const int64_t offsets[] = {0, int64_t{(std::numeric_limits<int32_t>::max)()} + 1};
+  array_view->length = 1;
+  array_view->buffer_views[1].data.as_int64 = offsets;
+  array_view->buffer_views[1].size_bytes = sizeof(offsets);
+
+  auto writer = PostgresCopyFieldWriter::Create<PostgresCopyListFieldWriter<false>>(
+      array_view.get(), /*child_oid=*/23,
+      std::make_unique<PostgresCopyNetworkEndianFieldWriter<int32_t>>());
+  nanoarrow::UniqueBuffer buffer;
+  struct ArrowError na_error;
+  ASSERT_EQ(writer->Write(buffer.get(), 0, &na_error), EOVERFLOW);
+  EXPECT_NE(std::string(na_error.message).find("too large"), std::string::npos)
+      << na_error.message;
+  EXPECT_EQ(buffer->size_bytes, 0);
+}
+
 TEST_F(PostgresCopyTest, PostgresCopyWriteMultiBatch) {
   // Regression test for https://github.com/apache/arrow-adbc/issues/1310
   adbc_validation::Handle<struct ArrowSchema> schema;
