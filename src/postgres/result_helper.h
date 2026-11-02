@@ -23,10 +23,13 @@
 #pragma once
 
 #include <cassert>
+#include <cerrno>
 #include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,6 +53,7 @@ struct PqRecord {
 
   std::optional<double> ParseDouble() const {
     char* end;
+    errno = 0;
     double result = std::strtod(data, &end);
     if (errno != 0 || end == data) {
       return std::nullopt;
@@ -69,12 +73,13 @@ struct PqRecord {
   }
 
   Result<std::vector<std::string>> ParseTextArray() const {
-    std::string text_array(data, len);
-    text_array.erase(0, 1);
-    text_array.erase(text_array.size() - 1);
+    if (is_null || len < 2 || data[0] != '{' || data[len - 1] != '}') {
+      return Status::Internal("Can't parse '", std::string_view(data, len),
+                              "' as text array");
+    }
 
     std::vector<std::string> elements;
-    std::stringstream ss(std::move(text_array));
+    std::stringstream ss(std::string(data + 1, len - 2));
     std::string tmp;
 
     while (getline(ss, tmp, ',')) {
