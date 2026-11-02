@@ -27,7 +27,13 @@ add_library(adbc_driver_motherduck_impl STATIC
             result_helper.cc
             result_reader.cc
             statement.cc
-            type_resolver_init.cc)
+            type_resolver_init.cc
+            motherduck_connection.cc
+            motherduck_database.cc
+            motherduck_factory.cc
+            motherduck_pipeline.cc
+            motherduck_statement.cc
+            motherduck_type_resolver.cc)
 target_include_directories(adbc_driver_motherduck_impl
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
                                   ${PROJECT_SOURCE_DIR}/include

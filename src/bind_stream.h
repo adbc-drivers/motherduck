@@ -311,21 +311,6 @@ struct BindStream {
     return Status::Ok();
   }
 
-  // Queue the current row for the prepared statement in a pipeline. libpq
-  // copies the parameters, so the next row can reuse the buffer.
-  Status SendCurrentRow(PGconn* pg_conn, int result_format) {
-    UNWRAP_STATUS(SerializeCurrentRow());
-
-    if (PQsendQueryPrepared(pg_conn, /*stmtName=*/"",
-                            /*nParams=*/bind_schema->n_children, param_values.data(),
-                            param_lengths.data(), param_formats.data(),
-                            result_format) != 1) {
-      return MakeStatus(nullptr, "[libpq] Failed to send prepared statement: {}",
-                        PQerrorMessage(pg_conn));
-    }
-    return Status::Ok();
-  }
-
   // Undo SetDatabaseTimezoneUTC after a failure. Under autocommit, rolling
   // back the transaction it began also restores the time zone. Otherwise the
   // user's transaction has failed, and rolling it back restores it.

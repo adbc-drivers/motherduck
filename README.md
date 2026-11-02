@@ -130,6 +130,47 @@ name `MotherDuck`. The driver still reports itself as PostgreSQL (#15), so the
 vendor check fails until that's fixed. Published validation documentation will
 be configured separately.
 
+## Code layout
+
+The upstream driver's sources in `src/` are kept as close to Apache's as
+possible, so upstream fixes merge cleanly. MotherDuck behavior lives in
+`src/motherduck_*` files, mostly as subclasses of the upstream classes:
+
+- `motherduck_database`: `MotherduckDatabase`, which adds `attach_mode`,
+  ignores `adbc.postgresql.type_resolver_mode`, uses the built-in type table
+  instead of reading the server's, and reports the MotherDuck driver name and
+  version.
+- `motherduck_connection`: `MotherduckConnection`, which leaves the vendor
+  version out of `GetInfo` rather than report the endpoint's PostgreSQL
+  `server_version_num`.
+- `motherduck_statement`: `MotherduckStatement`, which accepts the result sets
+  MotherDuck returns for DDL, and `MotherduckResultReader`, which runs queries
+  without a result through a pipeline.
+- `motherduck_pipeline`: pipelined execution and splitting multi-statement
+  queries.
+- `motherduck_type_resolver`: DuckDB-only type OIDs.
+- `motherduck_factory`: the subclasses `postgresql.cc` creates.
+
+The upstream files still differ from Apache's in these ways:
+
+- Every file starts with the modification notice described below, and
+  includes use paths relative to `src/`.
+- Hooks for the subclasses: `virtual` methods and `protected` members in
+  `PostgresDatabase`, `PostgresConnection`, `PostgresStatement`, and
+  `PqResultArrayReader`;
+  `DriverName()` and `DriverVersion()`, which `GetInfo` reports; and the
+  factory calls in `postgresql.cc`.
+- `BindStream::SerializeCurrentRow()` is split out of
+  `BindAndExecuteCurrentRow()` so rows can also be sent in a pipeline.
+- A failed bound row rolls back the transaction begun to set the time zone
+  (`BindStream::Abort()`); upstream leaves it open. This is a candidate to
+  contribute upstream, as is the `SerializeCurrentRow()` split.
+
+When merging from upstream, keep these differences and put new MotherDuck
+behavior in the `motherduck_*` files. MotherDuck's own tests are in
+`tests/motherduck_*_test.cc`; upstream tests that don't apply are skipped
+through `MOTHERDUCK_SKIPPED_UPSTREAM_TESTS` in `tests/CMakeLists.txt`.
+
 ## Upstream history and licensing
 
 The fork was extracted from `apache/arrow-adbc` at
