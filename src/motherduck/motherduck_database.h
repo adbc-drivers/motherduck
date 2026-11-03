@@ -38,8 +38,8 @@ std::string RegionHost(std::string_view region);
 
 /// \brief Append --<name>=<value> to libpq session options.
 ///
-/// Returns options unchanged if they already set name. value must not contain
-/// whitespace or backslashes, which libpq treats specially.
+/// Returns options unchanged if they already set name. Escapes whitespace and
+/// backslashes in value, which libpq treats specially.
 std::string AddSessionOption(std::string_view options, std::string_view name,
                              std::string_view value);
 

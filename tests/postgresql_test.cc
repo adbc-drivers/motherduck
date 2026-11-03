@@ -554,7 +554,7 @@ TEST_F(PostgresDatabaseTest, SessionNameOption) {
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME,
-                                    "adbc_session", &error),
+                                    "adbc session", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));

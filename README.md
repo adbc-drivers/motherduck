@@ -87,9 +87,16 @@ Single mode needs a named database; to connect to `md:`, set `workspace`.
 [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name),
 which routes connections with the same name to the same replica under read
 scaling and appears in query history. The driver adds `--session_name=<name>`
-to libpq's `options` the same way. The name can't contain whitespace or
-backslashes, which libpq treats specially in `options`. It's unset by default;
-an empty value unsets it.
+to libpq's `options` the same way, escaping whitespace and backslashes with a
+backslash; MotherDuck removes the escapes, so `my session` arrives as is. It's
+unset by default; an empty value unsets it.
+
+MotherDuck builds the user agent in query history and its logs from libpq's
+`application_name`. The driver adds `adbc_driver_motherduck/<version>` to it,
+after the application's own name if the URI's `application_name`,
+`PGAPPNAME`, or the URI's `fallback_application_name` gives one (in that
+order), so `application_name=dbt` becomes
+`dbt adbc_driver_motherduck/<version>`.
 
 The MotherDuck token is the connection's password. The driver takes it from,
 in order: the standard ADBC `password` database option (or its alias,

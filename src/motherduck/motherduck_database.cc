@@ -104,14 +104,16 @@ bool IsRegion(std::string_view value) {
   return !part_empty && parts >= 2 && has_digit;
 }
 
-// Whether value can go into libpq options as is: libpq splits options on
-// whitespace, and MotherDuck isn't documented to honor libpq's backslash
-// escapes.
-bool IsOptionValue(std::string_view value) {
+// Escapes value for libpq options, which splits on whitespace and treats a
+// backslash as escaping the next character. MotherDuck's endpoint removes the
+// escapes, so "a b" arrives as is.
+std::string EscapeOptionValue(std::string_view value) {
+  std::string escaped;
   for (char c : value) {
-    if (c == '\\' || std::isspace(static_cast<unsigned char>(c))) return false;
+    if (c == '\\' || std::isspace(static_cast<unsigned char>(c))) escaped += '\\';
+    escaped += c;
   }
-  return true;
+  return escaped;
 }
 }  // namespace
 
@@ -134,7 +136,7 @@ std::string AddSessionOption(std::string_view options, std::string_view name,
   result += "--";
   result += name;
   result += '=';
-  result += value;
+  result += EscapeOptionValue(value);
   return result;
 }
 
@@ -212,13 +214,6 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     }
     attach_mode_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
-    if (!IsOptionValue(value)) {
-      InternalAdbcSetError(error,
-                           "[libpq] Invalid value for option %s=%s: whitespace and "
-                           "backslashes aren't allowed",
-                           key, value);
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
     session_name_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     // The region becomes part of a hostname. An empty value unsets it.
@@ -269,6 +264,8 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   std::string options = env_options ? env_options : "";
   std::string password;
   std::string user;
+  std::string application_name;
+  std::string fallback_application_name;
   bool uri_sets_host = false;
   bool uri_sets_sslmode = false;
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
@@ -284,6 +281,10 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
       password = option->val;
     } else if (keyword == "user") {
       user = option->val;
+    } else if (keyword == "application_name") {
+      application_name = option->val;
+    } else if (keyword == "fallback_application_name") {
+      fallback_application_name = option->val;
     } else {
       params->emplace_back(option->keyword, option->val);
     }
@@ -331,6 +332,17 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     options = AddSessionOption(options, "session_name", session_name_);
   }
   params->emplace_back("options", std::move(options));
+  // MotherDuck builds the user agent in query history from application_name,
+  // so add the driver to the application's name (from the URI, PGAPPNAME, or
+  // fallback_application_name, as libpq would choose it).
+  if (application_name.empty()) {
+    const char* env_appname = std::getenv("PGAPPNAME");
+    if (env_appname != nullptr) application_name = env_appname;
+  }
+  if (application_name.empty()) application_name = fallback_application_name;
+  if (!application_name.empty()) application_name += ' ';
+  application_name += "adbc_driver_motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION;
+  params->emplace_back("application_name", std::move(application_name));
   return ADBC_STATUS_OK;
 }
 

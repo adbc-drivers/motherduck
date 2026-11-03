@@ -26,6 +26,7 @@
 #include <gtest/gtest.h>
 #include <nanoarrow/nanoarrow.h>
 
+#include "adbc_driver_motherduck_config.h"
 #include "motherduck_connection.h"
 #include "motherduck_database.h"
 #include "motherduck_factory.h"
@@ -99,6 +100,9 @@ TEST(MotherDuckAttachModeTest, AddSessionOption) {
   EXPECT_EQ("--session_name=a\\ attach_mode=x --attach_mode=single",
             adbcpq::AddSessionOption("--session_name=a\\ attach_mode=x", "attach_mode",
                                      "single"));
+  // Values are escaped for libpq.
+  EXPECT_EQ("--session_name=a\\ b\\\tc\\\\d",
+            adbcpq::AddSessionOption("", "session_name", "a b\tc\\d"));
   // A bare <name>=<value> isn't a setting unless it follows -c.
   EXPECT_EQ("attach_mode=x --attach_mode=single",
             adbcpq::AddSessionOption("attach_mode=x", "attach_mode", "single"));
@@ -135,23 +139,6 @@ TEST(MotherDuckSessionNameTest, OptionSetGet) {
   EXPECT_THAT(
       GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME, &error),
       IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  if (error.release) error.release(&error);
-}
-
-TEST(MotherDuckSessionNameTest, OptionInvalid) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* value : {"a b", "a\tb", "a\\b"}) {
-    EXPECT_THAT(AdbcDatabaseSetOption(&database.value,
-                                      ADBC_MOTHERDUCK_OPTION_SESSION_NAME, value, &error),
-                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    if (error.release) error.release(&error);
-  }
-  EXPECT_THAT(
-      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME, &error),
-      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  EXPECT_THAT(error.message, ::testing::HasSubstr("is not set"));
   if (error.release) error.release(&error);
 }
 
@@ -302,6 +289,7 @@ class MotherDuckConnectParamsTest : public ::testing::Test {
   ScopedEnv pgoptions_{"PGOPTIONS", nullptr};
   ScopedEnv pgsslmode_{"PGSSLMODE", nullptr};
   ScopedEnv pguser_{"PGUSER", "someone"};
+  ScopedEnv pgappname_{"PGAPPNAME", nullptr};
   adbcpq::MotherduckDatabase database_;
   struct AdbcError error_ = {};
 };
@@ -340,6 +328,28 @@ TEST_F(MotherDuckConnectParamsTest, SessionOptions) {
   EXPECT_THAT(
       Values("options"),
       ::testing::ElementsAre("-c x=y --attach_mode=single --session_name=adbc_session"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, SessionNameEscaped) {
+  SetOption("uri", "postgresql://localhost/db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "my session");
+  EXPECT_THAT(Values("options"),
+              ::testing::ElementsAre("--attach_mode=single --session_name=my\\ session"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, ApplicationName) {
+  const std::string driver = "adbc_driver_motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION;
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("application_name"), ::testing::ElementsAre(driver));
+  SetOption("uri", "postgresql://localhost/db?fallback_application_name=fallback");
+  EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("fallback " + driver));
+  EXPECT_THAT(Values("fallback_application_name"), ::testing::IsEmpty());
+  {
+    ScopedEnv pgappname("PGAPPNAME", "env");
+    EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("env " + driver));
+    SetOption("uri", "postgresql://localhost/db?application_name=dbt");
+    EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("dbt " + driver));
+  }
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionRequiresTls) {
