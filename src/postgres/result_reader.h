@@ -75,12 +75,22 @@ class PqResultArrayReader {
 
   Status Initialize(int64_t* affected_rows);
 
+  // Check that a result has the columns and types of the first result, which
+  // the schema and field readers were built from. bind_row is the index of the
+  // bind row that produced the result, for the error message.
+  static Status CheckResultMatches(const PqResultHelper& result,
+                                   const std::vector<Oid>& field_types, int64_t bind_row);
+
  protected:
   PGconn* conn_;
   PqResultHelper helper_;
   std::unique_ptr<BindStream> bind_stream_;
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
   std::vector<std::unique_ptr<PostgresCopyFieldReader>> field_readers_;
+  // The column types of the first result
+  std::vector<Oid> field_types_;
+  // The index of the bind row last executed
+  int64_t bind_row_ = -1;
   nanoarrow::UniqueSchema schema_;
   bool autocommit_;
   std::string vendor_name_;
@@ -93,6 +103,8 @@ class PqResultArrayReader {
         bind_stream_(std::move(other->bind_stream_)),
         type_resolver_(std::move(other->type_resolver_)),
         field_readers_(std::move(other->field_readers_)),
+        field_types_(std::move(other->field_types_)),
+        bind_row_(other->bind_row_),
         schema_(std::move(other->schema_)) {
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;

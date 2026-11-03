@@ -69,7 +69,7 @@ gtest_discover_tests(motherduck_unit_test TEST_PREFIX motherduck.)
 
 # The upstream PostgreSQL driver's tests, retargeted at MotherDuck
 add_executable(motherduck_postgresql_test error_test.cc postgres_type_test.cc
-                                          postgresql_test.cc)
+                                          postgresql_test.cc result_reader_test.cc)
 target_link_libraries(motherduck_postgresql_test
                       PRIVATE adbc_driver_motherduck adbc_driver_motherduck_impl
                               adbc_validation GTest::gmock_main)
@@ -78,7 +78,7 @@ target_compile_definitions(motherduck_postgresql_test
 )
 add_test(NAME postgresql_unit
          COMMAND motherduck_postgresql_test
-                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:-${MOTHERDUCK_SKIPPED_UPSTREAM_TESTS}
+                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:PostgresResultReaderTest.*:-${MOTHERDUCK_SKIPPED_UPSTREAM_TESTS}
 )
 # Keep the server-independent run from creating a MotherDuck test database.
 set_tests_properties(postgresql_unit

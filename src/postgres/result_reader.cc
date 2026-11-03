@@ -87,13 +87,12 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
   }
 
   // The schema and field readers were built from the first result. A later
-  // result with a different shape would index past them. This runs on every
-  // call, and the result is kept, so retrying after the error fails again
-  // instead of decoding it or ending the stream early.
-  const size_t num_columns = static_cast<size_t>(helper_.NumColumns());
-  if (num_columns != field_readers_.size()) {
-    status = Status::IO("[libpq] Result for a later bind row has ", num_columns,
-                        " columns, but the first result had ", field_readers_.size());
+  // result with different columns would index past them or be decoded as the
+  // wrong type. This runs on every call, and the result is kept, so retrying
+  // after the error fails again instead of decoding it or ending the stream
+  // early.
+  status = CheckResultMatches(helper_, field_types_, bind_row_);
+  if (!status.ok()) {
     status.ToAdbc(&error_);
     if (bind_stream_) {
       bind_stream_->Abort(conn_);
@@ -237,6 +236,28 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
     UNWRAP_NANOARROW(na_error_, Internal, child_reader->InitSchema(schema_->children[i]));
 
     field_readers_.push_back(std::move(child_reader));
+    field_types_.push_back(helper_.FieldType(i));
+  }
+
+  return Status::Ok();
+}
+
+Status PqResultArrayReader::CheckResultMatches(const PqResultHelper& result,
+                                               const std::vector<Oid>& field_types,
+                                               int64_t bind_row) {
+  const size_t num_columns = static_cast<size_t>(result.NumColumns());
+  if (num_columns != field_types.size()) {
+    return Status::IO("[libpq] Result for bind row ", bind_row, " has ", num_columns,
+                      " columns, but the first result had ", field_types.size());
+  }
+
+  for (int i = 0; i < result.NumColumns(); i++) {
+    if (result.FieldType(i) != field_types[i]) {
+      return Status::IO("[libpq] Result for bind row ", bind_row, " has type OID ",
+                        result.FieldType(i), " for column ", i, " (\"",
+                        result.FieldName(i), "\"), but the first result had type OID ",
+                        field_types[i]);
+    }
   }
 
   return Status::Ok();
@@ -268,23 +289,30 @@ Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
 Status PqResultArrayReader::BindNextAndExecute(int64_t* affected_rows) {
   // Keep pulling from the bind stream and executing as long as
   // we receive results with zero rows.
+  // On any error, undo what the bind stream set up (BindStream::Abort()) and
+  // drop it, so a retry doesn't run more rows.
+  auto abort = [this](Status status) {
+    bind_stream_->Abort(conn_);
+    bind_stream_.reset();
+    return status;
+  };
+
   do {
-    UNWRAP_STATUS(bind_stream_->EnsureNextRow());
+    Status status = bind_stream_->EnsureNextRow();
+    if (!status.ok()) return abort(std::move(status));
 
     if (!bind_stream_->current->release) {
-      UNWRAP_STATUS(bind_stream_->Cleanup(conn_));
+      status = bind_stream_->Cleanup(conn_);
+      if (!status.ok()) return abort(std::move(status));
       bind_stream_.reset();
       return Status::Ok();
     }
 
     PGresult* result;
-    Status status = bind_stream_->BindAndExecuteCurrentRow(
-        conn_, &result, /*result_format*/ kPgBinaryFormat);
-    if (!status.ok()) {
-      bind_stream_->Abort(conn_);
-      bind_stream_.reset();
-      return status;
-    }
+    bind_row_++;
+    status = bind_stream_->BindAndExecuteCurrentRow(conn_, &result,
+                                                    /*result_format*/ kPgBinaryFormat);
+    if (!status.ok()) return abort(std::move(status));
     helper_.SetResult(result);
     if (affected_rows) {
       (*affected_rows) += helper_.AffectedRows();

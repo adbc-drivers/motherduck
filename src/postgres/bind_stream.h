@@ -313,19 +313,29 @@ struct BindStream {
 
   // Undo SetDatabaseTimezoneUTC after a failure. Under autocommit, rolling
   // back the transaction it began also restores the time zone. Otherwise the
-  // user's transaction has failed, and rolling it back restores it.
+  // transaction is the user's, so leave it open. If it has failed, the user
+  // must roll it back, which restores the time zone. If it hasn't (the error
+  // came from the driver, not the server), restore the time zone here, as
+  // Cleanup() does.
   void Abort(PGconn* pg_conn) {
-    if (has_tz_field && autocommit) {
+    if (!has_tz_field) return;
+    // The failure that got us here is the error worth reporting.
+    if (autocommit) {
       PqResultHelper rollback(pg_conn, "ROLLBACK");
-      // The failure that got us here is the error worth reporting.
       (void)rollback.Execute();
+    } else if (PQtransactionStatus(pg_conn) != PQTRANS_INERROR) {
+      (void)RestoreTimezone(pg_conn);
     }
+  }
+
+  Status RestoreTimezone(PGconn* pg_conn) {
+    PqResultHelper reset(pg_conn, "SET TIME ZONE '" + tz_setting + "'");
+    return reset.Execute();
   }
 
   Status Cleanup(PGconn* pg_conn) {
     if (has_tz_field) {
-      PqResultHelper reset(pg_conn, "SET TIME ZONE '" + tz_setting + "'");
-      UNWRAP_STATUS(reset.Execute());
+      UNWRAP_STATUS(RestoreTimezone(pg_conn));
 
       if (autocommit) {
         // SetDatabaseTimezoneUTC will start a transaction if autocommit is
