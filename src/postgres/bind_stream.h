@@ -345,6 +345,40 @@ struct BindStream {
                      int64_t* rows_affected) {
     if (rows_affected) *rows_affected = 0;
 
+    Status write_status = WriteCopyData(pg_conn, type_resolver, target_types,
+                                        disable_decimal_fast_path, rows_affected);
+    if (!write_status.ok()) {
+      // End the COPY so the connection leaves COPY_IN and can run more queries;
+      // the server discards the rows sent so far.
+      if (PQputCopyEnd(pg_conn, "ADBC bulk ingest failed") > 0) {
+        while (PGresult* result = PQgetResult(pg_conn)) PQclear(result);
+      }
+      if (rows_affected) *rows_affected = 0;
+      return write_status;
+    }
+
+    if (PQputCopyEnd(pg_conn, NULL) <= 0) {
+      return Status::IO("Error message returned by PQputCopyEnd: ",
+                        PQerrorMessage(pg_conn));
+    }
+
+    PGresult* result = PQgetResult(pg_conn);
+    ExecStatusType pg_status = PQresultStatus(result);
+    if (pg_status != PGRES_COMMAND_OK) {
+      Status status =
+          MakeStatus(result, "[libpq] Failed to execute COPY statement: {} {}",
+                     PQresStatus(pg_status), PQerrorMessage(pg_conn));
+      PQclear(result);
+      return status;
+    }
+
+    PQclear(result);
+    return Status::Ok();
+  }
+
+  Status WriteCopyData(PGconn* pg_conn, const PostgresTypeResolver& type_resolver,
+                       const PostgresType* target_types, bool disable_decimal_fast_path,
+                       int64_t* rows_affected) {
     PostgresCopyStreamWriter writer;
     UNWRAP_ERRNO(Internal, writer.Init(&bind_schema.value));
     UNWRAP_NANOARROW(na_error, Internal,
@@ -367,7 +401,7 @@ struct BindStream {
 
       // check if not ENODATA at exit
       if (write_result != ENODATA) {
-        return Status::IO("Error occurred writing COPY data: ", PQerrorMessage(pg_conn));
+        return Status::IO("Error occurred writing COPY data: ", na_error.message);
       }
 
       UNWRAP_STATUS(FlushCopyWriterToConn(pg_conn, writer));
@@ -377,25 +411,7 @@ struct BindStream {
     }
 
     // If there were no arrays in the stream, we haven't flushed yet
-    UNWRAP_STATUS(FlushCopyWriterToConn(pg_conn, writer));
-
-    if (PQputCopyEnd(pg_conn, NULL) <= 0) {
-      return Status::IO("Error message returned by PQputCopyEnd: ",
-                        PQerrorMessage(pg_conn));
-    }
-
-    PGresult* result = PQgetResult(pg_conn);
-    ExecStatusType pg_status = PQresultStatus(result);
-    if (pg_status != PGRES_COMMAND_OK) {
-      Status status =
-          MakeStatus(result, "[libpq] Failed to execute COPY statement: {} {}",
-                     PQresStatus(pg_status), PQerrorMessage(pg_conn));
-      PQclear(result);
-      return status;
-    }
-
-    PQclear(result);
-    return Status::Ok();
+    return FlushCopyWriterToConn(pg_conn, writer);
   }
 
   Status FlushCopyWriterToConn(PGconn* pg_conn, const PostgresCopyStreamWriter& writer) {

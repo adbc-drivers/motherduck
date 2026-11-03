@@ -958,7 +958,9 @@ class PostgresCopyListFieldWriter : public PostgresCopyFieldWriter {
       bool is_null = ArrowArrayViewIsNull(child_view, i);
       if (!is_null && child_view->dictionary != nullptr) {
         const int64_t dict_index = ArrowArrayViewGetIntUnsafe(child_view, i);
-        NANOARROW_RETURN_NOT_OK(CheckDictionaryIndex(child_view, i, dict_index, error));
+        // Report the list's row, not the child element's index.
+        NANOARROW_RETURN_NOT_OK(
+            CheckDictionaryIndex(child_view, index, dict_index, error));
         is_null = ArrowArrayViewIsNull(child_view->dictionary, dict_index);
       }
       if (is_null) {

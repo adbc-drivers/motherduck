@@ -1957,6 +1957,15 @@ TEST_F(PostgresCopyTest, PostgresCopyWriteDictionaryIndexOutOfRange) {
       // A dictionary with a single entry, so only index 0 is valid
       ASSERT_EQ(ArrowArrayAppendString(indices->dictionary, ArrowCharView("x")), 0);
       ASSERT_EQ(ArrowArrayFinishBuildingDefault(indices->dictionary, nullptr), 0);
+      // A valid row, then a bad one; in a list the bad index is child element 2
+      ASSERT_EQ(ArrowArrayAppendInt(indices, 0), 0);
+      if (in_list) {
+        ASSERT_EQ(ArrowArrayFinishElement(array->children[0]), 0);
+      }
+      ASSERT_EQ(ArrowArrayFinishElement(&array.value), 0);
+      if (in_list) {
+        ASSERT_EQ(ArrowArrayAppendInt(indices, 0), 0);
+      }
       ASSERT_EQ(ArrowArrayAppendInt(indices, bad_index), 0);
       if (in_list) {
         ASSERT_EQ(ArrowArrayFinishElement(array->children[0]), 0);
@@ -1971,6 +1980,8 @@ TEST_F(PostgresCopyTest, PostgresCopyWriteDictionaryIndexOutOfRange) {
           << na_error.message;
       ASSERT_EQ(tester.WriteAll(&na_error), EINVAL);
       EXPECT_NE(std::string(na_error.message).find("out of range"), std::string::npos)
+          << na_error.message;
+      EXPECT_NE(std::string(na_error.message).find("at row 1 "), std::string::npos)
           << na_error.message;
     }
   }
