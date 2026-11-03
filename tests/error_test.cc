@@ -20,8 +20,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
+#include <cstring>
+#include <string>
 
+#include <gtest/gtest.h>
+#include <libpq-fe.h>
+
+#include "connection.h"
 #include "error.h"
 
 namespace adbcpq {
@@ -69,6 +74,47 @@ TEST(PostgresErrorTest, ClassifySqlState) {
     EXPECT_EQ(test_case.status, ClassifySqlState(test_case.sqlstate))
         << (test_case.sqlstate ? test_case.sqlstate : "null");
   }
+}
+
+TEST(PostgresErrorTest, EscapeIdentifier) {
+  // A connection that never reached a server still carries a client encoding,
+  // which is all PQescapeIdentifier needs.
+  PGconn* conn = PQconnectdb("host=/nonexistent-adbc-motherduck-test-socket-dir");
+  ASSERT_NE(nullptr, conn);
+
+  struct AdbcError error = ADBC_ERROR_INIT;
+  std::string escaped;
+  EXPECT_EQ(ADBC_STATUS_OK, EscapeIdentifier(conn, "my\"table", &escaped, &error));
+  EXPECT_EQ("\"my\"\"table\"", escaped);
+  if (error.release) error.release(&error);
+  PQfinish(conn);
+}
+
+TEST(PostgresErrorTest, EscapeIdentifierFailure) {
+  // PQescapeIdentifier fails without a connection, the same way it fails for
+  // input that is invalid in the client encoding.
+  struct AdbcError error = ADBC_ERROR_INIT;
+  std::string escaped = "unchanged";
+  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+            EscapeIdentifier(nullptr, "my_table", &escaped, &error));
+  EXPECT_EQ("unchanged", escaped);
+  ASSERT_NE(nullptr, error.message);
+  EXPECT_NE(nullptr, std::strstr(error.message, "Could not escape identifier my_table"))
+      << error.message;
+  if (error.release) error.release(&error);
+}
+
+TEST(PostgresConnectionUnitTest, GetTableSchemaNullTableName) {
+  PostgresConnection connection;
+  struct ArrowSchema schema = {};
+  struct AdbcError error = ADBC_ERROR_INIT;
+  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+            connection.GetTableSchema(nullptr, nullptr, nullptr, &schema, &error));
+  ASSERT_NE(nullptr, error.message);
+  EXPECT_NE(nullptr, std::strstr(error.message, "table_name must not be NULL"))
+      << error.message;
+  EXPECT_EQ(nullptr, schema.release);
+  if (error.release) error.release(&error);
 }
 
 }  // namespace adbcpq

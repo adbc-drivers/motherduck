@@ -86,4 +86,18 @@ AdbcStatusCode ClassifySqlState(const char* sqlstate) {
   return ADBC_STATUS_IO;
 }
 
+AdbcStatusCode EscapeIdentifier(PGconn* conn, std::string_view identifier,
+                                std::string* out, struct AdbcError* error) {
+  char* escaped = PQescapeIdentifier(conn, identifier.data(), identifier.size());
+  if (escaped == nullptr) {
+    InternalAdbcSetError(error, "[libpq] Could not escape identifier %.*s: %s",
+                         static_cast<int>(identifier.size()), identifier.data(),
+                         PQerrorMessage(conn));
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  }
+  *out = escaped;
+  PQfreemem(escaped);
+  return ADBC_STATUS_OK;
+}
+
 }  // namespace adbcpq

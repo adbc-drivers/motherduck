@@ -26,6 +26,7 @@
 
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <arrow-adbc/adbc.h>
@@ -63,6 +64,13 @@ static const std::vector<DetailField> kDetailFields = {
 };
 
 AdbcStatusCode ClassifySqlState(const char* sqlstate);
+
+/// \brief Quote an identifier with PQescapeIdentifier, storing the result in *out.
+///
+/// libpq rejects identifiers that are not valid in the client encoding, so a
+/// failure is reported as ADBC_STATUS_INVALID_ARGUMENT.
+AdbcStatusCode EscapeIdentifier(PGconn* conn, std::string_view identifier,
+                                std::string* out, struct AdbcError* error);
 
 template <typename... Args>
 Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
