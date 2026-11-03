@@ -21,15 +21,22 @@
 # under the License.
 
 add_library(adbc_driver_motherduck_impl STATIC
-            connection.cc
-            error.cc
-            database.cc
-            result_helper.cc
-            result_reader.cc
-            statement.cc
-            type_resolver_init.cc)
+            postgres/connection.cc
+            postgres/error.cc
+            postgres/database.cc
+            postgres/result_helper.cc
+            postgres/result_reader.cc
+            postgres/statement.cc
+            postgres/type_resolver_init.cc
+            motherduck/motherduck_connection.cc
+            motherduck/motherduck_database.cc
+            motherduck/motherduck_factory.cc
+            motherduck/motherduck_pipeline.cc
+            motherduck/motherduck_statement.cc
+            motherduck/motherduck_type_resolver.cc)
 target_include_directories(adbc_driver_motherduck_impl
-                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/postgres
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/motherduck
                                   ${PROJECT_SOURCE_DIR}/include
                                   ${PROJECT_BINARY_DIR}/generated)
 target_link_libraries(adbc_driver_motherduck_impl PUBLIC adbc_driver_framework
@@ -38,7 +45,7 @@ if(WIN32)
   target_link_libraries(adbc_driver_motherduck_impl PUBLIC wsock32 ws2_32)
 endif()
 
-add_library(adbc_driver_motherduck SHARED postgresql.cc motherduck.cc)
+add_library(adbc_driver_motherduck SHARED postgres/postgresql.cc motherduck/motherduck.cc)
 target_link_libraries(adbc_driver_motherduck PRIVATE adbc_driver_motherduck_impl)
 target_include_directories(adbc_driver_motherduck
                            PUBLIC ${PROJECT_SOURCE_DIR}/include

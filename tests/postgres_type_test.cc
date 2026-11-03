@@ -25,8 +25,10 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <libpq-fe.h>
 #include <nanoarrow/nanoarrow.hpp>
 
+#include "database.h"
 #include "postgres_type.h"
 #include "type_resolver_init.h"
 
@@ -592,27 +594,40 @@ TEST(PostgresTypeTest, PostgresTypeResolveInt2vector) {
   EXPECT_EQ(0, type.n_children());
 }
 
-TEST(PostgresTypeTest, MotherDuckTypes) {
-  PostgresTypeResolver resolver;
-  ASSERT_TRUE(InternalAdbcInitializeTypeResolver(resolver).ok());
+TEST(PostgresTypeTest, BuiltinResolver) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  if (!uri) {
+    FAIL() << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  }
 
-  // The standard OIDs still win the reverse lookups
-  EXPECT_EQ(resolver.GetOID(PostgresTypeId::kText), 25);
+  auto* conn = PQconnectdb(uri);
+  if (auto status = PQstatus(conn); status != CONNECTION_OK) {
+    std::string message = PQerrorMessage(conn);
+    PQfinish(conn);
+    ASSERT_EQ(CONNECTION_OK, status) << message;
+  }
 
-  PostgresType type;
-  ASSERT_EQ(resolver.Find(17001, &type, nullptr), NANOARROW_OK);
-  EXPECT_EQ(type.type_id(), PostgresTypeId::kText);
-  EXPECT_EQ(type.typname(), "duckdb_struct");
+  PostgresTypeResolver builtin, dynamic;
+  ASSERT_TRUE(InternalAdbcInitializeTypeResolver(builtin).ok());
+  ASSERT_TRUE(InternalAdbcRebuildTypeResolver(conn, dynamic).ok());
 
-  ASSERT_EQ(resolver.Find(17002, &type, nullptr), NANOARROW_OK);
-  EXPECT_EQ(type.type_id(), PostgresTypeId::kArray);
-  EXPECT_EQ(type.typname(), "_duckdb_struct");
-  ASSERT_EQ(type.n_children(), 1);
-  EXPECT_EQ(type.child(0).oid(), 17001);
+  PQfinish(conn);
 
-  for (uint32_t oid = 17000; oid <= 17018; oid++) {
+  for (const auto& [oid, type] : builtin.oid_mapping()) {
+    // types from PostgreSQL 19 - ignore them
+    if (oid == 6437) continue;  // oid8
+    if (oid == 6442) continue;  // oid8 array
+    if (oid == 6490) continue;  // regdatabase
+    if (oid == 6491) continue;  // regdatabase array
+
     SCOPED_TRACE("oid = " + std::to_string(oid));
-    EXPECT_EQ(resolver.Find(oid, &type, nullptr), NANOARROW_OK);
+    auto dynamic_type = dynamic.oid_mapping().find(oid);
+    EXPECT_NE(dynamic_type, dynamic.oid_mapping().end());
+    if (dynamic_type == dynamic.oid_mapping().end()) {
+      continue;
+    }
+    EXPECT_EQ(type.type_id(), dynamic_type->second.type_id());
+    EXPECT_EQ(type.typname(), dynamic_type->second.typname());
   }
 }
 

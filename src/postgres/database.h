@@ -22,10 +22,10 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <string_view>
 
 #include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
@@ -34,34 +34,28 @@
 #include "postgres_type.h"
 #include "type_resolver_init.h"
 
-#define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
-
 namespace adbcpq {
 using adbc::driver::Status;
-
-/// \brief Append --attach_mode=<attach_mode> to libpq session options.
-///
-/// Returns options unchanged if they already set attach_mode.
-std::string AddAttachMode(std::string_view options, std::string_view attach_mode);
 
 class PostgresDatabase {
  public:
   PostgresDatabase();
-  ~PostgresDatabase();
+  virtual ~PostgresDatabase();
 
   // Public ADBC API
 
-  AdbcStatusCode Init(struct AdbcError* error);
+  virtual AdbcStatusCode Init(struct AdbcError* error);
   AdbcStatusCode Release(struct AdbcError* error);
-  AdbcStatusCode GetOption(const char* option, char* value, size_t* length,
-                           struct AdbcError* error);
+  virtual AdbcStatusCode GetOption(const char* option, char* value, size_t* length,
+                                   struct AdbcError* error);
   AdbcStatusCode GetOptionBytes(const char* option, uint8_t* value, size_t* length,
                                 struct AdbcError* error);
   AdbcStatusCode GetOptionDouble(const char* option, double* value,
                                  struct AdbcError* error);
   AdbcStatusCode GetOptionInt(const char* option, int64_t* value,
                               struct AdbcError* error);
-  AdbcStatusCode SetOption(const char* key, const char* value, struct AdbcError* error);
+  virtual AdbcStatusCode SetOption(const char* key, const char* value,
+                                   struct AdbcError* error);
   AdbcStatusCode SetOptionBytes(const char* key, const uint8_t* value, size_t length,
                                 struct AdbcError* error);
   AdbcStatusCode SetOptionDouble(const char* key, double value, struct AdbcError* error);
@@ -69,20 +63,26 @@ class PostgresDatabase {
 
   // Internal implementation
 
-  AdbcStatusCode Connect(PGconn** conn, struct AdbcError* error);
+  virtual AdbcStatusCode Connect(PGconn** conn, struct AdbcError* error);
   AdbcStatusCode Disconnect(PGconn** conn, struct AdbcError* error);
   const std::shared_ptr<PostgresTypeResolver>& type_resolver() const {
     return type_resolver_;
   }
 
+  Status InitVersions(PGconn* conn);
   std::string_view VendorName() { return "PostgreSQL"; }
+  virtual std::string_view DriverName() { return "ADBC PostgreSQL Driver"; }
+  // TODO(lidavidm): fill in driver version
+  virtual std::string_view DriverVersion() { return "unknown"; }
+  const std::array<int, 3>& VendorVersion() { return postgres_server_version_; }
   bool use_copy() const { return use_copy_; }
 
- private:
+ protected:
   int32_t open_connections_;
   std::string uri_;
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
+  std::array<int, 3> postgres_server_version_{};
   bool use_copy_ = true;
-  std::string attach_mode_ = "single";
+  TypeResolverMode type_resolver_mode_ = TypeResolverMode::kServer;
 };
 }  // namespace adbcpq

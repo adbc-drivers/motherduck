@@ -48,7 +48,7 @@
 #include "adbc_driver_motherduck_config.h"
 #include "common/options.h"
 #include "common/utils.h"
-#include "database.h"
+#include "motherduck_database.h"
 #include "validation/adbc_validation.h"
 #include "validation/adbc_validation_util.h"
 
@@ -533,66 +533,6 @@ TEST_F(PostgresDatabaseTest, AdbcDriverBackwardsCompatibility) {
               IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
 }
 
-TEST(MotherDuckAttachModeTest, OptionDefault) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
-              ::testing::Optional("single"s));
-}
-
-TEST(MotherDuckAttachModeTest, OptionSetGet) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const std::string value : {"workspace", "single"}) {
-    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
-                                      value.c_str(), &error),
-                IsOkStatus(&error));
-    EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                    &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
-                ::testing::Optional(value));
-  }
-}
-
-TEST(MotherDuckAttachModeTest, OptionInvalid) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* value : {"", "SINGLE", "multi"}) {
-    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
-                                      value, &error),
-                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    if (error.release) error.release(&error);
-  }
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
-              ::testing::Optional("single"s));
-}
-
-TEST(MotherDuckAttachModeTest, AddAttachMode) {
-  EXPECT_EQ("--attach_mode=single", adbcpq::AddAttachMode("", "single"));
-  EXPECT_EQ("--session_name=x --attach_mode=workspace",
-            adbcpq::AddAttachMode("--session_name=x", "workspace"));
-  // Options from the URI win.
-  EXPECT_EQ("--attach_mode=workspace",
-            adbcpq::AddAttachMode("--attach_mode=workspace", "single"));
-  EXPECT_EQ("-c attach_mode=workspace",
-            adbcpq::AddAttachMode("-c attach_mode=workspace", "single"));
-  EXPECT_EQ("-cattach_mode=workspace",
-            adbcpq::AddAttachMode("-cattach_mode=workspace", "single"));
-  EXPECT_EQ("--attach-mode=workspace",
-            adbcpq::AddAttachMode("--attach-mode=workspace", "single"));
-  EXPECT_EQ("-c attach-mode=workspace",
-            adbcpq::AddAttachMode("-c attach-mode=workspace", "single"));
-  // Other options that mention attach_mode don't count.
-  EXPECT_EQ("--session_name=attach_mode=x --attach_mode=single",
-            adbcpq::AddAttachMode("--session_name=attach_mode=x", "single"));
-  EXPECT_EQ("--session_name=attach_mode --attach_mode=single",
-            adbcpq::AddAttachMode("--session_name=attach_mode", "single"));
-}
-
 class PostgresConnectionTest : public ::testing::Test,
                                public adbc_validation::ConnectionTest {
  public:
@@ -650,19 +590,9 @@ TEST_F(PostgresConnectionTest, GetInfoMetadata) {
           EXPECT_EQ("PostgreSQL", std::string(val.data, val.size_bytes));
           break;
         }
-        case ADBC_INFO_VENDOR_VERSION: {
-          ArrowStringView val = ArrowArrayViewGetStringUnsafe(str_child, offset);
-// Fall back to a simpler version regex. This only really impacts WIN32/MSVC but
-// this is slightly more correct/portable.
-#if GTEST_USES_SIMPLE_RE
-          const char* pater = "\\d\\d\\d\\d\\d\\d";
-#else
-          const char* pater = "[0-9]{6}";
-#endif
-          EXPECT_THAT(std::string(val.data, val.size_bytes),
-                      ::testing::MatchesRegex(pater));
+        case ADBC_INFO_VENDOR_VERSION:
+          ADD_FAILURE() << "vendor version must not be reported";
           break;
-        }
         case ADBC_INFO_DRIVER_ADBC_VERSION: {
           EXPECT_EQ(ADBC_VERSION_1_1_0, ArrowArrayViewGetIntUnsafe(int_child, offset));
           break;
@@ -673,7 +603,10 @@ TEST_F(PostgresConnectionTest, GetInfoMetadata) {
       }
     }
   }
-  ASSERT_THAT(seen, ::testing::UnorderedElementsAreArray(info));
+  // The PostgreSQL server version is requested but not reported.
+  ASSERT_THAT(seen, ::testing::UnorderedElementsAre(
+                        ADBC_INFO_DRIVER_NAME, ADBC_INFO_DRIVER_VERSION,
+                        ADBC_INFO_DRIVER_ADBC_VERSION, ADBC_INFO_VENDOR_NAME));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetCatalogs) {
@@ -999,9 +932,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
       << "expected 1 constraint on adbc_fkey_test table, found: "
       << table->n_table_constraints;
 
-  const std::string version = adbc_validation::GetDriverVendorVersion(&connection);
-  const std::string search_name =
-      version < "120000" ? "adbc_fkey_test_fid1_fkey" : "adbc_fkey_test_fid1_fid2_fkey";
+  // The driver reports no vendor version, so expect PostgreSQL 12+ naming.
+  const std::string search_name = "adbc_fkey_test_fid1_fid2_fkey";
   struct AdbcGetObjectsConstraint* constraint =
       InternalAdbcGetObjectsDataGetConstraintByName(
           *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
@@ -3710,12 +3642,6 @@ TEST_P(PostgresTypeTest, SelectValue) {
     GTEST_SKIP() << *reason;
   }
   std::string value = GetParam().sql_literal;
-  if ((value == "'-inf'") || (value == "'inf'")) {
-    const std::string version = adbc_validation::GetDriverVendorVersion(&connection_);
-    if (version < "140000") {
-      GTEST_SKIP() << "-inf and inf not implemented until postgres 14";
-    }
-  }
   // create table
   std::string query = "CREATE TABLE foo (col ";
   query += GetParam().sql_type;

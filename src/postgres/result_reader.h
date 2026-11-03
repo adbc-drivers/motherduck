@@ -51,7 +51,7 @@ class PqResultArrayReader {
     error_ = ADBC_ERROR_INIT;
   }
 
-  ~PqResultArrayReader() { ResetErrors(); }
+  virtual ~PqResultArrayReader() { ResetErrors(); }
 
   // Ensure the reader knows what the autocommit status was on creation. This is used
   // so that the temporary timezone setting required for parameter binding can be wrapped
@@ -75,7 +75,7 @@ class PqResultArrayReader {
 
   Status Initialize(int64_t* affected_rows);
 
- private:
+ protected:
   PGconn* conn_;
   PqResultHelper helper_;
   std::unique_ptr<BindStream> bind_stream_;
@@ -99,7 +99,7 @@ class PqResultArrayReader {
   }
 
   Status BindNextAndExecute(int64_t* affected_rows);
-  Status ExecuteAll(int64_t* affected_rows);
+  virtual Status ExecuteAll(int64_t* affected_rows);
 
   void ResetErrors() {
     ArrowErrorInit(&na_error_);

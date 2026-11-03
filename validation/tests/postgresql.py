@@ -22,7 +22,6 @@
 
 import functools
 import os
-import re
 from pathlib import Path
 
 from adbc_drivers_validation import model, quirks
@@ -38,10 +37,12 @@ class PostgreSQLQuirks(model.DriverQuirks):
     name = "postgresql"
     driver = "adbc_driver_postgresql"
     driver_name = "ADBC MotherDuck Driver"
-    # The driver still reports PostgreSQL and the endpoint's server_version_num
+    # The driver still reports PostgreSQL as the vendor name
     # (https://github.com/adbc-drivers/motherduck/issues/15).
     vendor_name = "MotherDuck"
-    vendor_version = re.compile(r"[0-9]{6}")
+    # It reports no vendor version, rather than the endpoint's PostgreSQL
+    # server_version_num.
+    vendor_version = ""
     # MotherDuck is a service with no version to pin, so the docs label the
     # results "latest".
     short_version = "latest"
