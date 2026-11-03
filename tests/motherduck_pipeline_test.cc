@@ -18,7 +18,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include "result_helper.h"
+#include "motherduck_pipeline.h"
 
 namespace adbcpq {
 

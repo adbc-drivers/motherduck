@@ -45,6 +45,7 @@
 namespace adbcpq {
 class PostgresConnection;
 class PostgresStatement;
+class PqResultArrayReader;
 
 constexpr static int64_t kDefaultBatchSizeHintBytes = 16777216;
 
@@ -112,6 +113,7 @@ class PostgresStatement {
         batch_size_hint_bytes_(kDefaultBatchSizeHintBytes) {
     std::memset(&bind_, 0, sizeof(bind_));
   }
+  virtual ~PostgresStatement();
 
   // ---------------------------------------------------------------------
   // ADBC API implementation
@@ -160,6 +162,13 @@ class PostgresStatement {
                              struct AdbcError* error);
 
   bool use_copy() const { return use_copy_; }
+
+ protected:
+  virtual std::unique_ptr<PqResultArrayReader> MakeResultReader(
+      PGconn* conn, std::shared_ptr<PostgresTypeResolver> type_resolver,
+      std::string query);
+  // Whether a DDL command run by CreateBulkTable succeeded
+  virtual bool IsCommandOk(PGresult* result);
 
  private:
   std::shared_ptr<PostgresTypeResolver> type_resolver_;

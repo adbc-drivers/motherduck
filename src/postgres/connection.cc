@@ -27,8 +27,6 @@
 
 #include "connection.h"
 
-#include "adbc_driver_motherduck_config.h"
-
 #include <array>
 #include <cassert>
 #include <cinttypes>
@@ -566,10 +564,10 @@ AdbcStatusCode PostgresConnection::GetInfo(struct AdbcConnection* connection,
         break;
       }
       case ADBC_INFO_DRIVER_NAME:
-        infos.push_back({info_codes[i], "ADBC MotherDuck Driver"});
+        infos.push_back({info_codes[i], std::string(database_->DriverName())});
         break;
       case ADBC_INFO_DRIVER_VERSION:
-        infos.push_back({info_codes[i], ADBC_DRIVER_MOTHERDUCK_VERSION});
+        infos.push_back({info_codes[i], std::string(database_->DriverVersion())});
         break;
       case ADBC_INFO_DRIVER_ARROW_VERSION:
         infos.push_back({info_codes[i], "v" NANOARROW_VERSION});
@@ -1317,5 +1315,9 @@ AdbcStatusCode PostgresConnection::SetOptionInt(const char* key, int64_t value,
 }
 
 std::string_view PostgresConnection::VendorName() { return database_->VendorName(); }
+
+const std::array<int, 3>& PostgresConnection::VendorVersion() {
+  return database_->VendorVersion();
+}
 
 }  // namespace adbcpq

@@ -27,10 +27,9 @@
 
 #include "database.h"
 
-#include <atomic>
+#include <array>
+#include <charconv>
 #include <cinttypes>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -43,37 +42,9 @@
 
 #include "driver/common/utils.h"
 #include "postgres_util.h"
+#include "result_helper.h"
 
 namespace adbcpq {
-
-namespace {
-// Whether libpq session options set attach_mode, as --attach_mode=<mode> or
-// -c attach_mode=<mode> (or attach-mode).
-bool SetsAttachMode(std::string_view options) {
-  constexpr std::string_view kWhitespace = " \t\n\r\f\v";
-  constexpr std::string_view kSettings[] = {"attach_mode=", "attach-mode="};
-  size_t start = options.find_first_not_of(kWhitespace);
-  while (start != std::string_view::npos) {
-    size_t end = options.find_first_of(kWhitespace, start);
-    std::string_view arg = options.substr(start, end - start);
-    if (arg.substr(0, 2) == "--" || arg.substr(0, 2) == "-c") arg.remove_prefix(2);
-    for (std::string_view setting : kSettings) {
-      if (arg.substr(0, setting.size()) == setting) return true;
-    }
-    start = options.find_first_not_of(kWhitespace, end);
-  }
-  return false;
-}
-}  // namespace
-
-std::string AddAttachMode(std::string_view options, std::string_view attach_mode) {
-  std::string result(options);
-  if (SetsAttachMode(options)) return result;
-  if (!result.empty()) result += ' ';
-  result += "--attach_mode=";
-  result += attach_mode;
-  return result;
-}
 
 PostgresDatabase::PostgresDatabase() : open_connections_(0) {
   type_resolver_ = std::make_shared<PostgresTypeResolver>();
@@ -85,8 +56,18 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
   std::string output;
   if (std::strcmp(option, ADBC_POSTGRESQL_OPTION_USE_COPY) == 0) {
     output = use_copy_ ? ADBC_OPTION_VALUE_ENABLED : ADBC_OPTION_VALUE_DISABLED;
-  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
-    output = attach_mode_;
+  } else if (std::strcmp(option, "adbc.postgresql.type_resolver_mode") == 0) {
+    switch (type_resolver_mode_) {
+      case TypeResolverMode::kBuiltin:
+        output = "builtin";
+        break;
+      case TypeResolverMode::kServer:
+        output = "server";
+        break;
+      default:
+        InternalAdbcSetError(error, "[libpq] unknown type resolver mode");
+        return ADBC_STATUS_INTERNAL;
+    }
   } else {
     InternalAdbcSetError(error, "[libpq] unknown database option '%s'", option);
     return ADBC_STATUS_NOT_FOUND;
@@ -111,12 +92,35 @@ AdbcStatusCode PostgresDatabase::GetOptionDouble(const char* option, double* val
 }
 
 AdbcStatusCode PostgresDatabase::Init(struct AdbcError* error) {
-  // Fail fast on a bad URI or token
+  // Connect to initialize the version information and build the type table
   PGconn* conn = nullptr;
   RAISE_ADBC(Connect(&conn, error));
-  RAISE_ADBC(Disconnect(&conn, error));
 
-  Status status = SharedTypeResolver(&type_resolver_);
+  Status status = InitVersions(conn);
+  if (!status.ok()) {
+    RAISE_ADBC(Disconnect(&conn, nullptr));
+    return status.ToAdbc(error);
+  }
+
+  auto resolver = std::make_shared<PostgresTypeResolver>();
+  switch (type_resolver_mode_) {
+    case TypeResolverMode::kBuiltin: {
+      status = InitializeTypeResolver(*resolver);
+      break;
+    }
+    case TypeResolverMode::kServer: {
+      status = RebuildTypeResolver(conn, *resolver);
+      break;
+    }
+  }
+  if (!status.ok()) {
+    RAISE_ADBC(Disconnect(&conn, nullptr));
+    return status.ToAdbc(error);
+  }
+
+  type_resolver_ = std::move(resolver);
+
+  RAISE_ADBC(Disconnect(&conn, nullptr));
   return status.ToAdbc(error);
 }
 
@@ -143,22 +147,18 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
   } else if (std::strcmp(key, "adbc.postgresql.type_resolver_mode") == 0) {
-    // Accepted for compatibility with the PostgreSQL driver, but ignored. Warn once
-    // per process so connection pools don't repeat it.
-    // TODO(https://github.com/adbc-drivers/motherduck/issues/29): use a logger
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true)) {
-      std::fprintf(stderr,
-                   "[motherduck] warning: ignoring database option %s=%s; the driver "
-                   "always uses its built-in type table\n",
-                   key, value);
-    }
-  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
-    if (std::strcmp(value, "single") != 0 && std::strcmp(value, "workspace") != 0) {
+    if (std::strcmp(value, "auto") == 0) {
+      // TODO(https://github.com/apache/arrow-adbc/issues/4782): implement fallback mode
+      InternalAdbcSetError(error, "[libpq] %s=%s not yet supported", key, value);
+      return ADBC_STATUS_NOT_IMPLEMENTED;
+    } else if (std::strcmp(value, "builtin") == 0) {
+      type_resolver_mode_ = TypeResolverMode::kBuiltin;
+    } else if (std::strcmp(value, "server") == 0) {
+      type_resolver_mode_ = TypeResolverMode::kServer;
+    } else {
       InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    attach_mode_ = value;
   } else {
     InternalAdbcSetError(error, "%s%s", "[libpq] Unknown database option ", key);
     return ADBC_STATUS_NOT_IMPLEMENTED;
@@ -191,37 +191,7 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
         "[libpq] Must set database option 'uri' before creating a connection");
     return ADBC_STATUS_INVALID_STATE;
   }
-
-  char* parse_error = nullptr;
-  PQconninfoOption* conninfo = PQconninfoParse(uri_.c_str(), &parse_error);
-  if (conninfo == nullptr) {
-    InternalAdbcSetError(error, "%s%s", "[libpq] Failed to connect: ",
-                         parse_error ? parse_error : "out of memory");
-    PQfreemem(parse_error);
-    return ADBC_STATUS_IO;
-  }
-
-  // Merge attach_mode into the session options from the URI (or PGOPTIONS).
-  std::vector<const char*> keywords;
-  std::vector<const char*> values;
-  const char* options = std::getenv("PGOPTIONS");
-  for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
-    if (option->val == nullptr) continue;
-    if (std::strcmp(option->keyword, "options") == 0) {
-      options = option->val;
-      continue;
-    }
-    keywords.push_back(option->keyword);
-    values.push_back(option->val);
-  }
-  std::string session_options = AddAttachMode(options ? options : "", attach_mode_);
-  keywords.push_back("options");
-  values.push_back(session_options.c_str());
-  keywords.push_back(nullptr);
-  values.push_back(nullptr);
-
-  *conn = PQconnectdbParams(keywords.data(), values.data(), /*expand_dbname=*/0);
-  PQconninfoFree(conninfo);
+  *conn = PQconnectdb(uri_.c_str());
   if (PQstatus(*conn) != CONNECTION_OK) {
     InternalAdbcSetError(error, "%s%s",
                          "[libpq] Failed to connect: ", PQerrorMessage(*conn));
@@ -241,6 +211,76 @@ AdbcStatusCode PostgresDatabase::Disconnect(PGconn** conn, struct AdbcError* err
     return ADBC_STATUS_INTERNAL;
   }
   return ADBC_STATUS_OK;
+}
+
+namespace {
+
+// Parse an individual version in the form of "xxx.xxx.xxx".
+// If the version components aren't numeric, they will be zero.
+std::array<int, 3> ParseVersion(std::string_view version) {
+  std::array<int, 3> out{};
+  size_t component = 0;
+  size_t component_begin = 0;
+  size_t component_end = 0;
+
+  // While there are remaining version components and we haven't reached the end of the
+  // string
+  while (component_begin < version.size() && component < out.size()) {
+    // Find the next character that marks a version component separation or the end of the
+    // string
+    component_end = version.find_first_of(".-", component_begin);
+    if (component_end == version.npos) {
+      component_end = version.size();
+    }
+
+    // Try to parse the component as an integer (assigning zero if this fails)
+    int value = 0;
+    std::from_chars(version.data() + component_begin, version.data() + component_end,
+                    value);
+    out[component] = value;
+
+    // Move on to the next component
+    component_begin = component_end + 1;
+    component_end = component_begin;
+    component++;
+  }
+
+  return out;
+}
+
+// Parse the PostgreSQL version() string that looks like:
+// PostgreSQL 8.0.2 on i686-pc-linux-gnu, compiled by GCC gcc (GCC) 3.4.2 20041017 (Red
+// Hat 3.4.2-6.fc3), Redshift 1.0.77467
+std::array<int, 3> ParsePrefixedVersion(std::string_view version_info,
+                                        std::string_view prefix) {
+  size_t pos = version_info.find(prefix);
+  if (pos == version_info.npos) {
+    return {0, 0, 0};
+  }
+
+  // Skip the prefix and any leading whitespace
+  pos = version_info.find_first_not_of(' ', pos + prefix.size());
+  if (pos == version_info.npos) {
+    return {0, 0, 0};
+  }
+
+  return ParseVersion(version_info.substr(pos));
+}
+
+}  // namespace
+
+Status PostgresDatabase::InitVersions(PGconn* conn) {
+  PqResultHelper helper(conn, "SELECT version();");
+  UNWRAP_STATUS(helper.Execute());
+  if (helper.NumRows() != 1 || helper.NumColumns() != 1) {
+    return Status::Internal("Expected 1 row and 1 column for SELECT version(); but got ",
+                            helper.NumRows(), "/", helper.NumColumns());
+  }
+
+  std::string_view version_info = helper.Row(0)[0].value();
+  postgres_server_version_ = ParsePrefixedVersion(version_info, "PostgreSQL");
+
+  return Status::Ok();
 }
 
 }  // namespace adbcpq

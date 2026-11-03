@@ -22,22 +22,30 @@
 
 #pragma once
 
-#include <memory>
+#include <libpq-fe.h>
 
 #include "driver/framework/status.h"
 #include "postgres_type.h"
 
 namespace adbcpq {
 
-// MotherDuck's type OIDs are fixed, so a built-in table replaces querying pg_type.
-adbc::driver::Status InitializeTypeResolver(PostgresTypeResolver& resolver);
+enum class TypeResolverMode {
+  // Only use the built-in type OID definitions
+  kBuiltin,
+  // Query the database up front
+  kServer,
+};
 
-// The built-in table, built once and shared. Do not modify it.
-adbc::driver::Status SharedTypeResolver(std::shared_ptr<PostgresTypeResolver>* out);
+adbc::driver::Status RebuildTypeResolver(PGconn* conn, PostgresTypeResolver& resolver);
+adbc::driver::Status InitializeTypeResolver(PostgresTypeResolver& resolver);
 
 }  // namespace adbcpq
 
 // exposed for testing
+
+ADBC_EXPORT
+adbc::driver::Status InternalAdbcRebuildTypeResolver(
+    PGconn* conn, adbcpq::PostgresTypeResolver& resolver);
 
 ADBC_EXPORT
 adbc::driver::Status InternalAdbcInitializeTypeResolver(
