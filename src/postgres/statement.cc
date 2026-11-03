@@ -396,6 +396,17 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                                   PostgresType* copy_target_types,
                                                   bool* has_copy_target_types,
                                                   struct AdbcError* error) {
+  // Check every column name before running any DDL (e.g. the DROP for replace
+  // mode), so a bad schema can't leave the target table half-modified.
+  for (int64_t i = 0; i < source_schema.n_children; i++) {
+    if (source_schema.children[i]->name == nullptr) {
+      InternalAdbcSetError(
+          error, "[libpq] Cannot ingest column %" PRId64 ": column name must not be NULL",
+          i);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+  }
+
   PGconn* conn = connection_->conn();
   *has_copy_target_types = false;
 

@@ -28,6 +28,8 @@
 
 #include "connection.h"
 #include "error.h"
+#include "postgres_type.h"
+#include "statement.h"
 
 namespace adbcpq {
 
@@ -114,6 +116,37 @@ TEST(PostgresConnectionUnitTest, GetTableSchemaNullTableName) {
   EXPECT_NE(nullptr, std::strstr(error.message, "table_name must not be NULL"))
       << error.message;
   EXPECT_EQ(nullptr, schema.release);
+  if (error.release) error.release(&error);
+}
+
+TEST(PostgresStatementUnitTest, CreateBulkTableNullColumnName) {
+  struct ArrowSchema child0 = {};
+  child0.format = "i";
+  child0.name = "ok";
+  struct ArrowSchema child1 = {};
+  child1.format = "i";
+  child1.name = nullptr;
+  struct ArrowSchema* children[] = {&child0, &child1};
+  struct ArrowSchema source_schema = {};
+  source_schema.format = "+s";
+  source_schema.n_children = 2;
+  source_schema.children = children;
+
+  // The statement has no connection: the check must run before touching it.
+  PostgresStatement statement;
+  std::string escaped_table;
+  std::string escaped_field_list;
+  PostgresType copy_target_types;
+  bool has_copy_target_types = true;
+  struct AdbcError error = ADBC_ERROR_INIT;
+  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+            statement.CreateBulkTable("public", source_schema, &escaped_table,
+                                      &escaped_field_list, &copy_target_types,
+                                      &has_copy_target_types, &error));
+  ASSERT_NE(nullptr, error.message);
+  EXPECT_NE(nullptr, std::strstr(error.message, "column 1: column name must not be NULL"))
+      << error.message;
+  EXPECT_TRUE(escaped_table.empty());
   if (error.release) error.release(&error);
 }
 
