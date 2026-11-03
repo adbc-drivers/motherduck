@@ -76,30 +76,25 @@ inline int64_t ReadUnsafe(ArrowBufferView* data) {
   return static_cast<int64_t>(ReadUnsafe<uint64_t>(data));
 }
 
-template <typename T>
-ArrowErrorCode ReadChecked(ArrowBufferView* data, T* out, ArrowError* error) {
-  if (data->size_bytes < static_cast<int64_t>(sizeof(T))) {
-    ArrowErrorSet(error, "Unexpected end of input (expected %d bytes but found %ld)",
-                  static_cast<int>(sizeof(T)),
-                  static_cast<long>(data->size_bytes));  // NOLINT(runtime/int)
+// Check that data has at least n_bytes remaining before n_bytes are read
+// from it with ReadUnsafe() or copied out of it
+inline ArrowErrorCode CheckAvailable(const ArrowBufferView* data, int64_t n_bytes,
+                                     ArrowError* error) {
+  if (data->size_bytes < n_bytes) {
+    ArrowErrorSet(error,
+                  "Unexpected end of input (expected %" PRId64 " bytes but found %" PRId64
+                  ")",
+                  n_bytes, static_cast<int64_t>(data->size_bytes));
     return EINVAL;
   }
 
-  *out = ReadUnsafe<T>(data);
   return NANOARROW_OK;
 }
 
-// Check that data has at least field_size_bytes remaining before a fixed-width
-// field is read from it with ReadUnsafe()
-inline ArrowErrorCode CheckFieldAvailable(const ArrowBufferView* data,
-                                          int32_t field_size_bytes, ArrowError* error) {
-  if (data->size_bytes < static_cast<int64_t>(field_size_bytes)) {
-    ArrowErrorSet(error, "Expected at least %d bytes of field data but found %ld bytes",
-                  static_cast<int>(field_size_bytes),
-                  static_cast<long>(data->size_bytes));  // NOLINT(runtime/int)
-    return EINVAL;
-  }
-
+template <typename T>
+ArrowErrorCode ReadChecked(ArrowBufferView* data, T* out, ArrowError* error) {
+  NANOARROW_RETURN_NOT_OK(CheckAvailable(data, static_cast<int64_t>(sizeof(T)), error));
+  *out = ReadUnsafe<T>(data);
   return NANOARROW_OK;
 }
 
@@ -183,7 +178,7 @@ class PostgresCopyBooleanFieldReader : public PostgresCopyFieldReader {
       return EINVAL;
     }
 
-    NANOARROW_RETURN_NOT_OK(CheckFieldAvailable(data, field_size_bytes, error));
+    NANOARROW_RETURN_NOT_OK(CheckAvailable(data, field_size_bytes, error));
 
     int64_t bytes_required = _ArrowBytesForBits(array->length + 1);
     if (bytes_required > data_->size_bytes) {
@@ -219,7 +214,7 @@ class PostgresCopyNetworkEndianFieldReader : public PostgresCopyFieldReader {
       return EINVAL;
     }
 
-    NANOARROW_RETURN_NOT_OK(CheckFieldAvailable(data, field_size_bytes, error));
+    NANOARROW_RETURN_NOT_OK(CheckAvailable(data, field_size_bytes, error));
 
     T value = kOffset + ReadUnsafe<T>(data);
     NANOARROW_RETURN_NOT_OK(ArrowBufferAppend(data_, &value, sizeof(T)));
@@ -243,7 +238,7 @@ class PostgresCopyIntervalFieldReader : public PostgresCopyFieldReader {
       return EINVAL;
     }
 
-    NANOARROW_RETURN_NOT_OK(CheckFieldAvailable(data, field_size_bytes, error));
+    NANOARROW_RETURN_NOT_OK(CheckAvailable(data, field_size_bytes, error));
 
     // postgres stores time as usec, arrow stores as ns
     const int64_t time_usec = ReadUnsafe<int64_t>(data);
@@ -289,27 +284,35 @@ class PostgresCopyNumericFieldReader : public PostgresCopyFieldReader {
       return ArrowArrayAppendNull(array, 1);
     }
 
-    // Read the input
-    if (data->size_bytes < static_cast<int64_t>(4 * sizeof(int16_t))) {
+    // The field is an 8-byte header (ndigits, weight, sign, dscale) followed
+    // by ndigits int16_t digits
+    constexpr int32_t kHeaderBytes = 4 * sizeof(int16_t);
+    if (field_size_bytes < kHeaderBytes) {
       ArrowErrorSet(error,
-                    "Expected at least %d bytes of field data for numeric copy data but "
-                    "only %d bytes of input remain",
-                    static_cast<int>(4 * sizeof(int16_t)),
-                    static_cast<int>(data->size_bytes));  // NOLINT(runtime/int)
+                    "Expected numeric field with at least %d bytes but found field "
+                    "with %d bytes",
+                    static_cast<int>(kHeaderBytes), static_cast<int>(field_size_bytes));
       return EINVAL;
     }
+
+    NANOARROW_RETURN_NOT_OK(CheckAvailable(data, field_size_bytes, error));
 
     int16_t ndigits = ReadUnsafe<int16_t>(data);
     int16_t weight = ReadUnsafe<int16_t>(data);
     uint16_t sign = ReadUnsafe<uint16_t>(data);
     uint16_t dscale = ReadUnsafe<uint16_t>(data);
 
-    if (data->size_bytes < static_cast<int64_t>(ndigits * sizeof(int16_t))) {
+    // Reading exactly the declared field size keeps the digits from running
+    // into the next field
+    const int64_t expected_size_bytes =
+        kHeaderBytes +
+        static_cast<int64_t>(ndigits) * static_cast<int64_t>(sizeof(int16_t));
+    if (ndigits < 0 || expected_size_bytes != field_size_bytes) {
       ArrowErrorSet(error,
-                    "Expected at least %d bytes of field data for numeric digits copy "
-                    "data but only %d bytes of input remain",
-                    static_cast<int>(ndigits * sizeof(int16_t)),
-                    static_cast<int>(data->size_bytes));  // NOLINT(runtime/int)
+                    "Expected numeric field with %d digits to have %" PRId64
+                    " bytes but found field with %d bytes",
+                    static_cast<int>(ndigits), expected_size_bytes,
+                    static_cast<int>(field_size_bytes));
       return EINVAL;
     }
 
@@ -528,6 +531,13 @@ class PostgresCopyJsonbFieldReader : public PostgresCopyFieldReader {
     // -1 for NULL (0 would be empty string)
     if (field_size_bytes < 0) {
       return ArrowArrayAppendNull(array, 1);
+    }
+
+    // The version byte is part of the field; without it the payload size
+    // below would be negative
+    if (field_size_bytes < 1) {
+      ArrowErrorSet(error, "Expected JSONB field with at least 1 byte but found 0 bytes");
+      return EINVAL;
     }
 
     if (field_size_bytes > data->size_bytes) {

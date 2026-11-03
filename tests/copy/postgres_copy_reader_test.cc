@@ -677,6 +677,7 @@ TEST(PostgresCopyUtilsTest, PostgresCopyReadJsonb) {
   input_type.AppendChild("col", col_type);
 
   struct ArrowError error;
+  ArrowErrorInit(&error);
   PostgresCopyStreamTester tester;
   ASSERT_EQ(tester.Init(input_type), NANOARROW_OK);
   ASSERT_EQ(tester.ReadAll(&data, &error), ENODATA) << error.message;
@@ -817,6 +818,7 @@ TEST(PostgresCopyUtilsTest, PostgresCopyReadInt2vector) {
 
   PostgresCopyStreamTester tester;
   ArrowError error;
+  ArrowErrorInit(&error);
   ASSERT_EQ(tester.Init(input_type, &error), NANOARROW_OK) << error.message;
   ASSERT_EQ(tester.ReadAll(&data), ENODATA);
   ASSERT_EQ(data.data.as_uint8 - kTestPgCopyInt2vector, sizeof(kTestPgCopyInt2vector));
@@ -981,16 +983,19 @@ TEST(PostgresCopyUtilsTest, JsonbOverflow) {
 }
 
 // A row whose last fixed-width field claims more bytes than remain in the
-// buffer must fail instead of reading past the end of it. Each test points at
-// a valid fixture but cuts size_bytes short partway through the first row, so
-// the bytes past the cut are still owned by the test.
+// buffer must fail instead of reading past the end of it. Each truncation test
+// points at a valid fixture but cuts size_bytes short partway through the first
+// row, so the bytes past the cut are still owned by the test.
 
 // Fixture offset of the first field's data: header (19 bytes), field count
 // (2 bytes), field length (4 bytes)
 constexpr int64_t kFirstFieldDataOffset = 25;
 
-void ExpectTruncatedRecordFails(const PostgresType& col_type, const uint8_t* buffer,
-                                int64_t size_bytes) {
+// Fixture offset of the low byte of the first field's length
+constexpr size_t kFirstFieldLengthLowByte = kFirstFieldDataOffset - 1;
+
+void ExpectRecordFails(const PostgresType& col_type, const uint8_t* buffer,
+                       int64_t size_bytes, const std::string& expected_message) {
   PostgresType input_type(PostgresTypeId::kRecord);
   input_type.AppendChild("col", col_type);
 
@@ -1004,10 +1009,28 @@ void ExpectTruncatedRecordFails(const PostgresType& col_type, const uint8_t* buf
   data.size_bytes = size_bytes;
 
   ArrowError error;
-  ASSERT_EQ(reader.ReadHeader(&data, &error), NANOARROW_OK);
+  ArrowErrorInit(&error);
+  ASSERT_EQ(reader.ReadHeader(&data, &error), NANOARROW_OK) << error.message;
   ASSERT_EQ(reader.ReadRecord(&data, &error), EINVAL);
-  ASSERT_NE(std::string(error.message).find("Expected at least"), std::string::npos)
+  ASSERT_NE(std::string(error.message).find(expected_message), std::string::npos)
       << error.message;
+}
+
+void ExpectTruncatedRecordFails(const PostgresType& col_type, const uint8_t* buffer,
+                                int64_t size_bytes) {
+  ExpectRecordFails(col_type, buffer, size_bytes, "Unexpected end of input");
+}
+
+// Copy a fixture and overwrite the declared length of its first field (which
+// is always less than 256 in these fixtures)
+template <size_t N>
+std::vector<uint8_t> WithFirstFieldLength(const uint8_t (&fixture)[N], uint8_t length) {
+  std::vector<uint8_t> out(fixture, fixture + N);
+  EXPECT_EQ(out[kFirstFieldLengthLowByte - 3], 0);
+  EXPECT_EQ(out[kFirstFieldLengthLowByte - 2], 0);
+  EXPECT_EQ(out[kFirstFieldLengthLowByte - 1], 0);
+  out[kFirstFieldLengthLowByte] = length;
+  return out;
 }
 
 TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedBoolean) {
@@ -1015,9 +1038,29 @@ TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedBoolean) {
                              kFirstFieldDataOffset);
 }
 
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedSmallInt) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt2), kTestPgCopySmallInt,
+                             kFirstFieldDataOffset + 1);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedInteger) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt4), kTestPgCopyInteger,
+                             kFirstFieldDataOffset + 2);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedReal) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kFloat4), kTestPgCopyReal,
+                             kFirstFieldDataOffset + 3);
+}
+
 TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedBigInt) {
   ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt8), kTestPgCopyBigInt,
                              kFirstFieldDataOffset + 3);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedDoublePrecision) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kFloat8),
+                             kTestPgCopyDoublePrecision, kFirstFieldDataOffset + 7);
 }
 
 TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedInterval) {
@@ -1029,6 +1072,46 @@ TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedArrayElement) {
   // The first array is 36 bytes; cut the last 2 bytes of its last element
   ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt4).Array(),
                              kTestPgCopyIntegerArray, kFirstFieldDataOffset + 36 - 2);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedNumeric) {
+  // The first numeric is 10 bytes (8-byte header + 1 digit); cut it after the
+  // header
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kNumeric), kTestPgCopyNumeric,
+                             kFirstFieldDataOffset + 8);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadNumericDeclaredLengthTooShort) {
+  // The first numeric has one digit (10 bytes). Declaring 8 bytes would make
+  // its digit come out of the next field's length.
+  auto buffer = WithFirstFieldLength(kTestPgCopyNumeric, 8);
+  ExpectRecordFails(PostgresType(PostgresTypeId::kNumeric), buffer.data(),
+                    static_cast<int64_t>(buffer.size()),
+                    "Expected numeric field with 1 digits to have 10 bytes but found "
+                    "field with 8 bytes");
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadNumericDeclaredLengthTooLong) {
+  auto buffer = WithFirstFieldLength(kTestPgCopyNumeric, 12);
+  ExpectRecordFails(PostgresType(PostgresTypeId::kNumeric), buffer.data(),
+                    static_cast<int64_t>(buffer.size()),
+                    "Expected numeric field with 1 digits to have 10 bytes but found "
+                    "field with 12 bytes");
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadNumericShorterThanHeader) {
+  auto buffer = WithFirstFieldLength(kTestPgCopyNumeric, 4);
+  ExpectRecordFails(PostgresType(PostgresTypeId::kNumeric), buffer.data(),
+                    static_cast<int64_t>(buffer.size()),
+                    "Expected numeric field with at least 8 bytes");
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadJsonbEmptyField) {
+  // A JSONB field must include its version byte
+  auto buffer = WithFirstFieldLength(kTestPgCopyJsonb, 0);
+  ExpectRecordFails(PostgresType(PostgresTypeId::kJsonb), buffer.data(),
+                    static_cast<int64_t>(buffer.size()),
+                    "Expected JSONB field with at least 1 byte");
 }
 
 // N.B. unfortunately testing with NUMERIC is difficult since we can't add all
