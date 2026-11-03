@@ -100,11 +100,16 @@ to fail.
   aren't available because the endpoint rejects `CREATE TEMP TABLE`.
 - **COPY result reads** fail: the endpoint rejects binary
   `COPY ... TO STDOUT`, so set `adbc.postgresql.use_copy` to `false` (#11).
-  The non-COPY path ignores `adbc.postgresql.batch_size_hint_bytes`.
+  The non-COPY path fetches the whole result at once, so it ignores
+  `adbc.postgresql.batch_size_hint_bytes`, the connection reports idle in
+  a transaction rather than active while you read (#11), and a running
+  query can't be cancelled (#48).
 - **Parameterized queries** fail or return wrong results (#17), and
   `GetParameterSchema` fails on queries whose result types the endpoint
   can't infer.
-- **Rows affected** is wrong for `DELETE` (#19).
+- **Rows affected** is wrong for `DELETE` (#19), and is the row count rather
+  than -1 for a `SELECT` on the non-COPY path (#50). `ExecuteQuery` on an
+  `INSERT` also returns the endpoint's `Count` row as a batch (#49).
 - **Metadata:** `GetObjects` and the current catalog don't reflect MotherDuck
   databases and schemas (#14), `GetTableSchema` fails its `$1::regclass`
   lookup (#13), `GetInfo` reports PostgreSQL and queries
