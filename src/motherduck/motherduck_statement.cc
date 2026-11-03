@@ -50,8 +50,10 @@ Status MotherduckResultReader::ExecuteAll(int64_t* affected_rows) {
       UNWRAP_STATUS(bind_stream_->ReconcileWithExpectedTypes(expected_types));
     }
 
-    UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
-    UNWRAP_STATUS(helper_.Prepare(bind_stream_->param_types));
+    // SetParamTypes() may begin a transaction, so from here on errors abort.
+    UNWRAP_STATUS(AbortBindOnError(
+        bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_)));
+    UNWRAP_STATUS(AbortBindOnError(helper_.Prepare(bind_stream_->param_types)));
 
     // Send every row through one pipeline instead of waiting on each in turn.
     // The rows share one sync, so they run in one implicit transaction.

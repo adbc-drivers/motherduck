@@ -166,7 +166,9 @@ The upstream files still differ from Apache's in these ways:
 - A failed bound row rolls back the transaction begun to set the time zone
   (`BindStream::Abort()`); upstream leaves it open. With autocommit off,
   `Abort()` instead restores the time zone, unless the user's transaction has
-  failed. Every error while executing bound rows calls `Abort()`. This is a
+  failed. Every error from `SetParamTypes()` onward while executing bound
+  rows calls `Abort()` (`PqResultArrayReader::AbortBindOnError()`), so the
+  transaction `SetParamTypes()` may begin isn't left open. This is a
   candidate to contribute upstream, as is the `SerializeCurrentRow()` split.
 - `PqResultArrayReader` checks that each bound row's result has the first
   result's column count and types (`CheckResultMatches()`) before decoding it

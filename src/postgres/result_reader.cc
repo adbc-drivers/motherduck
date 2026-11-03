@@ -186,10 +186,12 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
     }
 
     // Now set parameter types (will use reconciled types for NA fields)
-    UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
+    // SetParamTypes() may begin a transaction, so from here on errors abort.
+    UNWRAP_STATUS(AbortBindOnError(
+        bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_)));
 
     // Re-prepare with the actual parameter types
-    UNWRAP_STATUS(helper_.Prepare(bind_stream_->param_types));
+    UNWRAP_STATUS(AbortBindOnError(helper_.Prepare(bind_stream_->param_types)));
 
     UNWRAP_STATUS(BindNextAndExecute(nullptr));
 
@@ -278,7 +280,9 @@ Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
   // Otherwise, execute until we have a result to return. We need this to provide row
   // counts for DELETE and CREATE TABLE queries as well as to provide more informative
   // errors until this reader class is wired up to provide extended AdbcError information.
-  UNWRAP_STATUS(Initialize(affected_rows));
+  // Building the schema can fail after the first row ran, with the bind
+  // stream's transaction still open.
+  UNWRAP_STATUS(AbortBindOnError(Initialize(affected_rows)));
 
   nanoarrow::ArrayStreamFactory<PqResultArrayReader>::InitArrayStream(
       new PqResultArrayReader(this), out);
@@ -289,21 +293,13 @@ Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
 Status PqResultArrayReader::BindNextAndExecute(int64_t* affected_rows) {
   // Keep pulling from the bind stream and executing as long as
   // we receive results with zero rows.
-  // On any error, undo what the bind stream set up (BindStream::Abort()) and
-  // drop it, so a retry doesn't run more rows.
-  auto abort = [this](Status status) {
-    bind_stream_->Abort(conn_);
-    bind_stream_.reset();
-    return status;
-  };
-
   do {
     Status status = bind_stream_->EnsureNextRow();
-    if (!status.ok()) return abort(std::move(status));
+    if (!status.ok()) return AbortBindOnError(std::move(status));
 
     if (!bind_stream_->current->release) {
       status = bind_stream_->Cleanup(conn_);
-      if (!status.ok()) return abort(std::move(status));
+      if (!status.ok()) return AbortBindOnError(std::move(status));
       bind_stream_.reset();
       return Status::Ok();
     }
@@ -312,7 +308,7 @@ Status PqResultArrayReader::BindNextAndExecute(int64_t* affected_rows) {
     bind_row_++;
     status = bind_stream_->BindAndExecuteCurrentRow(conn_, &result,
                                                     /*result_format*/ kPgBinaryFormat);
-    if (!status.ok()) return abort(std::move(status));
+    if (!status.ok()) return AbortBindOnError(std::move(status));
     helper_.SetResult(result);
     if (affected_rows) {
       (*affected_rows) += helper_.AffectedRows();
@@ -341,8 +337,10 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
       UNWRAP_STATUS(bind_stream_->ReconcileWithExpectedTypes(expected_types));
     }
 
-    UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
-    UNWRAP_STATUS(helper_.Prepare(bind_stream_->param_types));
+    // SetParamTypes() may begin a transaction, so from here on errors abort.
+    UNWRAP_STATUS(AbortBindOnError(
+        bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_)));
+    UNWRAP_STATUS(AbortBindOnError(helper_.Prepare(bind_stream_->param_types)));
 
     // Reset affected rows to zero before binding and executing any
     if (affected_rows) {

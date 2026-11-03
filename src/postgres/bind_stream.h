@@ -160,9 +160,11 @@ struct BindStream {
       // tz-aware timestamps require special handling to set the timezone to UTC
       // prior to sending over the binary protocol; must be reset after execute
       if (!has_tz_field && type.type_id() == PostgresTypeId::kTimestamptz) {
-        UNWRAP_STATUS(SetDatabaseTimezoneUTC(pg_conn, autocommit));
+        // Set these first, so Abort() undoes a transaction begun before a
+        // later step failed.
         has_tz_field = true;
         this->autocommit = autocommit;
+        UNWRAP_STATUS(SetDatabaseTimezoneUTC(pg_conn, autocommit));
       }
 
       std::unique_ptr<PostgresCopyFieldWriter> writer;
@@ -323,7 +325,7 @@ struct BindStream {
     if (autocommit) {
       PqResultHelper rollback(pg_conn, "ROLLBACK");
       (void)rollback.Execute();
-    } else if (PQtransactionStatus(pg_conn) != PQTRANS_INERROR) {
+    } else if (!tz_setting.empty() && PQtransactionStatus(pg_conn) != PQTRANS_INERROR) {
       (void)RestoreTimezone(pg_conn);
     }
   }
