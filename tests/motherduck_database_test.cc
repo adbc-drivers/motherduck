@@ -313,8 +313,9 @@ TEST_F(MotherDuckConnectParamsTest, TokenAlias) {
   // It's the same option, so the last one set wins.
   SetOption(ADBC_OPTION_PASSWORD, "password");
   EXPECT_THAT(Values("password"), ::testing::ElementsAre("password"));
-  EXPECT_THAT(database_.GetOption(ADBC_MOTHERDUCK_OPTION_TOKEN, nullptr, nullptr, &error_),
-              IsStatus(ADBC_STATUS_NOT_FOUND, &error_));
+  EXPECT_THAT(
+      database_.GetOption(ADBC_MOTHERDUCK_OPTION_TOKEN, nullptr, nullptr, &error_),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error_));
 }
 
 TEST_F(MotherDuckConnectParamsTest, UserDefaultsToPostgres) {
