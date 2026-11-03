@@ -95,7 +95,8 @@ The MotherDuck token is the connection's password. The driver takes it from,
 in order: the standard ADBC `password` database option (or its alias,
 `adbc.motherduck.token`), a password in the URI, and the `MOTHERDUCK_TOKEN`
 environment variable. It always passes the token to libpq, so `PGPASSWORD` and
-password files (`~/.pgpass`, `PGPASSFILE`) are never used. Without a token, connecting fails with `UNAUTHENTICATED`.
+password files (`~/.pgpass`, `PGPASSFILE`) are never used. Without a token,
+connecting fails with `UNAUTHENTICATED`.
 
 The user is `postgres`, which MotherDuck's endpoint expects, so the URI can
 leave it out. The standard ADBC `username` database option, then a user in the
@@ -164,6 +165,49 @@ name `MotherDuck`. The driver still reports itself as PostgreSQL (#15), so the
 vendor check fails until that's fixed. Published validation documentation will
 be configured separately.
 
+## Code layout
+
+The upstream driver's sources in `src/postgres/` are kept as close to
+Apache's as possible, so upstream fixes merge cleanly. MotherDuck behavior
+lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
+
+- `motherduck_database`: `MotherduckDatabase`, which adds `attach_mode`,
+  `session_name`, `region`, and the token and user handling described under
+  Options, ignores `adbc.postgresql.type_resolver_mode`, uses the built-in type table
+  instead of reading the server's, and reports the MotherDuck driver name and
+  version.
+- `motherduck_connection`: `MotherduckConnection`, which leaves the vendor
+  version out of `GetInfo` rather than report the endpoint's PostgreSQL
+  `server_version_num`.
+- `motherduck_statement`: `MotherduckStatement`, which accepts the result sets
+  MotherDuck returns for DDL, and `MotherduckResultReader`, which runs queries
+  without a result through a pipeline.
+- `motherduck_pipeline`: pipelined execution and splitting multi-statement
+  queries.
+- `motherduck_type_resolver`: DuckDB-only type OIDs.
+- `motherduck_factory`: the subclasses `postgresql.cc` creates.
+- `motherduck.cc`: the `AdbcDriverMotherduckInit` entry point.
+
+The upstream files still differ from Apache's in these ways:
+
+- Every file starts with the modification notice described below, and
+  includes use paths relative to `src/postgres/`.
+- Hooks for the subclasses: `virtual` methods and `protected` members in
+  `PostgresDatabase`, `PostgresConnection`, `PostgresStatement`, and
+  `PqResultArrayReader`;
+  `DriverName()` and `DriverVersion()`, which `GetInfo` reports; and the
+  factory calls in `postgresql.cc`.
+- `BindStream::SerializeCurrentRow()` is split out of
+  `BindAndExecuteCurrentRow()` so rows can also be sent in a pipeline.
+- A failed bound row rolls back the transaction begun to set the time zone
+  (`BindStream::Abort()`); upstream leaves it open. This is a candidate to
+  contribute upstream, as is the `SerializeCurrentRow()` split.
+
+When merging from upstream, keep these differences and put new MotherDuck
+behavior in `src/motherduck/`. MotherDuck's own tests are in
+`tests/motherduck_*_test.cc`; upstream tests that don't apply are skipped
+through `MOTHERDUCK_SKIPPED_UPSTREAM_TESTS` in `tests/CMakeLists.txt`.
+
 ## Upstream history and licensing
 
 The fork was extracted from `apache/arrow-adbc` at
@@ -171,8 +215,9 @@ The fork was extracted from `apache/arrow-adbc` at
 for the driver and its bundled Apache dependencies. The original driver
 history begins with the libpq implementation on 2022-08-26. Historical paths
 `c/drivers/postgres/`, `c/driver/postgres/`, and `c/driver/postgresql/` are all
-included. Driver sources are now in `src/`, C++ tests in `tests/`, and shared
-Apache code in `third_party/arrow-adbc/`.
+included. The extraction puts driver sources in `src/` (since moved to
+`src/postgres/`), C++ tests in `tests/`, and shared Apache code in
+`third_party/arrow-adbc/`.
 
 To reproduce the extraction in a fresh, full-history clone of Apache Arrow ADBC
 checked out at that commit, use this repository's `ci/upstream-paths.txt`:

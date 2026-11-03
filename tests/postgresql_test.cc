@@ -50,7 +50,8 @@
 #include "adbc_driver_motherduck_config.h"
 #include "common/options.h"
 #include "common/utils.h"
-#include "database.h"
+#include "motherduck_database.h"
+#include "motherduck_test_util.h"
 #include "validation/adbc_validation.h"
 #include "validation/adbc_validation_util.h"
 
@@ -434,36 +435,6 @@ TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
               IsStatus(ADBC_STATUS_IO, &error));
 }
 
-// Sets an environment variable for the life of the object, then restores it.
-// On Windows, the CRT can't hold an empty variable (_putenv_s with "" removes
-// it), so an empty value is set, and restored, as unset. The driver treats an
-// empty MOTHERDUCK_TOKEN as unset, so the tests don't depend on the difference.
-class ScopedEnv {
- public:
-  ScopedEnv(const char* name, const char* value) : name_(name) {
-    const char* old = std::getenv(name);
-    if (old) old_ = old;
-    Set(value);
-  }
-  ~ScopedEnv() { Set(old_ ? old_->c_str() : nullptr); }
-
- private:
-  void Set(const char* value) {
-#ifdef _WIN32
-    _putenv_s(name_.c_str(), value ? value : "");
-#else
-    if (value) {
-      setenv(name_.c_str(), value, 1);
-    } else {
-      unsetenv(name_.c_str());
-    }
-#endif
-  }
-
-  std::string name_;
-  std::optional<std::string> old_;
-};
-
 // A uniquely named file in the temp directory, removed when the object is.
 class ScopedTempFile {
  public:
@@ -658,330 +629,6 @@ TEST_F(PostgresDatabaseTest, AdbcDriverBackwardsCompatibility) {
               IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
 }
 
-TEST(MotherDuckAttachModeTest, OptionDefault) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
-              ::testing::Optional("single"s));
-}
-
-TEST(MotherDuckAttachModeTest, OptionSetGet) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const std::string value : {"workspace", "single"}) {
-    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
-                                      value.c_str(), &error),
-                IsOkStatus(&error));
-    EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                    &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
-                ::testing::Optional(value));
-  }
-}
-
-TEST(MotherDuckAttachModeTest, OptionInvalid) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* value : {"", "SINGLE", "multi"}) {
-    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
-                                      value, &error),
-                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    if (error.release) error.release(&error);
-  }
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
-              ::testing::Optional("single"s));
-}
-
-TEST(MotherDuckAttachModeTest, AddSessionOption) {
-  EXPECT_EQ("--attach_mode=single",
-            adbcpq::AddSessionOption("", "attach_mode", "single"));
-  EXPECT_EQ("--session_name=x --attach_mode=workspace",
-            adbcpq::AddSessionOption("--session_name=x", "attach_mode", "workspace"));
-  // Options from the URI win.
-  for (const char* options :
-       {"--attach_mode=workspace", "-c attach_mode=workspace", "-cattach_mode=workspace",
-        "--attach-mode=workspace", "-c attach-mode=workspace"}) {
-    EXPECT_EQ(options, adbcpq::AddSessionOption(options, "attach_mode", "single"));
-  }
-  // Other options that mention attach_mode don't count.
-  EXPECT_EQ(
-      "--session_name=attach_mode=x --attach_mode=single",
-      adbcpq::AddSessionOption("--session_name=attach_mode=x", "attach_mode", "single"));
-  EXPECT_EQ(
-      "--session_name=attach_mode --attach_mode=single",
-      adbcpq::AddSessionOption("--session_name=attach_mode", "attach_mode", "single"));
-  EXPECT_EQ("--session_name=a\\ attach_mode=x --attach_mode=single",
-            adbcpq::AddSessionOption("--session_name=a\\ attach_mode=x", "attach_mode",
-                                     "single"));
-  // A bare <name>=<value> isn't a setting unless it follows -c.
-  EXPECT_EQ("attach_mode=x --attach_mode=single",
-            adbcpq::AddSessionOption("attach_mode=x", "attach_mode", "single"));
-  EXPECT_EQ("-c foo=1 attach_mode=x --attach_mode=single",
-            adbcpq::AddSessionOption("-c foo=1 attach_mode=x", "attach_mode", "single"));
-}
-
-// The status of getting a database option, for options that may be unset.
-AdbcStatusCode GetOptionStatus(struct AdbcDatabase* database, const char* key,
-                               struct AdbcError* error) {
-  char buffer[128];
-  size_t length = sizeof(buffer);
-  return AdbcDatabaseGetOption(database, key, buffer, &length, error);
-}
-
-TEST(MotherDuckSessionNameTest, OptionSetGet) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  EXPECT_THAT(
-      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME, &error),
-      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  if (error.release) error.release(&error);
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME,
-                                    "user123", &error),
-              IsOkStatus(&error));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME, &error),
-              ::testing::Optional("user123"s));
-  // An empty value unsets it.
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME,
-                                    "", &error),
-              IsOkStatus(&error));
-  EXPECT_THAT(
-      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME, &error),
-      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  if (error.release) error.release(&error);
-}
-
-TEST(MotherDuckSessionNameTest, OptionInvalid) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* value : {"a b", "a\tb", "a\\b"}) {
-    EXPECT_THAT(AdbcDatabaseSetOption(&database.value,
-                                      ADBC_MOTHERDUCK_OPTION_SESSION_NAME, value, &error),
-                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    if (error.release) error.release(&error);
-  }
-  EXPECT_THAT(
-      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME, &error),
-      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  EXPECT_THAT(error.message, ::testing::HasSubstr("is not set"));
-  if (error.release) error.release(&error);
-}
-
-TEST(MotherDuckRegionTest, RegionHost) {
-  EXPECT_EQ("pg.us-east-1-aws.motherduck.com", adbcpq::RegionHost("us-east-1"));
-  EXPECT_EQ("pg.eu-central-1-aws.motherduck.com", adbcpq::RegionHost("eu-central-1"));
-  // A region can name its cloud.
-  EXPECT_EQ("pg.us-east-1-aws.motherduck.com", adbcpq::RegionHost("us-east-1-aws"));
-  EXPECT_EQ("pg.us-central1-gcp.motherduck.com", adbcpq::RegionHost("us-central1-gcp"));
-}
-
-TEST(MotherDuckRegionTest, OptionSetGet) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_REGION, &error),
-              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  if (error.release) error.release(&error);
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
-                                    "us-west-2", &error),
-              IsOkStatus(&error));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(&database.value,
-                                                 ADBC_MOTHERDUCK_OPTION_REGION, &error),
-              ::testing::Optional("us-west-2"s));
-  // An empty value unsets it.
-  ASSERT_THAT(
-      AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION, "", &error),
-      IsOkStatus(&error));
-  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_REGION, &error),
-              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  if (error.release) error.release(&error);
-}
-
-TEST(MotherDuckRegionTest, OptionInvalid) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* value :
-       {"US-EAST-1", "us east 1", "us-east-1.example.com", "us-east-1/x", "us_east_1",
-        "-", "--", "-us-east-1", "us-east-1-", "us--east-1", "aws", "useast", "useast1",
-        "us-east",
-        "us-\xe9"
-        "ast-1"}) {
-    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
-                                      value, &error),
-                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    if (error.release) error.release(&error);
-  }
-  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_REGION, &error),
-              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  if (error.release) error.release(&error);
-}
-
-TEST(MotherDuckRegionTest, ConflictsWithHost) {
-  // Fails before connecting, so this needs no server.
-  for (const char* uri :
-       {"postgresql://postgres@localhost:1/db", "host=localhost dbname=db",
-        "hostaddr=127.0.0.1 dbname=db", "dbname=db"}) {
-    // Without a host in the URI, PGHOSTADDR conflicts.
-    ScopedEnv pghostaddr("PGHOSTADDR",
-                         std::strcmp(uri, "dbname=db") == 0 ? "127.0.0.1" : nullptr);
-    struct AdbcError error = {};
-    adbc_validation::Handle<struct AdbcDatabase> database;
-    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", uri, &error),
-                IsOkStatus(&error));
-    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
-                                      "us-east-1", &error),
-                IsOkStatus(&error));
-    EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
-                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    EXPECT_THAT(error.message, ::testing::HasSubstr("not both"));
-    if (error.release) error.release(&error);
-  }
-}
-
-TEST(MotherDuckUsernameTest, OptionSetGet) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_USERNAME, &error),
-              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  if (error.release) error.release(&error);
-  ASSERT_THAT(
-      AdbcDatabaseSetOption(&database.value, ADBC_OPTION_USERNAME, "postgres", &error),
-      IsOkStatus(&error));
-  EXPECT_THAT(
-      adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
-      ::testing::Optional("postgres"s));
-}
-
-TEST(MotherDuckPasswordTest, RequiresToken) {
-  // Fails before connecting, so this needs no server.
-  ScopedEnv pgpassword("PGPASSWORD", "token");
-  ScopedEnv motherduck_token("MOTHERDUCK_TOKEN", nullptr);
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri",
-                                    "postgresql://postgres@localhost:1/db", &error),
-              IsOkStatus(&error));
-  EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
-              IsStatus(ADBC_STATUS_UNAUTHENTICATED, &error));
-  EXPECT_THAT(error.message, ::testing::HasSubstr("No MotherDuck token"));
-  if (error.release) error.release(&error);
-}
-
-TEST(MotherDuckPasswordTest, OptionNotReadable) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(
-      AdbcDatabaseSetOption(&database.value, ADBC_OPTION_PASSWORD, "secret", &error),
-      IsOkStatus(&error));
-  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_PASSWORD, &error),
-              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  EXPECT_THAT(error.message, ::testing::HasSubstr("can't be read"));
-  if (error.release) error.release(&error);
-}
-
-// The libpq parameters Connect would pass, for a database with the given URI
-// and options. Needs no server.
-class MotherDuckConnectParamsTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    ASSERT_THAT(database_.SetOption(ADBC_OPTION_PASSWORD, "token", &error_),
-                IsOkStatus(&error_));
-  }
-  void TearDown() override {
-    if (error_.release) error_.release(&error_);
-  }
-
-  void SetOption(const char* key, const char* value) {
-    ASSERT_THAT(database_.SetOption(key, value, &error_), IsOkStatus(&error_));
-  }
-
-  // Every value passed for keyword, in order.
-  std::vector<std::string> Values(const char* keyword) {
-    std::vector<std::pair<std::string, std::string>> params;
-    EXPECT_THAT(database_.ConnectParams(&params, &error_), IsOkStatus(&error_));
-    std::vector<std::string> values;
-    for (const auto& [key, value] : params) {
-      if (key == keyword) values.push_back(value);
-    }
-    return values;
-  }
-
-  ScopedEnv pgoptions_{"PGOPTIONS", nullptr};
-  ScopedEnv pgsslmode_{"PGSSLMODE", nullptr};
-  ScopedEnv pguser_{"PGUSER", "someone"};
-  adbcpq::PostgresDatabase database_;
-  struct AdbcError error_ = {};
-};
-
-TEST_F(MotherDuckConnectParamsTest, TokenAlias) {
-  SetOption("uri", "postgresql://localhost/db?password=uri");
-  SetOption(ADBC_MOTHERDUCK_OPTION_TOKEN, "alias");
-  EXPECT_THAT(Values("password"), ::testing::ElementsAre("alias"));
-  // It's the same option, so the last one set wins.
-  SetOption(ADBC_OPTION_PASSWORD, "password");
-  EXPECT_THAT(Values("password"), ::testing::ElementsAre("password"));
-  EXPECT_THAT(database_.GetOption(ADBC_MOTHERDUCK_OPTION_TOKEN, nullptr, nullptr, &error_),
-              IsStatus(ADBC_STATUS_NOT_FOUND, &error_));
-}
-
-TEST_F(MotherDuckConnectParamsTest, UserDefaultsToPostgres) {
-  SetOption("uri", "postgresql://localhost/db");
-  EXPECT_THAT(Values("user"), ::testing::ElementsAre("postgres"));
-}
-
-TEST_F(MotherDuckConnectParamsTest, UriUser) {
-  SetOption("uri", "postgresql://alice@localhost/db");
-  EXPECT_THAT(Values("user"), ::testing::ElementsAre("alice"));
-}
-
-TEST_F(MotherDuckConnectParamsTest, UsernameReplacesUriUser) {
-  SetOption("uri", "postgresql://alice@localhost/db");
-  SetOption(ADBC_OPTION_USERNAME, "bob");
-  EXPECT_THAT(Values("user"), ::testing::ElementsAre("bob"));
-}
-
-TEST_F(MotherDuckConnectParamsTest, SessionOptions) {
-  SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy");
-  SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "adbc_session");
-  EXPECT_THAT(
-      Values("options"),
-      ::testing::ElementsAre("-c x=y --attach_mode=single --session_name=adbc_session"));
-}
-
-TEST_F(MotherDuckConnectParamsTest, RegionRequiresTls) {
-  SetOption("uri", "postgresql:///db");
-  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
-  EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
-  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
-}
-
-TEST_F(MotherDuckConnectParamsTest, RegionKeepsSslmode) {
-  SetOption("uri", "postgresql:///db?sslmode=verify-full");
-  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
-  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
-  {
-    ScopedEnv pgsslmode("PGSSLMODE", "verify-full");
-    SetOption("uri", "postgresql:///db");
-    EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
-  }
-}
-
-TEST_F(MotherDuckConnectParamsTest, NoRegionLeavesSslmode) {
-  SetOption("uri", "postgresql://localhost/db");
-  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
-}
-
 class PostgresConnectionTest : public ::testing::Test,
                                public adbc_validation::ConnectionTest {
  public:
@@ -1039,19 +686,9 @@ TEST_F(PostgresConnectionTest, GetInfoMetadata) {
           EXPECT_EQ("PostgreSQL", std::string(val.data, val.size_bytes));
           break;
         }
-        case ADBC_INFO_VENDOR_VERSION: {
-          ArrowStringView val = ArrowArrayViewGetStringUnsafe(str_child, offset);
-// Fall back to a simpler version regex. This only really impacts WIN32/MSVC but
-// this is slightly more correct/portable.
-#if GTEST_USES_SIMPLE_RE
-          const char* pater = "\\d\\d\\d\\d\\d\\d";
-#else
-          const char* pater = "[0-9]{6}";
-#endif
-          EXPECT_THAT(std::string(val.data, val.size_bytes),
-                      ::testing::MatchesRegex(pater));
+        case ADBC_INFO_VENDOR_VERSION:
+          ADD_FAILURE() << "vendor version must not be reported";
           break;
-        }
         case ADBC_INFO_DRIVER_ADBC_VERSION: {
           EXPECT_EQ(ADBC_VERSION_1_1_0, ArrowArrayViewGetIntUnsafe(int_child, offset));
           break;
@@ -1062,7 +699,10 @@ TEST_F(PostgresConnectionTest, GetInfoMetadata) {
       }
     }
   }
-  ASSERT_THAT(seen, ::testing::UnorderedElementsAreArray(info));
+  // The PostgreSQL server version is requested but not reported.
+  ASSERT_THAT(seen, ::testing::UnorderedElementsAre(
+                        ADBC_INFO_DRIVER_NAME, ADBC_INFO_DRIVER_VERSION,
+                        ADBC_INFO_DRIVER_ADBC_VERSION, ADBC_INFO_VENDOR_NAME));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetCatalogs) {
@@ -1388,9 +1028,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
       << "expected 1 constraint on adbc_fkey_test table, found: "
       << table->n_table_constraints;
 
-  const std::string version = adbc_validation::GetDriverVendorVersion(&connection);
-  const std::string search_name =
-      version < "120000" ? "adbc_fkey_test_fid1_fkey" : "adbc_fkey_test_fid1_fid2_fkey";
+  // The driver reports no vendor version, so expect PostgreSQL 12+ naming.
+  const std::string search_name = "adbc_fkey_test_fid1_fid2_fkey";
   struct AdbcGetObjectsConstraint* constraint =
       InternalAdbcGetObjectsDataGetConstraintByName(
           *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
@@ -4092,12 +3731,6 @@ TEST_P(PostgresTypeTest, SelectValue) {
     GTEST_SKIP() << *reason;
   }
   std::string value = GetParam().sql_literal;
-  if ((value == "'-inf'") || (value == "'inf'")) {
-    const std::string version = adbc_validation::GetDriverVendorVersion(&connection_);
-    if (version < "140000") {
-      GTEST_SKIP() << "-inf and inf not implemented until postgres 14";
-    }
-  }
   // create table
   std::string query = "CREATE TABLE foo (col ";
   query += GetParam().sql_type;

@@ -21,4 +21,4 @@
 # under the License.
 
 third_party/** linguist-vendored
-src/codegen/pgtype.h linguist-generated
+src/postgres/codegen/pgtype.h linguist-generated

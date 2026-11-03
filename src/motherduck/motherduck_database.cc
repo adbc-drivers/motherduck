@@ -1,50 +1,41 @@
 // Copyright (c) 2026 ADBC Drivers Contributors
 //
-// This file has been modified from its original version, which is
-// under the Apache License:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // For #warning Please include winsock2.h before windows.h on RTools/msys2
 #ifdef _WIN32
 #include <winsock2.h>
 #endif
 
-#include "database.h"
+#include "motherduck_database.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
-#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
-#include <nanoarrow/nanoarrow.h>
 
+#include "adbc_driver_motherduck_config.h"
 #include "driver/common/utils.h"
-#include "postgres_util.h"
+#include "motherduck_type_resolver.h"
 
 namespace adbcpq {
 
@@ -147,19 +138,28 @@ std::string AddSessionOption(std::string_view options, std::string_view name,
   return result;
 }
 
-PostgresDatabase::PostgresDatabase() : open_connections_(0) {
-  type_resolver_ = std::make_shared<PostgresTypeResolver>();
+std::string_view MotherduckDatabase::DriverVersion() {
+  return ADBC_DRIVER_MOTHERDUCK_VERSION;
 }
-PostgresDatabase::~PostgresDatabase() = default;
 
-AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
-                                           size_t* length, struct AdbcError* error) {
+AdbcStatusCode MotherduckDatabase::Init(struct AdbcError* error) {
+  // Fail fast on a bad URI or token. This replaces PostgresDatabase::Init
+  // rather than calling it: the server version and pg_type it reads are
+  // PostgreSQL's, and mustn't reach MotherDuck users.
+  PGconn* conn = nullptr;
+  RAISE_ADBC(Connect(&conn, error));
+  RAISE_ADBC(Disconnect(&conn, error));
+
+  Status status = SharedMotherduckTypeResolver(&type_resolver_);
+  return status.ToAdbc(error);
+}
+
+AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
+                                             size_t* length, struct AdbcError* error) {
   std::string output;
   // Options that are unset when empty.
   const std::string* optional = nullptr;
-  if (std::strcmp(option, ADBC_POSTGRESQL_OPTION_USE_COPY) == 0) {
-    output = use_copy_ ? ADBC_OPTION_VALUE_ENABLED : ADBC_OPTION_VALUE_DISABLED;
-  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
+  if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
     output = attach_mode_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
     optional = &session_name_;
@@ -171,9 +171,12 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
              std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
     InternalAdbcSetError(error, "[libpq] database option '%s' can't be read", option);
     return ADBC_STATUS_NOT_FOUND;
-  } else {
+  } else if (std::strcmp(option, "adbc.postgresql.type_resolver_mode") == 0) {
+    // A PostgreSQL option, accepted by SetOption only for compatibility
     InternalAdbcSetError(error, "[libpq] unknown database option '%s'", option);
     return ADBC_STATUS_NOT_FOUND;
+  } else {
+    return PostgresDatabase::GetOption(option, value, length, error);
   }
   if (optional != nullptr) {
     if (optional->empty()) {
@@ -188,52 +191,10 @@ AdbcStatusCode PostgresDatabase::GetOption(const char* option, char* value,
   *length = output.size() + 1;
   return ADBC_STATUS_OK;
 }
-AdbcStatusCode PostgresDatabase::GetOptionBytes(const char* option, uint8_t* value,
-                                                size_t* length, struct AdbcError* error) {
-  return ADBC_STATUS_NOT_FOUND;
-}
-AdbcStatusCode PostgresDatabase::GetOptionInt(const char* option, int64_t* value,
-                                              struct AdbcError* error) {
-  return ADBC_STATUS_NOT_FOUND;
-}
-AdbcStatusCode PostgresDatabase::GetOptionDouble(const char* option, double* value,
-                                                 struct AdbcError* error) {
-  return ADBC_STATUS_NOT_FOUND;
-}
 
-AdbcStatusCode PostgresDatabase::Init(struct AdbcError* error) {
-  // Fail fast on a bad URI or token
-  PGconn* conn = nullptr;
-  RAISE_ADBC(Connect(&conn, error));
-  RAISE_ADBC(Disconnect(&conn, error));
-
-  Status status = SharedTypeResolver(&type_resolver_);
-  return status.ToAdbc(error);
-}
-
-AdbcStatusCode PostgresDatabase::Release(struct AdbcError* error) {
-  if (open_connections_ != 0) {
-    InternalAdbcSetError(error, "%s%" PRId32 "%s", "[libpq] Database released with ",
-                         open_connections_, " open connections");
-    return ADBC_STATUS_INVALID_STATE;
-  }
-  return ADBC_STATUS_OK;
-}
-
-AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
-                                           struct AdbcError* error) {
-  if (std::strcmp(key, "uri") == 0) {
-    uri_ = value;
-  } else if (std::strcmp(key, ADBC_POSTGRESQL_OPTION_USE_COPY) == 0) {
-    if (std::strcmp(value, ADBC_OPTION_VALUE_ENABLED) == 0) {
-      use_copy_ = true;
-    } else if (std::strcmp(value, ADBC_OPTION_VALUE_DISABLED) == 0) {
-      use_copy_ = false;
-    } else {
-      InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
-  } else if (std::strcmp(key, "adbc.postgresql.type_resolver_mode") == 0) {
+AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
+                                             struct AdbcError* error) {
+  if (std::strcmp(key, "adbc.postgresql.type_resolver_mode") == 0) {
     // Accepted for compatibility with the PostgreSQL driver, but ignored. Warn once
     // per process so connection pools don't repeat it.
     // TODO(https://github.com/adbc-drivers/motherduck/issues/29): use a logger
@@ -275,31 +236,12 @@ AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
              std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
     password_ = value;
   } else {
-    InternalAdbcSetError(error, "%s%s", "[libpq] Unknown database option ", key);
-    return ADBC_STATUS_NOT_IMPLEMENTED;
+    return PostgresDatabase::SetOption(key, value, error);
   }
   return ADBC_STATUS_OK;
 }
 
-AdbcStatusCode PostgresDatabase::SetOptionBytes(const char* key, const uint8_t* value,
-                                                size_t length, struct AdbcError* error) {
-  InternalAdbcSetError(error, "%s%s", "[libpq] Unknown option ", key);
-  return ADBC_STATUS_NOT_IMPLEMENTED;
-}
-
-AdbcStatusCode PostgresDatabase::SetOptionDouble(const char* key, double value,
-                                                 struct AdbcError* error) {
-  InternalAdbcSetError(error, "%s%s", "[libpq] Unknown option ", key);
-  return ADBC_STATUS_NOT_IMPLEMENTED;
-}
-
-AdbcStatusCode PostgresDatabase::SetOptionInt(const char* key, int64_t value,
-                                              struct AdbcError* error) {
-  InternalAdbcSetError(error, "%s%s", "[libpq] Unknown option ", key);
-  return ADBC_STATUS_NOT_IMPLEMENTED;
-}
-
-AdbcStatusCode PostgresDatabase::ConnectParams(
+AdbcStatusCode MotherduckDatabase::ConnectParams(
     std::vector<std::pair<std::string, std::string>>* params,
     struct AdbcError* error) const {
   if (uri_.empty()) {
@@ -392,7 +334,7 @@ AdbcStatusCode PostgresDatabase::ConnectParams(
   return ADBC_STATUS_OK;
 }
 
-AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error) {
+AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* error) {
   std::vector<std::pair<std::string, std::string>> params;
   RAISE_ADBC(ConnectParams(&params, error));
   std::vector<const char*> keywords;
@@ -413,16 +355,6 @@ AdbcStatusCode PostgresDatabase::Connect(PGconn** conn, struct AdbcError* error)
     return ADBC_STATUS_IO;
   }
   open_connections_++;
-  return ADBC_STATUS_OK;
-}
-
-AdbcStatusCode PostgresDatabase::Disconnect(PGconn** conn, struct AdbcError* error) {
-  PQfinish(*conn);
-  *conn = nullptr;
-  if (--open_connections_ < 0) {
-    InternalAdbcSetError(error, "%s", "[libpq] Open connection count underflowed");
-    return ADBC_STATUS_INTERNAL;
-  }
   return ADBC_STATUS_OK;
 }
 

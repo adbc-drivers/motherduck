@@ -29,6 +29,11 @@ endif()
 
 set(ADBC_UPSTREAM_C "${PROJECT_SOURCE_DIR}/third_party/arrow-adbc/c")
 
+# Upstream tests that don't apply to MotherDuck, as a gtest filter pattern.
+# BuiltinResolver checks the built-in type table against the server's pg_type,
+# which the MotherDuck driver never reads.
+set(MOTHERDUCK_SKIPPED_UPSTREAM_TESTS "PostgresTypeTest.BuiltinResolver")
+
 add_library(adbc_validation STATIC
             ${ADBC_UPSTREAM_C}/validation/adbc_validation.cc
             ${ADBC_UPSTREAM_C}/validation/adbc_validation_connection.cc
@@ -55,8 +60,16 @@ target_link_libraries(motherduck_driver_test PRIVATE adbc_driver_motherduck
 
 # Compile the complete inherited test suites even when no PostgreSQL server is
 # configured. The default test run exercises their server-independent cases.
+add_executable(motherduck_unit_test motherduck_connection_test.cc motherduck_database_test.cc
+                                    motherduck_pipeline_test.cc)
+target_link_libraries(motherduck_unit_test
+                      PRIVATE adbc_driver_motherduck adbc_driver_motherduck_impl
+                              adbc_validation GTest::gmock_main)
+gtest_discover_tests(motherduck_unit_test TEST_PREFIX motherduck.)
+
+# The upstream PostgreSQL driver's tests, retargeted at MotherDuck
 add_executable(motherduck_postgresql_test error_test.cc postgres_type_test.cc
-                                          postgresql_test.cc result_helper_test.cc)
+                                          postgresql_test.cc)
 target_link_libraries(motherduck_postgresql_test
                       PRIVATE adbc_driver_motherduck adbc_driver_motherduck_impl
                               adbc_validation GTest::gmock_main)
@@ -65,7 +78,7 @@ target_compile_definitions(motherduck_postgresql_test
 )
 add_test(NAME postgresql_unit
          COMMAND motherduck_postgresql_test
-                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:MotherDuckAttachModeTest.*:MotherDuckSessionNameTest.*:MotherDuckPasswordTest.*:MotherDuckUsernameTest.*:MotherDuckRegionTest.*:MotherDuckConnectParamsTest.*:SplitStatementsTest.*:IsCopyStatementTest.*:IsResultOkTest.*
+                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:-${MOTHERDUCK_SKIPPED_UPSTREAM_TESTS}
 )
 # Keep the server-independent run from creating a MotherDuck test database.
 set_tests_properties(postgresql_unit
@@ -80,7 +93,9 @@ target_link_libraries(motherduck_copy_test
 add_test(NAME copy_unit COMMAND motherduck_copy_test)
 
 if(MOTHERDUCK_TEST_POSTGRESQL)
-  add_test(NAME postgresql_integration COMMAND motherduck_postgresql_test)
+  add_test(NAME postgresql_integration
+           COMMAND motherduck_postgresql_test
+                   --gtest_filter=-${MOTHERDUCK_SKIPPED_UPSTREAM_TESTS})
   set_tests_properties(postgresql_integration
                        PROPERTIES LABELS
                                   postgresql
@@ -91,8 +106,8 @@ if(MOTHERDUCK_TEST_POSTGRESQL)
 endif()
 
 if(WIN32)
-  foreach(test_target motherduck_driver_test motherduck_postgresql_test
-                      motherduck_copy_test)
+  foreach(test_target motherduck_driver_test motherduck_unit_test
+                      motherduck_postgresql_test motherduck_copy_test)
     add_custom_command(TARGET ${test_target}
                        POST_BUILD
                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
