@@ -57,6 +57,9 @@ using adbc_validation::IsOkStatus;
 using adbc_validation::IsStatus;
 using std::string_literals::operator""s;
 
+// Bulk ingest needs COPY FROM STDIN, which the Postgres endpoint lacks (ECO-587).
+#define SKIP_WITHOUT_COPY_FROM_STDIN() GTEST_SKIP() << "Needs COPY FROM STDIN (ECO-587)"
+
 class PostgresQuirks : public adbc_validation::DriverQuirks {
  public:
   // Leaves every other option at the driver's default.
@@ -118,6 +121,35 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     RAISE_ADBC(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), error));
     RAISE_ADBC(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, error));
     return AdbcStatementRelease(&statement.value, error);
+  }
+
+  // Bulk ingest isn't available (ECO-587), so build the sample table with SQL.
+  AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
+                                   const std::string& name,
+                                   struct AdbcError* error) const override {
+    return CreateSampleTableSql(connection, QuoteIdentifier(name), error);
+  }
+
+  AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
+                                   const std::string& name, const std::string& schema,
+                                   struct AdbcError* error) const override {
+    return CreateSampleTableSql(
+        connection, QuoteIdentifier(schema) + "." + QuoteIdentifier(name), error);
+  }
+
+  AdbcStatusCode CreateSampleTableSql(struct AdbcConnection* connection,
+                                      const std::string& table,
+                                      struct AdbcError* error) const {
+    for (const std::string& query :
+         {"CREATE TABLE " + table + " (int64s BIGINT, strings TEXT)",
+          "INSERT INTO " + table + " VALUES (42, 'foo'), (-42, NULL), (NULL, '')"}) {
+      Handle<struct AdbcStatement> statement;
+      RAISE_ADBC(AdbcStatementNew(connection, &statement.value, error));
+      RAISE_ADBC(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), error));
+      RAISE_ADBC(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, error));
+      RAISE_ADBC(AdbcStatementRelease(&statement.value, error));
+    }
+    return ADBC_STATUS_OK;
   }
 
   AdbcStatusCode DropTempTable(struct AdbcConnection* connection, const std::string& name,
@@ -238,6 +270,8 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   }
   std::string db_schema() const override { return "main"; }
 
+  // No COPY FROM STDIN yet (ECO-587).
+  bool supports_bulk_ingest(const char* mode) const override { return false; }
   // MotherDuck supports database.schema.table names.
   bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_db_schema() const override { return true; }
@@ -1404,6 +1438,8 @@ class PostgresStatementTest : public ::testing::Test,
   void TestSqlPrepareErrorParamCountMismatch() { GTEST_SKIP() << "Not yet implemented"; }
 
   void TestSqlPrepareSelectParams() { GTEST_SKIP() << "Not yet implemented"; }
+  void TestSqlIngestColumnEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
+  void TestSqlIngestTableEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
 
   void TestConcurrentStatements() {
     // TODO: refactor driver so that we read all the data as soon as
@@ -1697,6 +1733,7 @@ TEST_F(PostgresStatementTest, IsolationLevels) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestSchema) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   const std::string schema_name = "testschema";
 
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -2062,6 +2099,7 @@ TEST_F(PostgresStatementTest, SqlIngestAppendIntegerBoundsIntoNumeric) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendFloatIntoNumericNotImplemented) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->DropTable(&connection, "numeric_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -2171,6 +2209,7 @@ TEST_F(PostgresStatementTest, SqlIngestTimestampOverflow) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestJson) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   std::string drop = "DROP TABLE IF EXISTS jsontable";
@@ -2243,6 +2282,7 @@ TEST_F(PostgresStatementTest, SqlIngestJson) {
 // Ensure the table is actually created with the JSON type by trying to ingest
 // invalid JSON
 TEST_F(PostgresStatementTest, SqlIngestJsonInvalid) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   std::string drop = "DROP TABLE IF EXISTS jsontable";
@@ -2931,6 +2971,7 @@ TEST_F(PostgresStatementTest, SqlExecuteCopyZeroRowOutputError) {
 }
 
 TEST_F(PostgresStatementTest, BatchSizeHint) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->EnsureSampleTable(&connection, "batch_size_hint_test", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -4174,6 +4215,7 @@ static const std::vector<DecimalFixtureGroup>& DecimalFixtureGroups() {
 class PostgresDecimalTestBase : public ::testing::Test {
  public:
   void SetUp() override {
+    SKIP_WITHOUT_COPY_FROM_STDIN();
     ASSERT_THAT(AdbcDatabaseNew(&database_, &error_), IsOkStatus(&error_));
     ASSERT_THAT(quirks_.SetupDatabase(&database_, &error_), IsOkStatus(&error_));
     ASSERT_THAT(AdbcDatabaseInit(&database_, &error_), IsOkStatus(&error_));
