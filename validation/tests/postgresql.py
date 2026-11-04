@@ -54,7 +54,8 @@ class PostgreSQLQuirks(model.DriverQuirks):
         get_objects_constraints_primary=False,
         get_objects_constraints_unique=False,
         metadata_type_name=True,
-        statement_bulk_ingest=True,
+        # Needs COPY FROM STDIN, which the endpoint lacks (ECO-587).
+        statement_bulk_ingest=False,
         statement_bulk_ingest_catalog=False,
         statement_bulk_ingest_schema=False,
         # MotherDuck has no temporary tables.
