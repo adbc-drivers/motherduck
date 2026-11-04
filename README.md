@@ -114,11 +114,12 @@ URI, replace it. `PGUSER` is never used.
 `adbc.motherduck.region` (database option) sets the host from a MotherDuck
 region, so the URI can leave it out: `us-east-1` connects to
 `pg.us-east-1-aws.motherduck.com`, and `eastus2` connects to
-`pg.eastus2-azure.motherduck.com`. Find your region with `md_user_info()`. An
-AWS region is dash-separated parts of lowercase letters followed by a number;
-an Azure region is lowercase letters and digits with no
-dashes, starting with a letter. A region can also name its cloud
-(`us-east-1-aws`, `eastus2-azure`). Setting it together with a different host
+`pg.eastus2-azure.motherduck.com`. Find your region with `md_user_info()`. A
+region is dash-separated parts of lowercase letters and digits. One with
+dashes is taken to be on AWS and one without on Azure, unless it ends in
+`-aws` or `-azure`. The driver doesn't check the region against a list, so a
+mistyped one fails at connect with a DNS error naming the host. Setting it
+together with a different host
 or any `hostaddr` in the URI, or with `PGHOSTADDR`, is an error; a host that
 matches the region is allowed. When it's set, `PGHOST` and `PGPORT` are
 ignored, and the port is 5432 unless the URI sets one. Unless the URI or

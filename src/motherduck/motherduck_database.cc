@@ -19,7 +19,6 @@
 
 #include "motherduck_database.h"
 
-#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -48,39 +47,22 @@ std::string GetEnv(const char* name) {
   return value ? value : "";
 }
 
-// ASCII-only, unlike std::islower and friends, which follow the C locale.
-bool IsLower(char c) { return c >= 'a' && c <= 'z'; }
-bool IsDigit(char c) { return c >= '0' && c <= '9'; }
-
-// Whether name is an AWS region: dash-separated parts of lowercase letters,
-// then a number, e.g. us-east-1.
-bool IsAwsRegion(std::string_view name) {
-  size_t last_dash = name.rfind('-');
-  if (last_dash == std::string_view::npos) return false;
-  std::string_view number = name.substr(last_dash + 1);
-  if (number.empty() || !std::all_of(number.begin(), number.end(), IsDigit)) {
-    return false;
-  }
+// Whether value can be part of a hostname: dash-separated parts of lowercase
+// ASCII letters and digits. This keeps out anything libpq treats specially in
+// a host, such as a comma, which separates hosts it would also try.
+bool IsHostLabel(std::string_view value) {
   bool part_empty = true;
-  for (char c : name.substr(0, last_dash)) {
+  for (char c : value) {
     if (c == '-') {
       if (part_empty) return false;
       part_empty = true;
-    } else if (IsLower(c)) {
+    } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
       part_empty = false;
     } else {
       return false;
     }
   }
   return !part_empty;
-}
-
-// Whether name is an Azure region: a lowercase letter, then lowercase letters
-// and digits, e.g. eastus2.
-bool IsAzureRegion(std::string_view name) {
-  if (name.empty() || !IsLower(name[0]) || name == "aws" || name == "azure") return false;
-  return std::all_of(name.begin(), name.end(),
-                     [](char c) { return IsLower(c) || IsDigit(c); });
 }
 
 // Backslash-escapes whitespace and backslashes for libpq options. MotherDuck
@@ -96,25 +78,18 @@ std::string EscapeOptionValue(std::string_view value) {
 }  // namespace
 
 std::string RegionHost(std::string_view region) {
-  // An explicit cloud suffix wins; otherwise AWS names have dashes and Azure
-  // names don't.
-  std::string_view cloud;
-  for (std::string_view suffix : {"-aws", "-azure"}) {
-    if (region.size() > suffix.size() &&
-        region.substr(region.size() - suffix.size()) == suffix) {
-      cloud = suffix.substr(1);
-      region.remove_suffix(suffix.size());
-      break;
-    }
-  }
-  if (cloud.empty()) {
-    cloud = region.find('-') == std::string_view::npos ? "azure" : "aws";
-  }
-  if (cloud == "aws" ? !IsAwsRegion(region) : !IsAzureRegion(region)) return "";
+  if (!IsHostLabel(region)) return "";
   std::string host = "pg.";
   host += region;
-  host += '-';
-  host += cloud;
+  // Without a cloud suffix, AWS names have dashes (us-east-1) and Azure names
+  // don't (eastus2).
+  auto ends_with = [region](std::string_view suffix) {
+    return region.size() > suffix.size() &&
+           region.substr(region.size() - suffix.size()) == suffix;
+  };
+  if (!ends_with("-aws") && !ends_with("-azure")) {
+    host += region.find('-') == std::string_view::npos ? "-azure" : "-aws";
+  }
   host += ".motherduck.com";
   return host;
 }
@@ -206,9 +181,9 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     // The region becomes part of a hostname. An empty value unsets it.
     if (*value != '\0' && RegionHost(value).empty()) {
       InternalAdbcSetError(error,
-                           "[libpq] Invalid value for option %s=%s: expected an AWS "
-                           "region such as us-east-1 or an Azure region such as "
-                           "eastus2",
+                           "[libpq] Invalid value for option %s=%s: expected a region "
+                           "such as us-east-1 or eastus2, of lowercase letters, "
+                           "digits and dashes",
                            key, value);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }

@@ -162,12 +162,9 @@ TEST(MotherDuckRegionTest, OptionInvalid) {
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   for (const char* value :
        {"US-EAST-1", "us east 1", "us-east-1.example.com", "us-east-1/x", "us_east_1",
-        "-", "--", "-us-east-1", "us-east-1-", "us--east-1", "us-east",
-        // Bare cloud names, and names that don't match their cloud.
-        "aws", "azure", "-aws", "-azure", "eastus2-aws", "us-east-1-azure",
-        "eastus2-azure-aws", "2eastus", "EastUS2",
-        // Only AWS and Azure, so GCP names aren't regions.
-        "us-central1-gcp", "us-central1",
+        "-", "--", "-us-east-1", "us-east-1-", "us--east-1", "EastUS2",
+        // libpq would also try each comma-separated host.
+        "x,attacker.example,", "us-east-1,localhost",
         "us-\xe9"
         "ast-1"}) {
     EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
