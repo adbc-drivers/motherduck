@@ -624,7 +624,8 @@ TEST_F(PostgresDatabaseTest, SessionNameOption) {
 
 // Each sslmode against MotherDuck's endpoint, which refuses plaintext: every
 // mode that connects must use TLS. The CA bundle comes from the test URI,
-// since some libpq builds can't read the system trust store.
+// since some libpq builds can't read the system trust store, or, without
+// sslrootcert, from the driver's search of the OS trust store.
 TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
@@ -647,11 +648,15 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   ASSERT_FALSE(rootcert.empty()) << "Test URI must set sslrootcert";
 
   struct Case {
+    // Empty to leave it unset.
     const char* sslmode;
     std::string sslrootcert;
     bool connects;
   };
   const Case kCases[] = {
+      // The driver finds the OS's roots and verifies the server.
+      {"", "", true},
+      {"verify-full", "", true},
       // The endpoint refuses plaintext.
       {"disable", "", false},
       // allow and prefer retry with TLS after that refusal.
@@ -667,7 +672,9 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   ScopedEnv pgsslmode("PGSSLMODE", nullptr);
   ScopedEnv pgsslrootcert("PGSSLROOTCERT", nullptr);
   for (const Case& test_case : kCases) {
-    std::string conn_uri = base + "sslmode=" + test_case.sslmode;
+    std::string conn_uri = base;
+    if (*test_case.sslmode != '\0')
+      conn_uri += std::string("sslmode=") + test_case.sslmode;
     if (!test_case.sslrootcert.empty()) {
       conn_uri += " sslrootcert='" + test_case.sslrootcert + "'";
     }
@@ -684,6 +691,17 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
     }
     ASSERT_THAT(status, IsOkStatus(&error));
     EXPECT_EQ(PQsslInUse(conn), 1);
+    if (*test_case.sslmode == '\0') {
+      std::string sslmode;
+      PQconninfoOption* used = PQconninfo(conn);
+      for (PQconninfoOption* option = used; option->keyword != nullptr; option++) {
+        if (std::string_view(option->keyword) == "sslmode" && option->val) {
+          sslmode = option->val;
+        }
+      }
+      PQconninfoFree(used);
+      EXPECT_EQ(sslmode, "verify-full");
+    }
     ASSERT_THAT(database.Disconnect(&conn, &error), IsOkStatus(&error));
   }
 }

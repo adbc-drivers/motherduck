@@ -35,6 +35,7 @@
 
 #include "adbc_driver_motherduck_config.h"
 #include "driver/common/utils.h"
+#include "motherduck_trust_store.h"
 #include "motherduck_type_resolver.h"
 
 namespace adbcpq {
@@ -380,13 +381,42 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     // Like PGHOST, PGPORT is meant for some other server.
     if (uri_port.empty()) params->emplace_back("port", "5432");
   }
-  // Don't let libpq's default sslmode=prefer send the token in plaintext.
-  // Certificate verification still needs sslmode=verify-full (#34). A named
-  // service may set sslmode itself, which this would override; with a region,
-  // a service is already an error.
+  // Don't let libpq's default sslmode=prefer send the token in plaintext, and
+  // verify the server's certificate. A named service may set sslmode and
+  // sslrootcert itself, which defaults here would override; with a region, a
+  // service is already an error.
   bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
-  if (!names_service && DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
-    params->emplace_back("sslmode", "require");
+  if (!names_service) {
+    std::string sslmode = uri_sslmode.empty() ? GetEnv("PGSSLMODE") : uri_sslmode;
+    std::string sslrootcert =
+        uri_sslrootcert.empty() ? GetEnv("PGSSLROOTCERT") : uri_sslrootcert;
+    // libpq's own default root certificate file is the user's choice too.
+    if (sslrootcert.empty() && IsReadableFile(DefaultRootCertPath(GetEnv))) {
+      sslrootcert = DefaultRootCertPath(GetEnv);
+    }
+    // libpq can't find the OS's trusted roots (sslrootcert=system needs a
+    // libpq and OpenSSL that can), so pass them as a file. Not for modes that
+    // don't verify: a root file would make require verify the CA.
+    if (sslrootcert.empty() &&
+        (sslmode.empty() || sslmode == "verify-ca" || sslmode == "verify-full")) {
+      sslrootcert = find_ca_bundle_ ? find_ca_bundle_() : FindCaBundle(GetEnv);
+      if (!sslrootcert.empty()) params->emplace_back("sslrootcert", sslrootcert);
+    }
+    if (DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert) && !sslrootcert.empty()) {
+      params->emplace_back("sslmode", "verify-full");
+    } else if (DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
+      params->emplace_back("sslmode", "require");
+      // Warn once per process so connection pools don't repeat it.
+      // TODO(https://github.com/adbc-drivers/motherduck/issues/29): use a logger
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        std::fprintf(stderr,
+                     "[motherduck] warning: no trusted CA certificates found, so the "
+                     "driver can't verify the server's certificate; using "
+                     "sslmode=require. Set SSL_CERT_FILE, or sslrootcert in the URI, "
+                     "to a PEM CA bundle\n");
+      }
+    }
   }
   if (!password_.empty()) password = password_;
   if (password.empty()) password = GetEnv("MOTHERDUCK_TOKEN");

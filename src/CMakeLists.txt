@@ -33,6 +33,7 @@ add_library(adbc_driver_motherduck_impl STATIC
             motherduck/motherduck_factory.cc
             motherduck/motherduck_pipeline.cc
             motherduck/motherduck_statement.cc
+            motherduck/motherduck_trust_store.cc
             motherduck/motherduck_type_resolver.cc)
 target_include_directories(adbc_driver_motherduck_impl
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/postgres
@@ -42,7 +43,11 @@ target_include_directories(adbc_driver_motherduck_impl
 target_link_libraries(adbc_driver_motherduck_impl PUBLIC adbc_driver_framework
                                                          PostgreSQL::PostgreSQL)
 if(WIN32)
-  target_link_libraries(adbc_driver_motherduck_impl PUBLIC wsock32 ws2_32)
+  target_link_libraries(adbc_driver_motherduck_impl PUBLIC wsock32 ws2_32 crypt32)
+elseif(APPLE)
+  # The native trust store, for verifying servers
+  target_link_libraries(adbc_driver_motherduck_impl PUBLIC "-framework CoreFoundation"
+                                                           "-framework Security")
 endif()
 
 add_library(adbc_driver_motherduck SHARED postgres/postgresql.cc motherduck/motherduck.cc)

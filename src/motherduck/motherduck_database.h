@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -23,6 +24,7 @@
 #include <libpq-fe.h>
 
 #include "database.h"
+#include "motherduck_trust_store.h"
 
 #define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
 #define ADBC_MOTHERDUCK_OPTION_SESSION_NAME "adbc.motherduck.session_name"
@@ -64,6 +66,12 @@ class MotherduckDatabase : public PostgresDatabase {
   AdbcStatusCode ConnectParams(std::vector<std::pair<std::string, std::string>>* params,
                                struct AdbcError* error) const;
 
+  /// \brief Replace how Connect finds a CA bundle when the connection names
+  /// none, for tests. Returns the bundle's path, or empty if there's none.
+  void SetCaBundleFinder(std::function<std::string()> finder) {
+    find_ca_bundle_ = std::move(finder);
+  }
+
   std::string_view DriverName() override { return "ADBC MotherDuck Driver"; }
   std::string_view DriverVersion() override;
 
@@ -74,6 +82,8 @@ class MotherduckDatabase : public PostgresDatabase {
   std::string region_;
   std::string username_;
   std::string password_;
+  // Empty for FindCaBundle.
+  std::function<std::string()> find_ca_bundle_;
 };
 
 }  // namespace adbcpq
