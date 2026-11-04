@@ -259,8 +259,7 @@ TEST(MotherDuckPasswordTest, OptionNotReadable) {
   if (error.release) error.release(&error);
 }
 
-// The libpq parameters Connect would pass, for a database with the given URI
-// and options. Needs no server.
+// The libpq parameters Connect would pass. Needs no server.
 class MotherDuckConnectParamsTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -289,7 +288,6 @@ class MotherDuckConnectParamsTest : public ::testing::Test {
   ScopedEnv pgoptions_{"PGOPTIONS", nullptr};
   ScopedEnv pgsslmode_{"PGSSLMODE", nullptr};
   ScopedEnv pguser_{"PGUSER", "someone"};
-  ScopedEnv pgappname_{"PGAPPNAME", nullptr};
   adbcpq::MotherduckDatabase database_;
   struct AdbcError error_ = {};
 };
@@ -344,12 +342,12 @@ TEST_F(MotherDuckConnectParamsTest, ApplicationName) {
   SetOption("uri", "postgresql://localhost/db?fallback_application_name=fallback");
   EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("fallback " + driver));
   EXPECT_THAT(Values("fallback_application_name"), ::testing::IsEmpty());
-  {
-    ScopedEnv pgappname("PGAPPNAME", "env");
-    EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("env " + driver));
-    SetOption("uri", "postgresql://localhost/db?application_name=dbt");
-    EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("dbt " + driver));
-  }
+  SetOption("uri", "postgresql://localhost/db?application_name=dbt");
+  EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("dbt " + driver));
+  // PGAPPNAME is never used.
+  ScopedEnv pgappname("PGAPPNAME", "env");
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("application_name"), ::testing::ElementsAre(driver));
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionRequiresTls) {

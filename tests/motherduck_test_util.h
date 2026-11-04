@@ -18,10 +18,8 @@
 #include <optional>
 #include <string>
 
-// Sets an environment variable for the life of the object, then restores it.
-// On Windows, the CRT can't hold an empty variable (_putenv_s with "" removes
-// it), so an empty value is set, and restored, as unset. The driver treats an
-// empty MOTHERDUCK_TOKEN as unset, so the tests don't depend on the difference.
+// Sets an environment variable for the object's lifetime. On Windows an empty
+// value means unset (_putenv_s can't hold one); the driver treats both alike.
 class ScopedEnv {
  public:
   ScopedEnv(const char* name, const char* value) : name_(name) {

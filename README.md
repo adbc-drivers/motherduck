@@ -93,10 +93,10 @@ unset by default; an empty value unsets it.
 
 MotherDuck builds the user agent in query history and its logs from libpq's
 `application_name`. The driver adds `adbc_driver_motherduck/<version>` to it,
-after the application's own name if the URI's `application_name`,
-`PGAPPNAME`, or the URI's `fallback_application_name` gives one (in that
-order), so `application_name=dbt` becomes
-`dbt adbc_driver_motherduck/<version>`.
+after the application's own name if the URI's `application_name` or
+`fallback_application_name` gives one (in that order), so
+`application_name=dbt` becomes `dbt adbc_driver_motherduck/<version>`.
+`PGAPPNAME` is never used.
 
 The MotherDuck token is the connection's password. The driver takes it from,
 in order: the standard ADBC `password` database option (or its alias,

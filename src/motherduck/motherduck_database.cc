@@ -104,9 +104,8 @@ bool IsRegion(std::string_view value) {
   return !part_empty && parts >= 2 && has_digit;
 }
 
-// Escapes value for libpq options, which splits on whitespace and treats a
-// backslash as escaping the next character. MotherDuck's endpoint removes the
-// escapes, so "a b" arrives as is.
+// Backslash-escapes whitespace and backslashes for libpq options. MotherDuck
+// removes the escapes, so "a b" arrives as is.
 std::string EscapeOptionValue(std::string_view value) {
   std::string escaped;
   for (char c : value) {
@@ -255,10 +254,8 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     return ADBC_STATUS_IO;
   }
 
-  // Merge the MotherDuck settings into the session options from the URI (or
-  // PGOPTIONS), apply the region option, and fill in the user and token. The driver
-  // always passes both, so libpq never falls back to PGUSER, PGPASSWORD, or a password
-  // file.
+  // Always pass the user, token and application name, so libpq never falls
+  // back to PGUSER, PGPASSWORD, a password file, or PGAPPNAME.
   params->clear();
   const char* env_options = std::getenv("PGOPTIONS");
   std::string options = env_options ? env_options : "";
@@ -292,8 +289,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   PQconninfoFree(conninfo);
 
   if (!region_.empty()) {
-    // libpq would still apply PGHOSTADDR, connecting to that address
-    // instead of the region's host.
+    // libpq would connect to PGHOSTADDR instead of the region's host.
     const char* env_hostaddr = std::getenv("PGHOSTADDR");
     if (uri_sets_host || (env_hostaddr != nullptr && *env_hostaddr != '\0')) {
       InternalAdbcSetError(error,
@@ -303,8 +299,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
     params->emplace_back("host", RegionHost(region_));
-    // The driver chose the host, so don't let libpq's default sslmode=prefer
-    // fall back to sending the token in plaintext.
+    // Don't let the default sslmode=prefer send the token in plaintext.
     const char* env_sslmode = std::getenv("PGSSLMODE");
     if (!uri_sets_sslmode && (env_sslmode == nullptr || *env_sslmode == '\0')) {
       params->emplace_back("sslmode", "require");
@@ -332,13 +327,8 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     options = AddSessionOption(options, "session_name", session_name_);
   }
   params->emplace_back("options", std::move(options));
-  // MotherDuck builds the user agent in query history from application_name,
-  // so add the driver to the application's name (from the URI, PGAPPNAME, or
-  // fallback_application_name, as libpq would choose it).
-  if (application_name.empty()) {
-    const char* env_appname = std::getenv("PGAPPNAME");
-    if (env_appname != nullptr) application_name = env_appname;
-  }
+  // MotherDuck's user agent comes from application_name: append the driver to
+  // the application's name. Always passing it means PGAPPNAME is never used.
   if (application_name.empty()) application_name = fallback_application_name;
   if (!application_name.empty()) application_name += ' ';
   application_name += "adbc_driver_motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION;
