@@ -287,6 +287,9 @@ class MotherDuckConnectParamsTest : public ::testing::Test {
 
   ScopedEnv pgoptions_{"PGOPTIONS", nullptr};
   ScopedEnv pgsslmode_{"PGSSLMODE", nullptr};
+  ScopedEnv pgsslrootcert_{"PGSSLROOTCERT", nullptr};
+  ScopedEnv pghostaddr_{"PGHOSTADDR", nullptr};
+  ScopedEnv pgport_{"PGPORT", "5433"};
   ScopedEnv pguser_{"PGUSER", "someone"};
   adbcpq::MotherduckDatabase database_;
   struct AdbcError error_ = {};
@@ -368,9 +371,39 @@ TEST_F(MotherDuckConnectParamsTest, RegionKeepsSslmode) {
   }
 }
 
+TEST_F(MotherDuckConnectParamsTest, RegionSystemRootCert) {
+  // libpq makes sslrootcert=system imply verify-full, and rejects require.
+  SetOption("uri", "postgresql:///db?sslrootcert=system");
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+  SetOption("uri", "postgresql:///db");
+  {
+    ScopedEnv pgsslrootcert("PGSSLROOTCERT", "system");
+    EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+  }
+  // A root certificate file doesn't change the default sslmode.
+  SetOption("uri", "postgresql:///db?sslrootcert=/tmp/root.crt");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, RegionPort) {
+  SetOption("uri", "postgresql:///db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  EXPECT_THAT(Values("port"), ::testing::ElementsAre("5432"));
+  SetOption("uri", "postgresql://:6543/db");
+  EXPECT_THAT(Values("port"), ::testing::ElementsAre("6543"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, RegionMatchingHost) {
+  SetOption("uri", "postgresql://pg.us-east-1-aws.motherduck.com/db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
+}
+
 TEST_F(MotherDuckConnectParamsTest, NoRegionLeavesSslmode) {
   SetOption("uri", "postgresql://localhost/db");
   EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+  EXPECT_THAT(Values("port"), ::testing::IsEmpty());
 }
 
 // The PostgreSQL driver's type resolver mode (and the server type table it

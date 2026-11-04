@@ -114,11 +114,15 @@ region, so the URI can leave it out: `us-east-1` connects to
 `pg.us-east-1-aws.motherduck.com`. Find your region with `md_user_info()`. A
 region is two or more dash-separated parts of lowercase letters and digits,
 including a digit. It's taken to be on AWS unless its last part, all letters,
-names the cloud (`us-east-1-aws`). Setting it together with a host or
-`hostaddr` in the URI, or with `PGHOSTADDR`, is an error; when it's set,
-`PGHOST` is ignored. Unless the URI or `PGSSLMODE` sets `sslmode`, the driver
-uses `sslmode=require`, which encrypts the connection but doesn't verify the
-server's certificate; set `sslmode=verify-full` to verify it. For example, with
+names the cloud (`us-east-1-aws`). Setting it together with a different host
+or any `hostaddr` in the URI, or with `PGHOSTADDR`, is an error; a host that
+matches the region is allowed. When it's set, `PGHOST` and `PGPORT` are
+ignored, and the port is 5432 unless the URI sets one. Unless the URI or
+`PGSSLMODE` sets `sslmode`, the driver uses `sslmode=require`, which encrypts
+the connection but doesn't verify the server's certificate; set
+`sslmode=verify-full` to verify it. With `sslrootcert=system` (in the URI or
+`PGSSLROOTCERT`), libpq already defaults to `verify-full`, so the driver
+leaves `sslmode` alone. For example, with
 `region` set to `us-east-1`:
 
 ```text

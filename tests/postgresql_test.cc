@@ -531,8 +531,9 @@ TEST_F(PostgresDatabaseTest, RegionOption) {
       host.substr(kPrefix.size(), host.size() - kPrefix.size() - kSuffix.size());
   hostless.erase(start, end - start);
 
-  // Only the region can supply the host.
+  // Only the region can supply the host and port.
   ScopedEnv pghost("PGHOST", "localhost");
+  ScopedEnv pgport("PGPORT", "1");
   ScopedEnv pghostaddr("PGHOSTADDR", nullptr);
   adbc_validation::Handle<struct AdbcDatabase> database;
   adbc_validation::Handle<struct AdbcConnection> connection;

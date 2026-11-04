@@ -79,6 +79,12 @@ bool SetsSessionOption(std::string_view options, std::string_view name) {
   return false;
 }
 
+// An environment variable, or empty if it's unset.
+std::string GetEnv(const char* name) {
+  const char* value = std::getenv(name);
+  return value ? value : "";
+}
+
 // ASCII-only, unlike std::islower and friends, which follow the C locale.
 bool IsLower(char c) { return c >= 'a' && c <= 'z'; }
 bool IsDigit(char c) { return c >= '0' && c <= '9'; }
@@ -263,15 +269,20 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   std::string user;
   std::string application_name;
   std::string fallback_application_name;
-  bool uri_sets_host = false;
-  bool uri_sets_sslmode = false;
+  // Connection settings from the URI that the region interacts with.
+  std::string uri_host;
+  std::string uri_hostaddr;
+  std::string uri_port;
+  std::string uri_sslmode;
+  std::string uri_sslrootcert;
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
     if (option->val == nullptr) continue;
     std::string_view keyword = option->keyword;
-    if ((keyword == "host" || keyword == "hostaddr") && *option->val != '\0') {
-      uri_sets_host = true;
-    }
-    if (keyword == "sslmode" && *option->val != '\0') uri_sets_sslmode = true;
+    if (keyword == "host") uri_host = option->val;
+    if (keyword == "hostaddr") uri_hostaddr = option->val;
+    if (keyword == "port") uri_port = option->val;
+    if (keyword == "sslmode") uri_sslmode = option->val;
+    if (keyword == "sslrootcert") uri_sslrootcert = option->val;
     if (keyword == "options") {
       options = option->val;
     } else if (keyword == "password") {
@@ -289,19 +300,26 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   PQconninfoFree(conninfo);
 
   if (!region_.empty()) {
-    // libpq would connect to PGHOSTADDR instead of the region's host.
-    const char* env_hostaddr = std::getenv("PGHOSTADDR");
-    if (uri_sets_host || (env_hostaddr != nullptr && *env_hostaddr != '\0')) {
+    // A different host, or any hostaddr (which libpq connects to instead of the
+    // host), would send the connection elsewhere.
+    std::string region_host = RegionHost(region_);
+    if ((!uri_host.empty() && uri_host != region_host) || !uri_hostaddr.empty() ||
+        !GetEnv("PGHOSTADDR").empty()) {
       InternalAdbcSetError(error,
-                           "[libpq] Set either database option '%s' or a host "
-                           "(host or hostaddr in the URI, or PGHOSTADDR), not both",
+                           "[libpq] Set either database option '%s' or a different "
+                           "host (host or hostaddr in the URI, or PGHOSTADDR), not both",
                            ADBC_MOTHERDUCK_OPTION_REGION);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    params->emplace_back("host", RegionHost(region_));
-    // Don't let the default sslmode=prefer send the token in plaintext.
-    const char* env_sslmode = std::getenv("PGSSLMODE");
-    if (!uri_sets_sslmode && (env_sslmode == nullptr || *env_sslmode == '\0')) {
+    if (uri_host.empty()) params->emplace_back("host", std::move(region_host));
+    // Like PGHOST, PGPORT is meant for some other server.
+    if (uri_port.empty()) params->emplace_back("port", "5432");
+    // Don't let the default sslmode=prefer send the token in plaintext. With
+    // sslrootcert=system, libpq already defaults to verify-full and rejects
+    // anything weaker.
+    std::string sslrootcert =
+        uri_sslrootcert.empty() ? GetEnv("PGSSLROOTCERT") : uri_sslrootcert;
+    if (uri_sslmode.empty() && GetEnv("PGSSLMODE").empty() && sslrootcert != "system") {
       params->emplace_back("sslmode", "require");
     }
   }
