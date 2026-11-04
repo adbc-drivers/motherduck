@@ -52,25 +52,35 @@ std::string GetEnv(const char* name) {
 bool IsLower(char c) { return c >= 'a' && c <= 'z'; }
 bool IsDigit(char c) { return c >= '0' && c <= '9'; }
 
-// Whether value is a region: two or more dash-separated parts of lowercase
-// letters and digits, with a digit somewhere, e.g. us-east-1.
-bool IsRegion(std::string_view value) {
+// Whether name is an AWS region: dash-separated parts of lowercase letters,
+// then a number, e.g. us-east-1.
+bool IsAwsRegion(std::string_view name) {
+  size_t last_dash = name.rfind('-');
+  if (last_dash == std::string_view::npos) return false;
+  std::string_view number = name.substr(last_dash + 1);
+  if (number.empty() || !std::all_of(number.begin(), number.end(), IsDigit)) {
+    return false;
+  }
   bool part_empty = true;
-  bool has_digit = false;
-  int parts = 1;
-  for (char c : value) {
+  for (char c : name.substr(0, last_dash)) {
     if (c == '-') {
       if (part_empty) return false;
       part_empty = true;
-      parts++;
-    } else if (IsLower(c) || IsDigit(c)) {
+    } else if (IsLower(c)) {
       part_empty = false;
-      has_digit = has_digit || IsDigit(c);
     } else {
       return false;
     }
   }
-  return !part_empty && parts >= 2 && has_digit;
+  return !part_empty;
+}
+
+// Whether name is an Azure region: a lowercase letter, then lowercase letters
+// and digits, e.g. eastus2.
+bool IsAzureRegion(std::string_view name) {
+  if (name.empty() || !IsLower(name[0]) || name == "aws" || name == "azure") return false;
+  return std::all_of(name.begin(), name.end(),
+                     [](char c) { return IsLower(c) || IsDigit(c); });
 }
 
 // Backslash-escapes whitespace and backslashes for libpq options. MotherDuck
@@ -86,12 +96,25 @@ std::string EscapeOptionValue(std::string_view value) {
 }  // namespace
 
 std::string RegionHost(std::string_view region) {
+  // An explicit cloud suffix wins; otherwise AWS names have dashes and Azure
+  // names don't.
+  std::string_view cloud;
+  for (std::string_view suffix : {"-aws", "-azure"}) {
+    if (region.size() > suffix.size() &&
+        region.substr(region.size() - suffix.size()) == suffix) {
+      cloud = suffix.substr(1);
+      region.remove_suffix(suffix.size());
+      break;
+    }
+  }
+  if (cloud.empty()) {
+    cloud = region.find('-') == std::string_view::npos ? "azure" : "aws";
+  }
+  if (cloud == "aws" ? !IsAwsRegion(region) : !IsAzureRegion(region)) return "";
   std::string host = "pg.";
   host += region;
-  // A last part of only letters names the cloud (us-east-1-aws); otherwise
-  // it's AWS.
-  std::string_view last = region.substr(region.rfind('-') + 1);
-  if (last.empty() || !std::all_of(last.begin(), last.end(), IsLower)) host += "-aws";
+  host += '-';
+  host += cloud;
   host += ".motherduck.com";
   return host;
 }
@@ -181,10 +204,11 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     session_name_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     // The region becomes part of a hostname. An empty value unsets it.
-    if (*value != '\0' && !IsRegion(value)) {
+    if (*value != '\0' && RegionHost(value).empty()) {
       InternalAdbcSetError(error,
-                           "[libpq] Invalid value for option %s=%s: expected a region "
-                           "such as us-east-1",
+                           "[libpq] Invalid value for option %s=%s: expected an AWS "
+                           "region such as us-east-1 or an Azure region such as "
+                           "eastus2",
                            key, value);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }

@@ -33,7 +33,8 @@
 namespace adbcpq {
 
 /// \brief The Postgres endpoint host for a MotherDuck region, e.g.
-/// pg.us-east-1-aws.motherduck.com for us-east-1.
+/// pg.us-east-1-aws.motherduck.com for us-east-1 or
+/// pg.eastus2-azure.motherduck.com for eastus2, or empty if region isn't one.
 std::string RegionHost(std::string_view region);
 
 /// \brief A libpq session option, --<name>=<value>, with whitespace and

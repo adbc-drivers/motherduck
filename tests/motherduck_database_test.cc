@@ -119,11 +119,19 @@ TEST(MotherDuckSessionNameTest, OptionSetGet) {
 }
 
 TEST(MotherDuckRegionTest, RegionHost) {
-  EXPECT_EQ("pg.us-east-1-aws.motherduck.com", adbcpq::RegionHost("us-east-1"));
-  EXPECT_EQ("pg.eu-central-1-aws.motherduck.com", adbcpq::RegionHost("eu-central-1"));
+  // MotherDuck's AWS regions.
+  for (const char* region : {"us-east-1", "us-west-2", "eu-central-1", "eu-west-1",
+                             "ap-northeast-1", "ap-southeast-2"}) {
+    EXPECT_EQ("pg." + std::string(region) + "-aws.motherduck.com",
+              adbcpq::RegionHost(region));
+  }
+  // Azure region names have no dashes.
+  EXPECT_EQ("pg.eastus2-azure.motherduck.com", adbcpq::RegionHost("eastus2"));
+  EXPECT_EQ("pg.westeurope-azure.motherduck.com", adbcpq::RegionHost("westeurope"));
   // A region can name its cloud.
   EXPECT_EQ("pg.us-east-1-aws.motherduck.com", adbcpq::RegionHost("us-east-1-aws"));
-  EXPECT_EQ("pg.us-central1-gcp.motherduck.com", adbcpq::RegionHost("us-central1-gcp"));
+  EXPECT_EQ("pg.eastus2-azure.motherduck.com", adbcpq::RegionHost("eastus2-azure"));
+  EXPECT_EQ("pg.westeurope-azure.motherduck.com", adbcpq::RegionHost("westeurope-azure"));
 }
 
 TEST(MotherDuckRegionTest, OptionSetGet) {
@@ -154,8 +162,12 @@ TEST(MotherDuckRegionTest, OptionInvalid) {
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   for (const char* value :
        {"US-EAST-1", "us east 1", "us-east-1.example.com", "us-east-1/x", "us_east_1",
-        "-", "--", "-us-east-1", "us-east-1-", "us--east-1", "aws", "useast", "useast1",
-        "us-east",
+        "-", "--", "-us-east-1", "us-east-1-", "us--east-1", "us-east",
+        // Bare cloud names, and names that don't match their cloud.
+        "aws", "azure", "-aws", "-azure", "eastus2-aws", "us-east-1-azure",
+        "eastus2-azure-aws", "2eastus", "EastUS2",
+        // Only AWS and Azure, so GCP names aren't regions.
+        "us-central1-gcp", "us-central1",
         "us-\xe9"
         "ast-1"}) {
     EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
