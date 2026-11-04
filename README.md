@@ -136,6 +136,41 @@ libpq connection service files (`~/.pg_service.conf`, `service=`, or
 replaces any `options` a service file sets. Put connection settings in the
 URI instead.
 
+## Unsupported PostgreSQL driver features
+
+These upstream PostgreSQL driver features don't work against MotherDuck's
+Postgres endpoint yet. Most are endpoint gaps; the tests skip or expect them
+to fail.
+
+- **Bulk ingest** fails: the endpoint has no `COPY ... FROM STDIN` (#31).
+  `adbc.ingest.target_catalog` isn't supported (#16), appending to an
+  existing table fails its `$1::regclass` lookup (#13), and temporary tables
+  aren't available because the endpoint rejects `CREATE TEMP TABLE`.
+- **COPY result reads** fail: the endpoint rejects binary
+  `COPY ... TO STDOUT`, so set `adbc.postgresql.use_copy` to `false` (#11).
+  The non-COPY path fetches the whole result at once, so it ignores
+  `adbc.postgresql.batch_size_hint_bytes`, the connection reports idle in
+  a transaction rather than active while you read (#11), and a running
+  query can't be cancelled (#48).
+- **Parameterized queries** fail or return wrong results (#17), and
+  `GetParameterSchema` fails on queries whose result types the endpoint
+  can't infer.
+- **Rows affected** is wrong for `DELETE` (#19), and is the row count rather
+  than -1 for a `SELECT` on the non-COPY path (#50). `ExecuteQuery` on an
+  `INSERT` also returns the endpoint's `Count` row as a batch (#49).
+- **Metadata:** `GetObjects` and the current catalog don't reflect MotherDuck
+  databases and schemas (#14), `GetTableSchema` fails its `$1::regclass`
+  lookup (#13), `GetInfo` reports PostgreSQL and queries
+  `server_version_num` (#15), and `GetStatistics` isn't supported (it reads
+  `pg_stats`).
+- **Transactions:** DuckDB has a single isolation level and the endpoint
+  rejects `SET TRANSACTION`, so isolation levels can't be set.
+- **Types:** PostgreSQL-only types such as `jsonb` and `int2vector` don't
+  exist, DuckDB `DECIMAL` holds at most 38 digits, and lists of decimals
+  can't be bound (#37).
+- **Errors:** data conversion errors map to `INTERNAL` instead of
+  `INVALID_DATA` (#32).
+
 ## Inherited tests
 
 The complete upstream C++ test suites are compiled in test builds. The
