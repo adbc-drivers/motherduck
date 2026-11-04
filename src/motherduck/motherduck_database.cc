@@ -40,44 +40,7 @@
 namespace adbcpq {
 
 namespace {
-// Whether libpq session options set a setting, as --<name>=<value> or
-// -c <name>=<value>, with either underscores or dashes in the name.
-bool SetsSessionOption(std::string_view options, std::string_view name) {
-  std::string underscores(name);
-  std::string dashes(name);
-  for (char& c : dashes) {
-    if (c == '_') c = '-';
-  }
-  underscores += '=';
-  dashes += '=';
-  // Split on whitespace, as libpq does, keeping backslash escapes in each arg.
-  bool after_c = false;
-  size_t i = 0;
-  while (i < options.size()) {
-    if (std::isspace(static_cast<unsigned char>(options[i]))) {
-      i++;
-      continue;
-    }
-    size_t start = i;
-    while (i < options.size() && !std::isspace(static_cast<unsigned char>(options[i]))) {
-      if (options[i] == '\\' && i + 1 < options.size()) i++;
-      i++;
-    }
-    std::string_view arg = options.substr(start, i - start);
-    // A bare <name>=<value> only counts as a setting right after -c.
-    bool setting_arg = after_c;
-    after_c = arg == "-c";
-    if (arg.substr(0, 2) == "--" || arg.substr(0, 2) == "-c") {
-      arg.remove_prefix(2);
-      setting_arg = true;
-    }
-    if (!setting_arg) continue;
-    for (std::string_view setting : {underscores, dashes}) {
-      if (arg.substr(0, setting.size()) == setting) return true;
-    }
-  }
-  return false;
-}
+constexpr char kDefaultAttachMode[] = "single";
 
 // An environment variable, or empty if it's unset.
 std::string GetEnv(const char* name) {
@@ -133,16 +96,12 @@ std::string RegionHost(std::string_view region) {
   return host;
 }
 
-std::string AddSessionOption(std::string_view options, std::string_view name,
-                             std::string_view value) {
-  std::string result(options);
-  if (SetsSessionOption(options, name)) return result;
-  if (!result.empty()) result += ' ';
-  result += "--";
-  result += name;
-  result += '=';
-  result += EscapeOptionValue(value);
-  return result;
+std::string SessionOption(std::string_view name, std::string_view value) {
+  std::string option = "--";
+  option += name;
+  option += '=';
+  option += EscapeOptionValue(value);
+  return option;
 }
 
 std::string_view MotherduckDatabase::DriverVersion() {
@@ -167,7 +126,7 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
   // Options that are unset when empty.
   const std::string* optional = nullptr;
   if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
-    output = attach_mode_;
+    output = attach_mode_.empty() ? kDefaultAttachMode : attach_mode_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
     optional = &session_name_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
@@ -340,11 +299,25 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   if (!username_.empty()) user = username_;
   if (user.empty()) user = "postgres";
   params->emplace_back("user", std::move(user));
-  options = AddSessionOption(options, "attach_mode", attach_mode_);
-  if (!session_name_.empty()) {
-    options = AddSessionOption(options, "session_name", session_name_);
+  // MotherDuck keeps the last value of a repeated setting, so defaults go
+  // before the URI's options (or PGOPTIONS) and explicit options after them.
+  std::vector<std::string> session_options;
+  if (attach_mode_.empty()) {
+    session_options.push_back(SessionOption("attach_mode", kDefaultAttachMode));
   }
-  params->emplace_back("options", std::move(options));
+  if (!options.empty()) session_options.push_back(std::move(options));
+  if (!attach_mode_.empty()) {
+    session_options.push_back(SessionOption("attach_mode", attach_mode_));
+  }
+  if (!session_name_.empty()) {
+    session_options.push_back(SessionOption("session_name", session_name_));
+  }
+  std::string joined;
+  for (const std::string& session_option : session_options) {
+    if (!joined.empty()) joined += ' ';
+    joined += session_option;
+  }
+  params->emplace_back("options", std::move(joined));
   // MotherDuck's user agent comes from application_name: append the driver to
   // the application's name. Always passing it means PGAPPNAME is never used.
   if (application_name.empty()) application_name = fallback_application_name;

@@ -79,35 +79,11 @@ TEST(MotherDuckAttachModeTest, OptionInvalid) {
               ::testing::Optional("single"s));
 }
 
-TEST(MotherDuckAttachModeTest, AddSessionOption) {
-  EXPECT_EQ("--attach_mode=single",
-            adbcpq::AddSessionOption("", "attach_mode", "single"));
-  EXPECT_EQ("--session_name=x --attach_mode=workspace",
-            adbcpq::AddSessionOption("--session_name=x", "attach_mode", "workspace"));
-  // Options from the URI win.
-  for (const char* options :
-       {"--attach_mode=workspace", "-c attach_mode=workspace", "-cattach_mode=workspace",
-        "--attach-mode=workspace", "-c attach-mode=workspace"}) {
-    EXPECT_EQ(options, adbcpq::AddSessionOption(options, "attach_mode", "single"));
-  }
-  // Other options that mention attach_mode don't count.
-  EXPECT_EQ(
-      "--session_name=attach_mode=x --attach_mode=single",
-      adbcpq::AddSessionOption("--session_name=attach_mode=x", "attach_mode", "single"));
-  EXPECT_EQ(
-      "--session_name=attach_mode --attach_mode=single",
-      adbcpq::AddSessionOption("--session_name=attach_mode", "attach_mode", "single"));
-  EXPECT_EQ("--session_name=a\\ attach_mode=x --attach_mode=single",
-            adbcpq::AddSessionOption("--session_name=a\\ attach_mode=x", "attach_mode",
-                                     "single"));
+TEST(MotherDuckAttachModeTest, SessionOption) {
+  EXPECT_EQ("--attach_mode=single", adbcpq::SessionOption("attach_mode", "single"));
   // Values are escaped for libpq.
   EXPECT_EQ("--session_name=a\\ b\\\tc\\\\d",
-            adbcpq::AddSessionOption("", "session_name", "a b\tc\\d"));
-  // A bare <name>=<value> isn't a setting unless it follows -c.
-  EXPECT_EQ("attach_mode=x --attach_mode=single",
-            adbcpq::AddSessionOption("attach_mode=x", "attach_mode", "single"));
-  EXPECT_EQ("-c foo=1 attach_mode=x --attach_mode=single",
-            adbcpq::AddSessionOption("-c foo=1 attach_mode=x", "attach_mode", "single"));
+            adbcpq::SessionOption("session_name", "a b\tc\\d"));
 }
 
 // The status of getting a database option, for options that may be unset.
@@ -324,11 +300,27 @@ TEST_F(MotherDuckConnectParamsTest, UsernameReplacesUriUser) {
 }
 
 TEST_F(MotherDuckConnectParamsTest, SessionOptions) {
+  // The default attach mode goes first, so the URI can override it; explicit
+  // options go last, so they override the URI.
   SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy");
   SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "adbc_session");
   EXPECT_THAT(
       Values("options"),
-      ::testing::ElementsAre("-c x=y --attach_mode=single --session_name=adbc_session"));
+      ::testing::ElementsAre("--attach_mode=single -c x=y --session_name=adbc_session"));
+  SetOption(ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, "workspace");
+  EXPECT_THAT(Values("options"),
+              ::testing::ElementsAre(
+                  "-c x=y --attach_mode=workspace --session_name=adbc_session"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, PgoptionsBetweenDefaultsAndOptions) {
+  ScopedEnv pgoptions("PGOPTIONS", "--attach_mode=workspace");
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("options"),
+              ::testing::ElementsAre("--attach_mode=single --attach_mode=workspace"));
+  SetOption(ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, "single");
+  EXPECT_THAT(Values("options"),
+              ::testing::ElementsAre("--attach_mode=workspace --attach_mode=single"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, SessionNameEscaped) {

@@ -36,12 +36,9 @@ namespace adbcpq {
 /// pg.us-east-1-aws.motherduck.com for us-east-1.
 std::string RegionHost(std::string_view region);
 
-/// \brief Append --<name>=<value> to libpq session options.
-///
-/// Returns options unchanged if they already set name. Escapes whitespace and
-/// backslashes in value, which libpq treats specially.
-std::string AddSessionOption(std::string_view options, std::string_view name,
-                             std::string_view value);
+/// \brief A libpq session option, --<name>=<value>, with whitespace and
+/// backslashes in value escaped.
+std::string SessionOption(std::string_view name, std::string_view value);
 
 class MotherduckDatabase : public PostgresDatabase {
  public:
@@ -60,7 +57,8 @@ class MotherduckDatabase : public PostgresDatabase {
   std::string_view DriverVersion() override;
 
  private:
-  std::string attach_mode_ = "single";
+  // Empty until set, so the URI can override the default.
+  std::string attach_mode_;
   std::string session_name_;
   std::string region_;
   std::string username_;

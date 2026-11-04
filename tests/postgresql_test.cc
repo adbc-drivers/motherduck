@@ -773,7 +773,7 @@ void ListCatalogs(struct AdbcDatabase* database, std::vector<std::string>* catal
 }
 }  // namespace
 
-// With the default attach_mode=single, other databases in the account aren't
+// With attach_mode=single (the default), other databases in the account aren't
 // catalogs; with workspace, they are.
 TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
   Handle<struct AdbcDatabase> workspace;
@@ -792,16 +792,43 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
                          "CREATE DATABASE " + quirks_.QuoteIdentifier(other), &error),
               IsOkStatus(&error));
 
+  // attach_mode in the URI overrides the default, and the option overrides the
+  // URI. This relies on MotherDuck keeping the last value of a repeated setting.
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  std::string workspace_uri = uri;
+  workspace_uri += std::strchr(uri, '?') ? "&" : "?";
+  workspace_uri += "options=--attach_mode%3Dworkspace";
+  Handle<struct AdbcDatabase> uri_workspace;
+  Handle<struct AdbcDatabase> option_single;
+  for (struct AdbcDatabase* db : {&uri_workspace.value, &option_single.value}) {
+    ASSERT_THAT(AdbcDatabaseNew(db, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupDatabase(db, workspace_uri.c_str(), &error),
+                IsOkStatus(&error));
+  }
+  ASSERT_THAT(AdbcDatabaseSetOption(&option_single.value,
+                                    ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, "single", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&uri_workspace.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&option_single.value, &error), IsOkStatus(&error));
+
   std::vector<std::string> workspace_catalogs;
   std::vector<std::string> single_catalogs;
+  std::vector<std::string> uri_workspace_catalogs;
+  std::vector<std::string> option_single_catalogs;
   ListCatalogs(&workspace.value, &workspace_catalogs);
   ListCatalogs(&database, &single_catalogs);
+  ListCatalogs(&uri_workspace.value, &uri_workspace_catalogs);
+  ListCatalogs(&option_single.value, &option_single_catalogs);
   EXPECT_THAT(ExecuteSql(&workspace.value, drop, &error), IsOkStatus(&error));
   if (HasFatalFailure()) return;
 
   EXPECT_THAT(workspace_catalogs, ::testing::IsSupersetOf({catalog, other}));
   EXPECT_THAT(single_catalogs, ::testing::Contains(catalog));
   EXPECT_THAT(single_catalogs, ::testing::Not(::testing::Contains(other)));
+  EXPECT_THAT(uri_workspace_catalogs, ::testing::IsSupersetOf({catalog, other}));
+  EXPECT_THAT(option_single_catalogs, ::testing::Contains(catalog));
+  EXPECT_THAT(option_single_catalogs, ::testing::Not(::testing::Contains(other)));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
