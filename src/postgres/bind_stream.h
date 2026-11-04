@@ -317,8 +317,9 @@ struct BindStream {
   // the transaction it began, then restore the time zone: PostgreSQL's ROLLBACK
   // restores it, but MotherDuck's doesn't. Otherwise the transaction is the
   // user's, so leave it open. If it has failed, the server rejects the SET until
-  // the user rolls back. If it hasn't (the error came from the driver, not the
-  // server), restore the time zone here, as Cleanup() does.
+  // the user rolls back; on MotherDuck the session then stays in UTC, since
+  // the rollback doesn't restore it. If it hasn't (the error came from the
+  // driver, not the server), restore the time zone here, as Cleanup() does.
   void Abort(PGconn* pg_conn) {
     if (!has_tz_field) return;
     // The failure that got us here is the error worth reporting, so ignore

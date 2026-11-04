@@ -54,7 +54,7 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
 
   Status status;
   if (schema_->release == nullptr) {
-    status = Initialize(nullptr);
+    status = AbortBindOnError(Initialize(nullptr));
     if (!status.ok()) {
       status.ToAdbc(&error_);
       return EINVAL;
@@ -98,6 +98,28 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
   }
 
   nanoarrow::UniqueArray tmp;
+  int code = ReadResult(tmp.get());
+  if (code != NANOARROW_OK) {
+    // A value the field readers reject ends the bind like any other error.
+    AbortBind();
+    return code;
+  }
+
+  // Signal that the next call to GetNext() will have to populate the result again
+  helper_.ClearResult();
+
+  // Canonically return zero-size results as an empty stream
+  if (tmp->length == 0) {
+    out->release = nullptr;
+    return NANOARROW_OK;
+  }
+
+  ArrowArrayMove(tmp.get(), out);
+  return NANOARROW_OK;
+}
+
+int PqResultArrayReader::ReadResult(struct ArrowArray* out) {
+  nanoarrow::UniqueArray tmp;
   NANOARROW_RETURN_NOT_OK(ArrowArrayInitFromSchema(tmp.get(), schema_.get(), &na_error_));
   NANOARROW_RETURN_NOT_OK(ArrowArrayStartAppending(tmp.get()));
   for (int i = 0; i < helper_.NumColumns(); i++) {
@@ -133,16 +155,6 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
   tmp->length = helper_.NumRows();
   tmp->null_count = 0;
   NANOARROW_RETURN_NOT_OK(ArrowArrayFinishBuildingDefault(tmp.get(), &na_error_));
-
-  // Signal that the next call to GetNext() will have to populate the result again
-  helper_.ClearResult();
-
-  // Canonically return zero-size results as an empty stream
-  if (tmp->length == 0) {
-    out->release = nullptr;
-    return NANOARROW_OK;
-  }
-
   ArrowArrayMove(tmp.get(), out);
   return NANOARROW_OK;
 }

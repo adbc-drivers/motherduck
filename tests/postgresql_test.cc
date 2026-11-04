@@ -3334,51 +3334,97 @@ TEST_F(PostgresStatementTest, ExecuteManyTimestampTzError) {
   ASSERT_EQ("0", rows);
 }
 
+// After a failed bind that set the time zone to UTC, check that the session's
+// America/New_York is back and that the connection commits again. A
+// transaction left open would keep an insert from committing, which only
+// another connection can see.
+void ExpectBindUndone(struct AdbcDatabase* database, struct AdbcStatement* statement,
+                      const std::string& table, struct AdbcError* error) {
+  std::string time_zone;
+  ASSERT_NO_FATAL_FAILURE(QueryScalar(
+      statement, "SELECT CAST(current_setting('TimeZone') AS TEXT)", &time_zone, error));
+  ASSERT_EQ("America/New_York", time_zone);
+  const std::string insert = "INSERT INTO " + table + " VALUES (1)";
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(statement, {insert.c_str()}, error));
+  adbc_validation::Handle<struct AdbcConnection> other;
+  adbc_validation::Handle<struct AdbcStatement> other_statement;
+  ASSERT_THAT(AdbcConnectionNew(&other.value, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcConnectionInit(&other.value, database, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementNew(&other.value, &other_statement.value, error),
+              IsOkStatus(error));
+  std::string rows;
+  ASSERT_NO_FATAL_FAILURE(CountRows(&other_statement.value, table, &rows, error));
+  ASSERT_EQ("1", rows);
+}
+
 TEST_F(PostgresStatementTest, PrepareErrorRestoresTimeZone) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_NO_FATAL_FAILURE(ExecuteEach(
-      &statement,
-      {"DROP TABLE IF EXISTS test_prepare_error_tz",
-       "CREATE TABLE test_prepare_error_tz (x INT)", "SET TimeZone = 'America/New_York'"},
-      &error));
 
   // Binding a TIMESTAMPTZ under autocommit begins a transaction and sets the
   // time zone to UTC before the query is prepared. When the prepare fails, both
   // must be undone. MotherDuck's ROLLBACK leaves the time zone alone, so this
-  // also checks that the driver sets it back itself.
+  // also checks that the driver sets it back itself. Without a result stream
+  // the driver runs every row up front (ExecuteAll); with one it prepares in
+  // Initialize().
+  for (bool with_stream : {false, true}) {
+    SCOPED_TRACE(with_stream ? "with a result stream" : "without a result stream");
+    ASSERT_NO_FATAL_FAILURE(ExecuteEach(&statement,
+                                        {"DROP TABLE IF EXISTS test_prepare_error_tz",
+                                         "CREATE TABLE test_prepare_error_tz (x INT)",
+                                         "SET TimeZone = 'America/New_York'"},
+                                        &error));
+    adbc_validation::Handle<struct ArrowSchema> schema;
+    adbc_validation::Handle<struct ArrowArray> batch;
+    ASSERT_NO_FATAL_FAILURE(MakeTimestampTzBatch(&schema.value, &batch.value, {0}));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(
+                    &statement,
+                    "SELECT * FROM test_prepare_error_tz_missing WHERE ts = $1", &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+                IsOkStatus(&error));
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcStatementExecuteQuery(
+            &statement, with_stream ? &reader.stream.value : nullptr, nullptr, &error),
+        ::testing::Not(IsOkStatus(&error)));
+    error.release(&error);
+
+    ASSERT_NO_FATAL_FAILURE(
+        ExpectBindUndone(&database, &statement, "test_prepare_error_tz", &error));
+  }
+}
+
+TEST_F(PostgresStatementTest, DecodeErrorRestoresTimeZone) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(
+      &statement,
+      {"DROP TABLE IF EXISTS test_decode_error_tz",
+       "CREATE TABLE test_decode_error_tz (x INT)", "SET TimeZone = 'America/New_York'"},
+      &error));
+
+  // The query runs, but the interval overflows nanoseconds, so reading the
+  // result fails. That must undo the bind like an error from the server.
   adbc_validation::Handle<struct ArrowSchema> schema;
   adbc_validation::Handle<struct ArrowArray> batch;
   ASSERT_NO_FATAL_FAILURE(MakeTimestampTzBatch(&schema.value, &batch.value, {0}));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &statement, "SELECT * FROM test_prepare_error_tz_missing WHERE ts = $1",
-                  &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "SELECT INTERVAL '3000000 hours' AS v "
+                                       "WHERE CAST($1 AS TIMESTAMPTZ) IS NOT NULL",
+                                       &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
               IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
-              ::testing::Not(IsOkStatus(&error)));
-  error.release(&error);
+  {
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                          &reader.rows_affected, &error),
+                IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NE(0, reader.MaybeNext());
+  }
 
-  std::string time_zone;
-  ASSERT_NO_FATAL_FAILURE(QueryScalar(&statement,
-                                      "SELECT CAST(current_setting('TimeZone') AS TEXT)",
-                                      &time_zone, &error));
-  ASSERT_EQ("America/New_York", time_zone);
-
-  // A transaction left open would keep this insert from committing, which only
-  // another connection can see.
   ASSERT_NO_FATAL_FAILURE(
-      ExecuteEach(&statement, {"INSERT INTO test_prepare_error_tz VALUES (1)"}, &error));
-  adbc_validation::Handle<struct AdbcConnection> other;
-  adbc_validation::Handle<struct AdbcStatement> other_statement;
-  ASSERT_THAT(AdbcConnectionNew(&other.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcConnectionInit(&other.value, &database, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementNew(&other.value, &other_statement.value, &error),
-              IsOkStatus(&error));
-  std::string rows;
-  ASSERT_NO_FATAL_FAILURE(
-      CountRows(&other_statement.value, "test_prepare_error_tz", &rows, &error));
-  ASSERT_EQ("1", rows);
+      ExpectBindUndone(&database, &statement, "test_decode_error_tz", &error));
 }
 
 TEST_F(PostgresStatementTest, SetUseCopyFalse) {

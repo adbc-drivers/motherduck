@@ -112,14 +112,23 @@ class PqResultArrayReader {
 
   Status BindNextAndExecute(int64_t* affected_rows);
 
-  // If status is an error, undo what the bind stream set up
-  // (BindStream::Abort()) and drop it, so the transaction it may have begun
-  // isn't left open and a retry doesn't run more rows. Returns status.
-  Status AbortBindOnError(Status status) {
-    if (!status.ok() && bind_stream_) {
+  // Decode the current result into out. Returns an errno code, with the
+  // message in na_error_.
+  int ReadResult(struct ArrowArray* out);
+
+  // Undo what the bind stream set up (BindStream::Abort()) and drop it, so the
+  // transaction it may have begun isn't left open and a retry doesn't run more
+  // rows.
+  void AbortBind() {
+    if (bind_stream_) {
       bind_stream_->Abort(conn_);
       bind_stream_.reset();
     }
+  }
+
+  // AbortBind() if status is an error. Returns status.
+  Status AbortBindOnError(Status status) {
+    if (!status.ok()) AbortBind();
     return status;
   }
   virtual Status ExecuteAll(int64_t* affected_rows);
