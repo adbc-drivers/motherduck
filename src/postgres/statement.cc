@@ -396,8 +396,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                                   PostgresType* copy_target_types,
                                                   bool* has_copy_target_types,
                                                   struct AdbcError* error) {
-  // Check every column name before running any DDL, so a bad schema fails
-  // before replace mode drops the target table.
+  // A NULL column name can't be escaped (or used at all).
   for (int64_t i = 0; i < source_schema.n_children; i++) {
     if (source_schema.children[i]->name == nullptr) {
       InternalAdbcSetError(
@@ -442,6 +441,33 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
     }
   }
 
+  // Escape every column name and resolve every type before running any DDL,
+  // so a bad schema fails before replace mode drops the target table.
+  std::string columns;
+  std::vector<std::string> source_field_names;
+  source_field_names.reserve(source_schema.n_children);
+  for (int64_t i = 0; i < source_schema.n_children; i++) {
+    if (i > 0) {
+      columns += ", ";
+      *escaped_field_list += ", ";
+    }
+
+    const char* unescaped = source_schema.children[i]->name;
+    std::string escaped;
+    RAISE_ADBC(EscapeIdentifier(conn, unescaped, &escaped, error));
+    columns += escaped;
+    *escaped_field_list += escaped;
+    source_field_names.emplace_back(unescaped);
+
+    PostgresType pg_type;
+    struct ArrowError na_error;
+    CHECK_NA_DETAIL(INTERNAL,
+                    PostgresType::FromSchema(*type_resolver_, source_schema.children[i],
+                                             &pg_type, &na_error),
+                    &na_error, error);
+    columns += " " + pg_type.sql_type_name();
+  }
+
   std::string create;
 
   if (ingest_.temporary) {
@@ -478,30 +504,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
   }
   create += *escaped_table;
   create += " (";
-  std::vector<std::string> source_field_names;
-  source_field_names.reserve(source_schema.n_children);
-
-  for (int64_t i = 0; i < source_schema.n_children; i++) {
-    if (i > 0) {
-      create += ", ";
-      *escaped_field_list += ", ";
-    }
-
-    const char* unescaped = source_schema.children[i]->name;
-    std::string escaped;
-    RAISE_ADBC(EscapeIdentifier(conn, unescaped, &escaped, error));
-    create += escaped;
-    *escaped_field_list += escaped;
-    source_field_names.emplace_back(unescaped);
-
-    PostgresType pg_type;
-    struct ArrowError na_error;
-    CHECK_NA_DETAIL(INTERNAL,
-                    PostgresType::FromSchema(*type_resolver_, source_schema.children[i],
-                                             &pg_type, &na_error),
-                    &na_error, error);
-    create += " " + pg_type.sql_type_name();
-  }
+  create += columns;
 
   if (ingest_.mode == IngestMode::kAppend) {
     AdbcStatusCode status = ResolveCopyTargetTypes(*escaped_table, source_field_names,
