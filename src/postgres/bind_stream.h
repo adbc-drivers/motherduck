@@ -313,12 +313,12 @@ struct BindStream {
     return Status::Ok();
   }
 
-  // Undo SetDatabaseTimezoneUTC after a failure. Under autocommit, rolling
-  // back the transaction it began also restores the time zone. Otherwise the
-  // transaction is the user's, so leave it open. If it has failed, the user
-  // must roll it back, which restores the time zone. If it hasn't (the error
-  // came from the driver, not the server), restore the time zone here, as
-  // Cleanup() does.
+  // Undo SetDatabaseTimezoneUTC after a failure. Under autocommit, roll back
+  // the transaction it began, then restore the time zone: PostgreSQL's ROLLBACK
+  // restores it, but MotherDuck's doesn't. Otherwise the transaction is the
+  // user's, so leave it open. If it has failed, the server rejects the SET until
+  // the user rolls back. If it hasn't (the error came from the driver, not the
+  // server), restore the time zone here, as Cleanup() does.
   void Abort(PGconn* pg_conn) {
     if (!has_tz_field) return;
     // The failure that got us here is the error worth reporting, so ignore
@@ -326,7 +326,8 @@ struct BindStream {
     if (autocommit) {
       PqResultHelper rollback(pg_conn, "ROLLBACK");
       (void)rollback.Execute();
-    } else if (!tz_setting.empty() && PQtransactionStatus(pg_conn) != PQTRANS_INERROR) {
+    }
+    if (!tz_setting.empty() && PQtransactionStatus(pg_conn) != PQTRANS_INERROR) {
       (void)RestoreTimezone(pg_conn);
     }
   }
