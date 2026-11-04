@@ -44,6 +44,7 @@
 #include <arrow-adbc/driver/postgresql.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
+#include <libpq-fe.h>
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow.hpp>
 
@@ -561,6 +562,72 @@ TEST_F(PostgresDatabaseTest, SessionNameOption) {
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
               IsOkStatus(&error));
+}
+
+// Each sslmode against MotherDuck's endpoint, which refuses plaintext: every
+// mode that connects must use TLS. The CA bundle comes from the test URI,
+// since some libpq builds can't read the system trust store.
+TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  char* parse_error = nullptr;
+  PQconninfoOption* conninfo = PQconninfoParse(uri, &parse_error);
+  ASSERT_NE(conninfo, nullptr) << (parse_error ? parse_error : "out of memory");
+  std::string base;
+  std::string rootcert;
+  for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
+    if (option->val == nullptr || *option->val == '\0') continue;
+    std::string_view keyword = option->keyword;
+    if (keyword == "sslrootcert") {
+      rootcert = option->val;
+    } else if (keyword == "host" || keyword == "port" || keyword == "dbname" ||
+               keyword == "user") {
+      base += std::string(keyword) + "='" + option->val + "' ";
+    }
+  }
+  PQconninfoFree(conninfo);
+  ASSERT_FALSE(rootcert.empty()) << "Test URI must set sslrootcert";
+
+  struct Case {
+    const char* sslmode;
+    std::string sslrootcert;
+    bool connects;
+  };
+  const Case kCases[] = {
+      // The endpoint refuses plaintext.
+      {"disable", "", false},
+      // allow and prefer retry with TLS after that refusal.
+      {"allow", "", true},
+      {"prefer", "", true},
+      {"require", "", true},
+      {"verify-ca", rootcert, true},
+      {"verify-full", rootcert, true},
+      // libpq refuses anything but verify-full with the system trust store.
+      {"require", "system", false},
+      {"verify-ca", "system", false},
+  };
+  ScopedEnv pgsslmode("PGSSLMODE", nullptr);
+  ScopedEnv pgsslrootcert("PGSSLROOTCERT", nullptr);
+  for (const Case& test_case : kCases) {
+    std::string conn_uri = base + "sslmode=" + test_case.sslmode;
+    if (!test_case.sslrootcert.empty()) {
+      conn_uri += " sslrootcert='" + test_case.sslrootcert + "'";
+    }
+    SCOPED_TRACE(std::string("sslmode=") + test_case.sslmode +
+                 " sslrootcert=" + test_case.sslrootcert);
+    adbcpq::MotherduckDatabase database;
+    ASSERT_THAT(database.SetOption("uri", conn_uri.c_str(), &error), IsOkStatus(&error));
+    PGconn* conn = nullptr;
+    AdbcStatusCode status = database.Connect(&conn, &error);
+    if (!test_case.connects) {
+      EXPECT_THAT(status, IsStatus(ADBC_STATUS_IO, &error));
+      if (error.release) error.release(&error);
+      continue;
+    }
+    ASSERT_THAT(status, IsOkStatus(&error));
+    EXPECT_EQ(PQsslInUse(conn), 1);
+    ASSERT_THAT(database.Disconnect(&conn, &error), IsOkStatus(&error));
+  }
 }
 
 TEST_F(PostgresDatabaseTest, TypeResolverModeOptionIgnored) {

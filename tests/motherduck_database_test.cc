@@ -352,30 +352,53 @@ TEST_F(MotherDuckConnectParamsTest, RegionRequiresTls) {
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
 }
 
-TEST_F(MotherDuckConnectParamsTest, RegionKeepsSslmode) {
-  SetOption("uri", "postgresql:///db?sslmode=verify-full");
-  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
-  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
-  {
-    ScopedEnv pgsslmode("PGSSLMODE", "verify-full");
-    SetOption("uri", "postgresql:///db");
-    EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
-  }
-}
+// Every combination of region, sslmode (URI and PGSSLMODE) and sslrootcert
+// source. The URI's sslmode passes through unchanged. A region adds
+// sslmode=require only when nothing else sets sslmode and sslrootcert isn't
+// system, which already makes libpq default to verify-full and reject require.
+TEST_F(MotherDuckConnectParamsTest, SslmodeMatrix) {
+  struct RootCert {
+    const char* uri;
+    const char* env;
+    bool system;
+  };
+  const RootCert kRootCerts[] = {
+      {"", nullptr, false},
+      {"system", nullptr, true},
+      {"", "system", true},
+      {"/tmp/root.crt", nullptr, false},
+      // The URI wins over PGSSLROOTCERT.
+      {"/tmp/root.crt", "system", false},
+  };
+  for (const char* region : {"", "us-east-1"}) {
+    for (const char* uri_mode :
+         {"", "disable", "allow", "prefer", "require", "verify-ca", "verify-full"}) {
+      for (const char* env_mode : {static_cast<const char*>(nullptr), "prefer"}) {
+        for (const RootCert& rootcert : kRootCerts) {
+          ScopedEnv pgsslmode("PGSSLMODE", env_mode);
+          ScopedEnv pgsslrootcert("PGSSLROOTCERT", rootcert.env);
+          std::string query;
+          if (*uri_mode != '\0') query += std::string("&sslmode=") + uri_mode;
+          if (*rootcert.uri != '\0') query += std::string("&sslrootcert=") + rootcert.uri;
+          std::string uri = "postgresql:///db";
+          if (!query.empty()) uri += "?" + query.substr(1);
+          SCOPED_TRACE(uri + " region=" + region +
+                       " PGSSLMODE=" + (env_mode ? env_mode : "(unset)") +
+                       " PGSSLROOTCERT=" + (rootcert.env ? rootcert.env : "(unset)"));
+          SetOption("uri", uri.c_str());
+          SetOption(ADBC_MOTHERDUCK_OPTION_REGION, region);
 
-TEST_F(MotherDuckConnectParamsTest, RegionSystemRootCert) {
-  // libpq makes sslrootcert=system imply verify-full, and rejects require.
-  SetOption("uri", "postgresql:///db?sslrootcert=system");
-  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
-  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
-  SetOption("uri", "postgresql:///db");
-  {
-    ScopedEnv pgsslrootcert("PGSSLROOTCERT", "system");
-    EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+          std::vector<std::string> expected;
+          if (*uri_mode != '\0') {
+            expected.push_back(uri_mode);
+          } else if (*region != '\0' && env_mode == nullptr && !rootcert.system) {
+            expected.push_back("require");
+          }
+          EXPECT_EQ(Values("sslmode"), expected);
+        }
+      }
+    }
   }
-  // A root certificate file doesn't change the default sslmode.
-  SetOption("uri", "postgresql:///db?sslrootcert=/tmp/root.crt");
-  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionPort) {
