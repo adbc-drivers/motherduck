@@ -68,7 +68,8 @@ AdbcStatusCode ClassifySqlState(const char* sqlstate);
 /// \brief Quote an identifier with PQescapeIdentifier, storing the result in *out.
 ///
 /// libpq rejects identifiers that are not valid in the client encoding, so a
-/// failure is reported as ADBC_STATUS_INVALID_ARGUMENT.
+/// failure is reported as ADBC_STATUS_INVALID_ARGUMENT (libpq also fails if it
+/// runs out of memory, which is rare enough not to distinguish).
 AdbcStatusCode EscapeIdentifier(PGconn* conn, std::string_view identifier,
                                 std::string* out, struct AdbcError* error);
 
