@@ -160,8 +160,8 @@ struct BindStream {
       // tz-aware timestamps require special handling to set the timezone to UTC
       // prior to sending over the binary protocol; must be reset after execute
       if (!has_tz_field && type.type_id() == PostgresTypeId::kTimestamptz) {
-        // Set these first, so Abort() undoes a transaction begun before a
-        // later step failed.
+        // Set these before SetDatabaseTimezoneUTC, which may begin a transaction
+        // and then fail, so that Abort() still undoes it.
         has_tz_field = true;
         this->autocommit = autocommit;
         UNWRAP_STATUS(SetDatabaseTimezoneUTC(pg_conn, autocommit));
@@ -321,7 +321,8 @@ struct BindStream {
   // Cleanup() does.
   void Abort(PGconn* pg_conn) {
     if (!has_tz_field) return;
-    // The failure that got us here is the error worth reporting.
+    // The failure that got us here is the error worth reporting, so ignore
+    // errors from undoing it.
     if (autocommit) {
       PqResultHelper rollback(pg_conn, "ROLLBACK");
       (void)rollback.Execute();

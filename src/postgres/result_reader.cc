@@ -91,13 +91,9 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
   // wrong type. This runs on every call, and the result is kept, so retrying
   // after the error fails again instead of decoding it or ending the stream
   // early.
-  status = CheckResultMatches(helper_, field_types_, bind_row_);
+  status = AbortBindOnError(CheckResultMatches(helper_, field_types_, bind_row_));
   if (!status.ok()) {
     status.ToAdbc(&error_);
-    if (bind_stream_) {
-      bind_stream_->Abort(conn_);
-      bind_stream_.reset();
-    }
     return EIO;
   }
 

@@ -99,10 +99,8 @@ Status MotherduckResultReader::ExecuteAll(int64_t* affected_rows) {
     if (affected_rows) {
       *affected_rows = rows_unknown ? -1 : total_rows;
     }
-    Status cleanup_status = bind_stream_->Cleanup(conn_);
-    if (!cleanup_status.ok()) bind_stream_->Abort(conn_);
+    UNWRAP_STATUS(AbortBindOnError(bind_stream_->Cleanup(conn_)));
     bind_stream_.reset();
-    UNWRAP_STATUS(cleanup_status);
   } else {
     UNWRAP_STATUS(ExecuteScript(conn_, query_, &helper_));
 

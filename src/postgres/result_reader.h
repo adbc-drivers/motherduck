@@ -89,7 +89,7 @@ class PqResultArrayReader {
   std::vector<std::unique_ptr<PostgresCopyFieldReader>> field_readers_;
   // The column types of the first result
   std::vector<Oid> field_types_;
-  // The index of the bind row last executed
+  // The 0-based index of the bind row last executed, for error messages
   int64_t bind_row_ = -1;
   nanoarrow::UniqueSchema schema_;
   bool autocommit_;
