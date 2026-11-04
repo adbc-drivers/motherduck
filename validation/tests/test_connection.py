@@ -20,12 +20,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from adbc_drivers_validation.tests.connection import (
-    TestConnection,  # noqa: F401
-    generate_tests,
-)
+import adbc_drivers_validation.tests.connection
+import pytest
+from adbc_drivers_validation.tests.connection import generate_tests
 
 from . import postgresql
+
+
+class TestConnection(adbc_drivers_validation.tests.connection.TestConnection):
+    @pytest.fixture(scope="class")
+    @classmethod
+    def get_objects_table(cls, driver, conn):
+        # It ingests, which needs COPY FROM STDIN (ECO-587).
+        pytest.skip("Needs COPY FROM STDIN (ECO-587)")
 
 
 def pytest_generate_tests(metafunc) -> None:
