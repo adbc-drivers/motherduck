@@ -86,13 +86,9 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return SetupDatabase(database, uri, error);
   }
 
-  // Works around https://github.com/adbc-drivers/motherduck/issues/11;
-  // MotherDuckDefaultsSelect covers the default.
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database, const char* uri,
                                struct AdbcError* error) const {
-    AdbcStatusCode status = AdbcDatabaseSetOption(database, "uri", uri, error);
-    if (status != ADBC_STATUS_OK) return status;
-    return AdbcDatabaseSetOption(database, "adbc.postgresql.use_copy", "false", error);
+    return AdbcDatabaseSetOption(database, "uri", uri, error);
   }
 
   std::string QuoteIdentifier(std::string_view name) const override {
@@ -386,36 +382,37 @@ TEST_F(PostgresDatabaseTest, UseCopyOption) {
 
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, key, "false", &error),
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, key, "true", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   use_copy = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
 
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::ConnectionGetOption(&connection.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
 
   ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::StatementGetOption(&statement.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 
-  ASSERT_THAT(AdbcConnectionSetOption(&connection.value, key, "true", &error),
+  ASSERT_THAT(AdbcConnectionSetOption(&connection.value, key, "false", &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::ConnectionGetOption(&connection.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
 
   ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::StatementGetOption(&statement.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 }
 
+// The endpoint rejects binary COPY TO STDOUT, so the default is off (#11).
 TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   const char* key = "adbc.postgresql.use_copy";
   std::optional<std::string> use_copy;
@@ -428,18 +425,18 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   use_copy = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
 
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::ConnectionGetOption(&connection.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
 
   ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::StatementGetOption(&statement.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 }
 
@@ -687,8 +684,8 @@ TEST_F(PostgresDatabaseTest, TypeResolverModeOptionIgnored) {
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
 }
 
-// https://github.com/adbc-drivers/motherduck/issues/11: by default, results come
-// through binary COPY TO STDOUT.
+// https://github.com/adbc-drivers/motherduck/issues/11: a query returning rows
+// works with the default options.
 TEST_F(PostgresDatabaseTest, MotherDuckDefaultsSelect) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   adbc_validation::Handle<struct AdbcConnection> connection;

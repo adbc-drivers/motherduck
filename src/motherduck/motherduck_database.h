@@ -44,6 +44,10 @@ std::string SessionOption(std::string_view name, std::string_view value);
 
 class MotherduckDatabase : public PostgresDatabase {
  public:
+  // The endpoint rejects binary COPY TO STDOUT, so results don't use it unless
+  // adbc.postgresql.use_copy asks for it (#11).
+  MotherduckDatabase() { use_copy_ = false; }
+
   AdbcStatusCode Init(struct AdbcError* error) override;
   AdbcStatusCode GetOption(const char* option, char* value, size_t* length,
                            struct AdbcError* error) override;
