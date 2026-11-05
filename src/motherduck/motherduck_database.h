@@ -64,6 +64,7 @@ class MotherduckDatabase : public PostgresDatabase {
   AdbcStatusCode ConnectParams(std::vector<std::pair<std::string, std::string>>* params,
                                struct AdbcError* error) const;
 
+  std::string_view InfoVendorName() override { return "MotherDuck"; }
   std::string_view DriverName() override { return "ADBC MotherDuck Driver"; }
   std::string_view DriverVersion() override;
 
