@@ -390,10 +390,57 @@ TEST_F(MotherDuckConnectParamsTest, RegionRequiresTls) {
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
 }
 
+TEST_F(MotherDuckConnectParamsTest, RequiresTls) {
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+  SetOption("uri", "host=localhost dbname=db");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, EmptySslmodeRequiresTls) {
+  // libpq uses the last value given for a keyword, so require wins.
+  SetOption("uri", "postgresql://localhost/db?sslmode=");
+  EXPECT_EQ(Values("sslmode").back(), "require");
+  SetOption("uri", "host=localhost dbname=db sslmode=''");
+  EXPECT_EQ(Values("sslmode").back(), "require");
+  ScopedEnv pgsslmode("PGSSLMODE", "");
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, KeepsUriSslmode) {
+  SetOption("uri", "postgresql://localhost/db?sslmode=verify-full");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+  SetOption("uri", "host=localhost dbname=db sslmode=disable");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("disable"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, KeepsRequiressl) {
+  // libpq translates the deprecated requiressl=1 into sslmode=require.
+  SetOption("uri", "host=localhost dbname=db requiressl=1");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, KeepsPgsslmode) {
+  ScopedEnv pgsslmode("PGSSLMODE", "verify-full");
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, KeepsServiceSslmode) {
+  // The service file may set sslmode, which a default here would override.
+  SetOption("uri", "service=md dbname=db");
+  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+  ScopedEnv pgservice("PGSERVICE", "md");
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+}
+
 // Every combination of region, sslmode (URI and PGSSLMODE) and sslrootcert
-// source. The URI's sslmode passes through unchanged. A region adds
-// sslmode=require only when nothing else sets sslmode and sslrootcert isn't
-// system, which already makes libpq default to verify-full and reject require.
+// source. The URI's sslmode passes through unchanged. The driver adds
+// sslmode=require, with or without a region, only when nothing else sets
+// sslmode and sslrootcert isn't system, which already makes libpq default to
+// verify-full and reject require.
 TEST_F(MotherDuckConnectParamsTest, SslmodeMatrix) {
   struct RootCert {
     const char* uri;
@@ -432,7 +479,7 @@ TEST_F(MotherDuckConnectParamsTest, SslmodeMatrix) {
           } else if (env_mode != nullptr) {
             // Passed explicitly, so libpq sees what the driver saw.
             expected.push_back(env_mode);
-          } else if (*region != '\0' && !rootcert.system) {
+          } else if (!rootcert.system) {
             expected.push_back("require");
           }
           EXPECT_EQ(Values("sslmode"), expected);
@@ -497,9 +544,8 @@ TEST_F(MotherDuckConnectParamsTest, OptionsLoneBackslash) {
               ::testing::ElementsAre("--attach_mode=single -c x=y\\\\ --session_name=s"));
 }
 
-TEST_F(MotherDuckConnectParamsTest, NoRegionLeavesSslmode) {
+TEST_F(MotherDuckConnectParamsTest, NoRegionLeavesPort) {
   SetOption("uri", "postgresql://localhost/db");
-  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
   EXPECT_THAT(Values("port"), ::testing::IsEmpty());
 }
 
