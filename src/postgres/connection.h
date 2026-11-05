@@ -25,7 +25,6 @@
 #include <array>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,24 +34,12 @@
 
 #include "postgres_type.h"
 
+namespace adbc::driver {
+struct GetObjectsHelper;
+}  // namespace adbc::driver
+
 namespace adbcpq {
 class PostgresDatabase;
-
-/// \brief Replacements for the queries GetObjects runs; unset ones keep the
-/// default. Each some_* query is its all_* query with the filter for that level
-/// added as the last parameter.
-struct PostgresGetObjectsQueryOverrides {
-  std::optional<std::string> all_catalogs;
-  std::optional<std::string> some_catalogs;
-  std::optional<std::string> all_schemas;
-  std::optional<std::string> some_schemas;
-  std::optional<std::string> all_tables;
-  std::optional<std::string> some_tables;
-  std::optional<std::string> all_columns;
-  std::optional<std::string> some_columns;
-  std::optional<std::string> all_constraints;
-  std::optional<std::string> some_constraints;
-};
 
 class PostgresConnection {
  public:
@@ -92,8 +79,9 @@ class PostgresConnection {
                                         const char* table_name,
                                         struct ArrowSchema* schema,
                                         struct AdbcError* error);
-  AdbcStatusCode GetTableTypes(struct AdbcConnection* connection,
-                               struct ArrowArrayStream* out, struct AdbcError* error);
+  virtual AdbcStatusCode GetTableTypes(struct AdbcConnection* connection,
+                                       struct ArrowArrayStream* out,
+                                       struct AdbcError* error);
   AdbcStatusCode Init(struct AdbcDatabase* database, struct AdbcError* error);
   AdbcStatusCode Release(struct AdbcError* error);
   AdbcStatusCode Rollback(struct AdbcError* error);
@@ -113,7 +101,7 @@ class PostgresConnection {
   const std::array<int, 3>& VendorVersion();
 
  protected:
-  virtual PostgresGetObjectsQueryOverrides GetObjectsQueryOverrides() const { return {}; }
+  virtual std::unique_ptr<adbc::driver::GetObjectsHelper> MakeGetObjectsHelper();
 
  private:
   friend class PostgresStatement;

@@ -183,20 +183,18 @@ static const char* kConstraintsQueryAll =
 
 class PostgresGetObjectsHelper : public adbc::driver::GetObjectsHelper {
  public:
-  explicit PostgresGetObjectsHelper(PGconn* conn,
-                                    const PostgresGetObjectsQueryOverrides& overrides)
+  explicit PostgresGetObjectsHelper(PGconn* conn)
       : current_database_(PQdb(conn)),
-        all_catalogs_(conn, overrides.all_catalogs.value_or(kCatalogQueryAll)),
-        some_catalogs_(conn, overrides.some_catalogs.value_or(CatalogQuery())),
-        all_schemas_(conn, overrides.all_schemas.value_or(kSchemaQueryAll)),
-        some_schemas_(conn, overrides.some_schemas.value_or(SchemaQuery())),
-        all_tables_(conn, overrides.all_tables.value_or(kTablesQueryAll)),
-        some_tables_(conn, overrides.some_tables.value_or(TablesQuery())),
-        all_columns_(conn, overrides.all_columns.value_or(kColumnsQueryAll)),
-        some_columns_(conn, overrides.some_columns.value_or(ColumnsQuery())),
-        all_constraints_(conn, overrides.all_constraints.value_or(kConstraintsQueryAll)),
-        some_constraints_(conn, overrides.some_constraints.value_or(ConstraintsQuery())) {
-  }
+        all_catalogs_(conn, kCatalogQueryAll),
+        some_catalogs_(conn, CatalogQuery()),
+        all_schemas_(conn, kSchemaQueryAll),
+        some_schemas_(conn, SchemaQuery()),
+        all_tables_(conn, kTablesQueryAll),
+        some_tables_(conn, TablesQuery()),
+        all_columns_(conn, kColumnsQueryAll),
+        some_columns_(conn, ColumnsQuery()),
+        all_constraints_(conn, kConstraintsQueryAll),
+        some_constraints_(conn, ConstraintsQuery()) {}
 
   Status Load(adbc::driver::GetObjectsDepth depth,
               std::optional<std::string_view> catalog_filter,
@@ -587,11 +585,16 @@ AdbcStatusCode PostgresConnection::GetInfo(struct AdbcConnection* connection,
   return ADBC_STATUS_OK;
 }
 
+std::unique_ptr<adbc::driver::GetObjectsHelper>
+PostgresConnection::MakeGetObjectsHelper() {
+  return std::make_unique<PostgresGetObjectsHelper>(conn_);
+}
+
 AdbcStatusCode PostgresConnection::GetObjects(
     struct AdbcConnection* connection, int c_depth, const char* catalog,
     const char* db_schema, const char* table_name, const char** table_type,
     const char* column_name, struct ArrowArrayStream* out, struct AdbcError* error) {
-  PostgresGetObjectsHelper helper(conn_, GetObjectsQueryOverrides());
+  std::unique_ptr<adbc::driver::GetObjectsHelper> helper = MakeGetObjectsHelper();
 
   const auto catalog_filter =
       catalog ? std::make_optional(std::string_view(catalog)) : std::nullopt;
@@ -632,9 +635,9 @@ AdbcStatusCode PostgresConnection::GetObjects(
 
   RAISE_ADBC(EnsureTransaction(error));
 
-  auto status = BuildGetObjects(&helper, depth, catalog_filter, schema_filter,
+  auto status = BuildGetObjects(helper.get(), depth, catalog_filter, schema_filter,
                                 table_filter, column_filter, table_type_filter, out);
-  RAISE_STATUS(error, helper.Close());
+  RAISE_STATUS(error, helper->Close());
   RAISE_STATUS(error, status);
 
   return ADBC_STATUS_OK;

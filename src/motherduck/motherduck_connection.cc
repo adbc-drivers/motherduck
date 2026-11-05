@@ -22,12 +22,22 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
+#include <memory>
 #include <string>
-#include <string_view>
 #include <vector>
 
+#include <libpq-fe.h>
+#include <nanoarrow/nanoarrow.hpp>
+
 #include "driver/common/utils.h"
+#include "driver/framework/objects.h"
+#include "driver/framework/status.h"
+#include "driver/framework/utility.h"
+#include "motherduck_get_objects.h"
+#include "postgres_type.h"
+#include "result_helper.h"
 
 namespace adbcpq {
 
@@ -39,67 +49,11 @@ constexpr uint32_t kMotherduckInfoCodes[] = {
     ADBC_INFO_DRIVER_ADBC_VERSION,
 };
 
-constexpr char kSchemasQuery[] =
-    "SELECT schema_name FROM duckdb_schemas() "
-    "WHERE database_name = current_database() "
-    "AND schema_name NOT IN ('information_schema', 'pg_catalog')";
-
-// Parameterized on schema_name, relkind. relkind is a PostgreSQL array literal
-// such as {"r", "v"}, which DuckDB can't cast to VARCHAR[], so this matches the
-// quoted relkind in the text. The temp database also has a main schema, so only
-// the current database's schemas match.
-constexpr char kTablesQuery[] =
-    "SELECT c.relname, CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' "
-    "WHEN 'm' THEN 'materialized view' WHEN 't' THEN 'TOAST table' "
-    "WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' END "
-    "AS reltype FROM pg_catalog.pg_class c "
-    "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-    "WHERE n.nspname = $1::VARCHAR "
-    "AND contains($2::VARCHAR, '\"' || c.relkind || '\"') "
-    "AND n.oid IN (SELECT oid FROM duckdb_schemas() "
-    "WHERE database_name = current_database())";
-
-// Parameterized on schema_name, table_name. DuckDB foreign keys can only
-// reference tables in the same schema.
-constexpr char kConstraintsQuery[] =
-    "WITH cons AS ( "
-    "    SELECT constraint_name AS conname, constraint_type AS contype, "
-    "    constraint_column_names AS colnames, "
-    "    CASE WHEN constraint_type = 'FOREIGN KEY' THEN schema_name END AS fschema, "
-    "    referenced_table AS ftable, referenced_column_names AS fcolnames "
-    "    FROM duckdb_constraints() "
-    "    WHERE database_name = current_database() AND schema_name = $1::VARCHAR "
-    "    AND table_name = $2::VARCHAR "
-    "    AND constraint_type IN ('CHECK', 'UNIQUE', 'PRIMARY KEY', 'FOREIGN KEY') "
-    ") "
-    "SELECT conname, contype, colnames, fschema, ftable, fcolnames FROM cons";
-
 constexpr char kNoStatistics[] =
     "[motherduck] %s is not supported by the MotherDuck driver: MotherDuck has no "
     "pg_stats to read statistics from";
 
 }  // namespace
-
-bool MotherduckIsMissingRelation(const char* message) {
-  if (message == nullptr) return false;
-  std::string_view view(message);
-  return view.find("Invalid Input Error: relation ") != std::string_view::npos &&
-         view.find(" does not exist") != std::string_view::npos;
-}
-
-PostgresGetObjectsQueryOverrides MotherduckGetObjectsQueryOverrides() {
-  PostgresGetObjectsQueryOverrides overrides;
-  overrides.all_schemas = kSchemasQuery;
-  // DuckDB identifiers are case-insensitive, so the schema and table filters are too.
-  overrides.some_schemas =
-      std::string(kSchemasQuery) + " AND lower(schema_name) = lower($1::VARCHAR)";
-  overrides.all_tables = kTablesQuery;
-  overrides.some_tables = std::string(kTablesQuery) + " AND c.relname ILIKE $3::VARCHAR";
-  overrides.all_constraints = kConstraintsQuery;
-  overrides.some_constraints =
-      std::string(kConstraintsQuery) + " WHERE conname LIKE $3::VARCHAR";
-  return overrides;
-}
 
 std::vector<uint32_t> MotherduckInfoCodes(const uint32_t* info_codes,
                                           size_t info_codes_length) {
@@ -141,17 +95,53 @@ AdbcStatusCode MotherduckConnection::GetTableSchema(const char* catalog,
                                                     const char* table_name,
                                                     struct ArrowSchema* schema,
                                                     struct AdbcError* error) {
-  AdbcStatusCode status =
-      PostgresConnection::GetTableSchema(catalog, db_schema, table_name, schema, error);
-  if (status == ADBC_STATUS_INTERNAL && error &&
-      MotherduckIsMissingRelation(error->message)) {
-    return ADBC_STATUS_NOT_FOUND;
+  if (table_name == nullptr) {
+    InternalAdbcSetError(error, "[motherduck] GetTableSchema requires a table name");
+    return ADBC_STATUS_INVALID_ARGUMENT;
   }
-  return status;
+  // A catalog without a schema means that catalog's default schema.
+  if (catalog != nullptr && db_schema == nullptr) db_schema = "main";
+
+  std::string name;
+  for (const char* part : {catalog, db_schema, table_name}) {
+    if (part == nullptr) continue;
+    char* quoted = PQescapeIdentifier(conn(), part, std::strlen(part));
+    if (quoted == nullptr) {
+      InternalAdbcSetError(error, "[motherduck] Failed to quote '%s': %s", part,
+                           PQerrorMessage(conn()));
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    if (!name.empty()) name += ".";
+    name += quoted;
+    PQfreemem(quoted);
+  }
+
+  // Describing a query resolves the name as any query does: ignoring case and
+  // through the search path. A missing table fails with 42P01 (NOT_FOUND).
+  PqResultHelper helper(conn(), "SELECT * FROM " + name);
+  RAISE_STATUS(error, helper.Prepare());
+  RAISE_STATUS(error, helper.DescribePrepared());
+  PostgresType output_type;
+  RAISE_STATUS(error, helper.ResolveOutputTypes(*type_resolver(), &output_type));
+
+  nanoarrow::UniqueSchema result;
+  ArrowSchemaInit(result.get());
+  CHECK_NA(INTERNAL, output_type.SetSchema(result.get(), std::string(VendorName())),
+           error);
+  result.move(schema);
+  return ADBC_STATUS_OK;
 }
 
-PostgresGetObjectsQueryOverrides MotherduckConnection::GetObjectsQueryOverrides() const {
-  return MotherduckGetObjectsQueryOverrides();
+AdbcStatusCode MotherduckConnection::GetTableTypes(struct AdbcConnection* connection,
+                                                   struct ArrowArrayStream* out,
+                                                   struct AdbcError* error) {
+  RAISE_STATUS(error, adbc::driver::MakeTableTypesStream({"table", "view"}, out));
+  return ADBC_STATUS_OK;
+}
+
+std::unique_ptr<adbc::driver::GetObjectsHelper>
+MotherduckConnection::MakeGetObjectsHelper() {
+  return MakeMotherduckGetObjectsHelper(conn());
 }
 
 }  // namespace adbcpq

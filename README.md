@@ -237,9 +237,15 @@ lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
   version.
 - `motherduck_connection`: `MotherduckConnection`, which leaves the vendor
   version out of `GetInfo` rather than report the endpoint's PostgreSQL
-  `server_version_num`, replaces the `GetObjects` schema, table and
-  constraint queries that fail on the endpoint, returns `NOT_FOUND` from
-  `GetTableSchema` for a missing table, and rejects the statistics calls.
+  `server_version_num`, describes `SELECT * FROM` the table for
+  `GetTableSchema`, reports only `table` and `view` table types, and rejects
+  the statistics calls.
+- `motherduck_get_objects`: the `GetObjects` helper, which reads DuckDB's
+  `duckdb_*()` metadata functions for every attached database, one query per
+  level, with case-insensitive filters.
+- `motherduck_error`: `ClassifyServerError`, which classifies the endpoint's
+  missing-object errors as `NOT_FOUND` although they arrive with the generic
+  SQLSTATE `XXUUU`.
 - `motherduck_statement`: `MotherduckStatement`, which accepts the result sets
   MotherDuck returns for DDL, and `MotherduckResultReader`, which runs queries
   without a result through a pipeline.
@@ -255,8 +261,9 @@ The upstream files still differ from Apache's in these ways:
   includes use paths relative to `src/postgres/`.
 - Hooks for the subclasses: `virtual` methods and `protected` members in
   `PostgresDatabase`, `PostgresConnection`, `PostgresStatement`, and
-  `PqResultArrayReader`; `GetObjectsQueryOverrides()`, which lets a
-  subclass replace any of the `GetObjects` queries;
+  `PqResultArrayReader`; `MakeGetObjectsHelper()`, which lets a subclass
+  supply the `GetObjects` helper; `ClassifyServerError()`, which `MakeStatus`
+  calls and `motherduck_error.cc` defines;
   `DriverName()` and `DriverVersion()`, which `GetInfo` reports; and the
   factory calls in `postgresql.cc`.
 - `BindStream::SerializeCurrentRow()` is split out of
