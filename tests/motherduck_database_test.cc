@@ -224,6 +224,17 @@ TEST(MotherDuckUsernameTest, OptionSetGet) {
       ::testing::Optional("bob"s));
 }
 
+TEST(MotherDuckUsernameTest, UnparseableUri) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", "postgresql://[bad", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_USERNAME, &error),
+              IsStatus(ADBC_STATUS_INVALID_STATE, &error));
+  if (error.release) error.release(&error);
+}
+
 TEST(MotherDuckPasswordTest, RequiresToken) {
   // Fails before connecting, so this needs no server.
   ScopedEnv pgpassword("PGPASSWORD", "token");
@@ -418,7 +429,10 @@ TEST_F(MotherDuckConnectParamsTest, SslmodeMatrix) {
           std::vector<std::string> expected;
           if (*uri_mode != '\0') {
             expected.push_back(uri_mode);
-          } else if (*region != '\0' && env_mode == nullptr && !rootcert.system) {
+          } else if (env_mode != nullptr) {
+            // Passed explicitly, so libpq sees what the driver saw.
+            expected.push_back(env_mode);
+          } else if (*region != '\0' && !rootcert.system) {
             expected.push_back("require");
           }
           EXPECT_EQ(Values("sslmode"), expected);
@@ -471,9 +485,11 @@ TEST_F(MotherDuckConnectParamsTest, RegionRejectsService) {
 }
 
 TEST_F(MotherDuckConnectParamsTest, OptionsLoneBackslash) {
-  // A trailing backslash would escape the space before the driver's options.
-  SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "s");
+  // With nothing appended after them, a trailing backslash is harmless.
   SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy%5C");
+  EXPECT_EQ(Status(), ADBC_STATUS_OK);
+  // It would escape the space before an explicit option.
+  SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "s");
   EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
   // An escaped backslash is fine.
   SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy%5C%5C");

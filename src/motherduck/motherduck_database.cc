@@ -14,7 +14,7 @@
 
 // For #warning Please include winsock2.h before windows.h on RTools/msys2
 #ifdef _WIN32
-#include <windows.h>
+// winsock2.h includes windows.h, which declares GetEnvironmentVariableA.
 #include <winsock2.h>
 #endif
 
@@ -49,11 +49,20 @@ constexpr char kDefaultUser[] = "postgres";
 // misses changes the application makes after the DLL loads.
 std::string GetEnv(const char* name) {
 #ifdef _WIN32
+  std::string value;
   DWORD size = GetEnvironmentVariableA(name, nullptr, 0);
-  if (size == 0) return "";
-  std::string value(size, '\0');
-  value.resize(GetEnvironmentVariableA(name, value.data(), size));
-  return value;
+  while (size > 0) {
+    value.resize(size);
+    DWORD written = GetEnvironmentVariableA(name, value.data(), size);
+    // Less than the buffer: the value and its terminator fit. More: it grew
+    // meanwhile, so retry with the new size.
+    if (written < size) {
+      value.resize(written);
+      return value;
+    }
+    size = written;
+  }
+  return "";
 #else
   const char* value = std::getenv(name);
   return value ? value : "";
@@ -86,16 +95,17 @@ bool EndsWithLoneBackslash(std::string_view options) {
   return backslashes % 2 == 1;
 }
 
-// A keyword's value in a libpq URI or connection string, or empty.
-std::string UriValue(const std::string& uri, std::string_view keyword) {
+// A keyword's value in a libpq URI or connection string (empty if unset), or
+// false if the URI doesn't parse.
+bool UriValue(const std::string& uri, std::string_view keyword, std::string* value) {
   PQconninfoOption* conninfo = PQconninfoParse(uri.c_str(), nullptr);
-  if (conninfo == nullptr) return "";
-  std::string value;
+  if (conninfo == nullptr) return false;
+  value->clear();
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
-    if (option->val != nullptr && keyword == option->keyword) value = option->val;
+    if (option->val != nullptr && keyword == option->keyword) *value = option->val;
   }
   PQconninfoFree(conninfo);
-  return value;
+  return true;
 }
 
 // Whether value can be part of a hostname: dash-separated parts of lowercase
@@ -192,7 +202,13 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     // The user the driver connects as.
     output = username_;
-    if (output.empty() && !uri_.empty()) output = UriValue(uri_, "user");
+    if (output.empty() && !uri_.empty() && !UriValue(uri_, "user", &output)) {
+      InternalAdbcSetError(error,
+                           "[libpq] database option '%s' is unknown: the URI doesn't "
+                           "parse",
+                           option);
+      return ADBC_STATUS_INVALID_STATE;
+    }
     if (output.empty()) output = kDefaultUser;
   } else if (std::strcmp(option, ADBC_OPTION_PASSWORD) == 0 ||
              std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
@@ -326,6 +342,20 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   }
   PQconninfoFree(conninfo);
 
+  // On Windows the driver reads the process environment, but libpq reads its
+  // own C runtime copy, which can be stale. Pass the TLS settings the driver
+  // acts on, so libpq uses the same ones.
+  if (uri_sslmode.empty()) {
+    if (std::string env = GetEnv("PGSSLMODE"); !env.empty()) {
+      params->emplace_back("sslmode", std::move(env));
+    }
+  }
+  if (uri_sslrootcert.empty()) {
+    if (std::string env = GetEnv("PGSSLROOTCERT"); !env.empty()) {
+      params->emplace_back("sslrootcert", std::move(env));
+    }
+  }
+
   if (!region_.empty()) {
     // A different host, or any hostaddr (which libpq connects to instead of the
     // host), would send the connection elsewhere.
@@ -367,7 +397,9 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   if (!username_.empty()) user = username_;
   if (user.empty()) user = kDefaultUser;
   params->emplace_back("user", std::move(user));
-  if (EndsWithLoneBackslash(options)) {
+  // Only an option appended after them can be affected.
+  if ((!attach_mode_.empty() || !session_name_.empty()) &&
+      EndsWithLoneBackslash(options)) {
     InternalAdbcSetError(error, "%s",
                          "[libpq] Session options (options in the URI, or "
                          "PGOPTIONS) end in a backslash that escapes nothing");

@@ -473,7 +473,8 @@ TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
 
 // A uniquely named file in the temp directory, removed when the object is.
 // A uniquely named file in the temp directory holding contents, readable only
-// by its owner from the moment it exists, and removed when the object is.
+// by its owner from the moment it exists, and removed when the object is. The
+// path is empty if the file couldn't be created and written in full.
 class ScopedTempFile {
  public:
   ScopedTempFile(std::string_view prefix, std::string_view contents) {
@@ -484,6 +485,8 @@ class ScopedTempFile {
             (std::string(prefix) + "_" + std::to_string(random()));
     std::ofstream out(path_, std::ios::binary);
     out << contents;
+    out.close();
+    if (!out) path_.clear();
 #else
     // mkstemp creates the file exclusively, with mode 0600.
     std::string name =
@@ -498,7 +501,10 @@ class ScopedTempFile {
       if (n <= 0) break;
       written += static_cast<size_t>(n);
     }
-    close(fd);
+    if (close(fd) != 0 || written < contents.size()) {
+      std::filesystem::remove(path_);
+      path_.clear();
+    }
 #endif
   }
   ~ScopedTempFile() {
