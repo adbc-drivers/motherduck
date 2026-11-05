@@ -1197,6 +1197,10 @@ AdbcStatusCode PostgresConnection::Rollback(struct AdbcError* error) {
 
 AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
                                              struct AdbcError* error) {
+  if (value == nullptr) {
+    InternalAdbcSetError(error, "[libpq] Option %s requires a value", key);
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  }
   if (std::strcmp(key, ADBC_CONNECTION_OPTION_AUTOCOMMIT) == 0) {
     bool autocommit = true;
     if (std::strcmp(value, ADBC_OPTION_VALUE_ENABLED) == 0) {

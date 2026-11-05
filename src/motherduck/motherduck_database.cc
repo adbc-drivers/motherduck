@@ -158,6 +158,10 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
 
 AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
                                              struct AdbcError* error) {
+  if (value == nullptr) {
+    InternalAdbcSetError(error, "[libpq] Option %s requires a value", key);
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  }
   if (std::strcmp(key, "adbc.postgresql.type_resolver_mode") == 0) {
     // Accepted for compatibility with the PostgreSQL driver, but ignored. Warn once
     // per process so connection pools don't repeat it.

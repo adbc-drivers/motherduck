@@ -430,6 +430,59 @@ TEST_F(MotherDuckConnectParamsTest, NoRegionLeavesSslmode) {
   EXPECT_THAT(Values("port"), ::testing::IsEmpty());
 }
 
+// A NULL option value used to be dereferenced (strcmp, std::string).
+TEST(MotherDuckNullOptionTest, DatabaseRejectsNullValue) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const char* key :
+       {"uri", ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, ADBC_MOTHERDUCK_OPTION_SESSION_NAME,
+        ADBC_MOTHERDUCK_OPTION_REGION, ADBC_MOTHERDUCK_OPTION_TOKEN, ADBC_OPTION_USERNAME,
+        ADBC_OPTION_PASSWORD, "adbc.postgresql.type_resolver_mode",
+        "adbc.postgresql.use_copy", "adbc.unknown_option"}) {
+    SCOPED_TRACE(key);
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, key, nullptr, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+}
+
+TEST(MotherDuckNullOptionTest, ConnectionRejectsNullValue) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  for (const char* key :
+       {ADBC_CONNECTION_OPTION_AUTOCOMMIT, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+        ADBC_CONNECTION_OPTION_ISOLATION_LEVEL, "adbc.postgresql.use_copy"}) {
+    SCOPED_TRACE(key);
+    EXPECT_THAT(AdbcConnectionSetOption(&connection.value, key, nullptr, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+}
+
+TEST(MotherDuckNullOptionTest, StatementRejectsNullValue) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  adbc_validation::Handle<struct AdbcStatement> statement;
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
+              IsOkStatus(&error));
+  for (const char* key :
+       {ADBC_INGEST_OPTION_TARGET_TABLE, ADBC_INGEST_OPTION_MODE,
+        ADBC_INGEST_OPTION_TEMPORARY, "adbc.postgresql.batch_size_hint_bytes",
+        "adbc.postgresql.use_copy", "adbc.unknown_option"}) {
+    SCOPED_TRACE(key);
+    EXPECT_THAT(AdbcStatementSetOption(&statement.value, key, nullptr, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+  // NULL clears the target schema.
+  EXPECT_THAT(AdbcStatementSetOption(
+                  &statement.value, ADBC_INGEST_OPTION_TARGET_DB_SCHEMA, nullptr, &error),
+              IsOkStatus(&error));
+}
+
 // The PostgreSQL driver's type resolver mode (and the server type table it
 // selects) must not show through the MotherDuck driver.
 TEST(MotherDuckPostgresOptionsTest, TypeResolverModeNotReported) {
