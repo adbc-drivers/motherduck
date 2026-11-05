@@ -547,7 +547,7 @@ AdbcStatusCode PostgresConnection::GetInfo(struct AdbcConnection* connection,
   for (size_t i = 0; i < info_codes_length; i++) {
     switch (info_codes[i]) {
       case ADBC_INFO_VENDOR_NAME:
-        infos.push_back({info_codes[i], std::string(VendorName())});
+        infos.push_back({info_codes[i], std::string(database_->InfoVendorName())});
         break;
       case ADBC_INFO_VENDOR_VERSION: {
         RAISE_ADBC(EnsureTransaction(error));
