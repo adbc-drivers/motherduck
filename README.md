@@ -127,22 +127,26 @@ together with a different host or any `hostaddr` in the URI, with
 `PGHOSTADDR`, or with a connection service (`service=` or `PGSERVICE`, which
 can set `hostaddr`) is an error; a host that matches the region, ignoring case
 and a trailing dot, is allowed. When it's set, `PGHOST` and `PGPORT` are
-ignored, and the port is 5432 unless the URI sets one. Unless the URI or
-`PGSSLMODE` sets `sslmode`, the driver uses `sslmode=require`, which encrypts
-the connection but doesn't verify the server's certificate; set
-`sslmode=verify-full` to verify it. With `sslrootcert=system` (in the URI or
-`PGSSLROOTCERT`), libpq already defaults to `verify-full`, so the driver
-leaves `sslmode` alone. For example, with
+ignored, and the port is 5432 unless the URI sets one. For example, with
 `region` set to `us-east-1`:
 
 ```text
 postgresql:///my_db?sslmode=verify-full&sslrootcert=system
 ```
 
+Unless the URI or `PGSSLMODE` sets `sslmode`, the driver uses
+`sslmode=require` instead of libpq's default, `prefer`, so the token is never
+sent unencrypted. `require` doesn't verify the server's certificate; set
+`sslmode=verify-full` to verify it. With `sslrootcert=system` (in the URI or
+`PGSSLROOTCERT`), libpq 16 and later already default to `verify-full`, so the
+driver leaves `sslmode` alone. Naming a connection service also turns this
+default off, since the service file may set `sslmode` itself.
+
 libpq connection service files (`~/.pg_service.conf`, `service=`, or
 `PGSERVICE`) aren't supported: the driver always passes `options`, which
-replaces any `options` a service file sets. Put connection settings in the
-URI instead.
+replaces any `options` a service file sets, doesn't default `sslmode` when
+one is named, and can't combine one with a `region`. Put connection settings
+in the URI instead.
 
 ## Unsupported PostgreSQL driver features
 

@@ -310,7 +310,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   std::string user;
   std::string application_name;
   std::string fallback_application_name;
-  // Connection settings from the URI that the region interacts with.
+  // Connection settings from the URI that the region and sslmode interact with.
   std::string uri_host;
   std::string uri_hostaddr;
   std::string uri_port;
@@ -379,10 +379,14 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     if (uri_host.empty()) params->emplace_back("host", std::move(region_host));
     // Like PGHOST, PGPORT is meant for some other server.
     if (uri_port.empty()) params->emplace_back("port", "5432");
-    // Don't let the default sslmode=prefer send the token in plaintext.
-    if (DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
-      params->emplace_back("sslmode", "require");
-    }
+  }
+  // Don't let libpq's default sslmode=prefer send the token in plaintext.
+  // Certificate verification still needs sslmode=verify-full (#34). A named
+  // service may set sslmode itself, which this would override; with a region,
+  // a service is already an error.
+  bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
+  if (!names_service && DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
+    params->emplace_back("sslmode", "require");
   }
   if (!password_.empty()) password = password_;
   if (password.empty()) password = GetEnv("MOTHERDUCK_TOKEN");
