@@ -38,6 +38,11 @@ namespace adbcpq {
 /// part of a hostname.
 std::string RegionHost(std::string_view region);
 
+/// \brief Whether a connection should default to sslmode=require: neither the
+/// URI nor PGSSLMODE sets sslmode, and sslrootcert (from the URI, or
+/// PGSSLROOTCERT) isn't system, which makes libpq default to verify-full.
+bool DefaultsToRequireSsl(std::string_view uri_sslmode, std::string_view uri_sslrootcert);
+
 /// \brief A libpq session option, --<name>=<value>, with whitespace and
 /// backslashes in value escaped.
 std::string SessionOption(std::string_view name, std::string_view value);

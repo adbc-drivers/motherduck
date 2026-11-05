@@ -161,8 +161,10 @@ TEST(MotherDuckRegionTest, OptionInvalid) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   for (const char* value :
-       {"US-EAST-1", "us east 1", "us-east-1.example.com", "us-east-1/x", "us_east_1",
-        "-", "--", "-us-east-1", "us-east-1-", "us--east-1", "EastUS2",
+       {"us east 1", "us-east-1.example.com", "us-east-1/x", "us_east_1", "-", "--",
+        "-us-east-1", "us-east-1-", "us--east-1",
+        // Too long for a hostname label once -azure is added.
+        "a23456789012345678901234567890123456789012345678901234567890",
         // libpq would also try each comma-separated host.
         "x,attacker.example,", "us-east-1,localhost",
         "us-\xe9"
@@ -204,15 +206,22 @@ TEST(MotherDuckUsernameTest, OptionSetGet) {
   struct AdbcError error = {};
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_USERNAME, &error),
-              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  if (error.release) error.release(&error);
-  ASSERT_THAT(
-      AdbcDatabaseSetOption(&database.value, ADBC_OPTION_USERNAME, "postgres", &error),
-      IsOkStatus(&error));
+  // It reports the user the driver connects as: postgres by default, then the
+  // URI's user, then the option.
   EXPECT_THAT(
       adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
       ::testing::Optional("postgres"s));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri",
+                                    "postgresql://alice@localhost/db", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(
+      adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
+      ::testing::Optional("alice"s));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_OPTION_USERNAME, "bob", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(
+      adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
+      ::testing::Optional("bob"s));
 }
 
 TEST(MotherDuckPasswordTest, RequiresToken) {
@@ -259,6 +268,14 @@ class MotherDuckConnectParamsTest : public ::testing::Test {
     ASSERT_THAT(database_.SetOption(key, value, &error_), IsOkStatus(&error_));
   }
 
+  // The status ConnectParams returns.
+  AdbcStatusCode Status() {
+    std::vector<std::pair<std::string, std::string>> params;
+    AdbcStatusCode status = database_.ConnectParams(&params, &error_);
+    if (error_.release) error_.release(&error_);
+    return status;
+  }
+
   // Every value passed for keyword, in order.
   std::vector<std::string> Values(const char* keyword) {
     std::vector<std::pair<std::string, std::string>> params;
@@ -273,6 +290,7 @@ class MotherDuckConnectParamsTest : public ::testing::Test {
   ScopedEnv pgoptions_{"PGOPTIONS", nullptr};
   ScopedEnv pgsslmode_{"PGSSLMODE", nullptr};
   ScopedEnv pgsslrootcert_{"PGSSLROOTCERT", nullptr};
+  ScopedEnv pgservice_{"PGSERVICE", nullptr};
   ScopedEnv pghostaddr_{"PGHOSTADDR", nullptr};
   ScopedEnv pgport_{"PGPORT", "5433"};
   ScopedEnv pguser_{"PGUSER", "someone"};
@@ -422,6 +440,45 @@ TEST_F(MotherDuckConnectParamsTest, RegionMatchingHost) {
   SetOption("uri", "postgresql://pg.us-east-1-aws.motherduck.com/db");
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
   EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
+  // Hostnames ignore case and a trailing dot.
+  SetOption("uri", "host=PG.US-EAST-1-AWS.MOTHERDUCK.COM. dbname=db");
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("PG.US-EAST-1-AWS.MOTHERDUCK.COM."));
+}
+
+TEST_F(MotherDuckConnectParamsTest, RegionLowercased) {
+  SetOption("uri", "postgresql:///db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "US-East-1");
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
+  char region[32];
+  size_t length = sizeof(region);
+  ASSERT_THAT(
+      database_.GetOption(ADBC_MOTHERDUCK_OPTION_REGION, region, &length, &error_),
+      IsOkStatus(&error_));
+  EXPECT_STREQ(region, "us-east-1");
+}
+
+TEST_F(MotherDuckConnectParamsTest, RegionRejectsService) {
+  // libpq would fill hostaddr from the service, connecting elsewhere.
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  SetOption("uri", "service=local dbname=db");
+  EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
+  SetOption("uri", "postgresql:///db");
+  {
+    ScopedEnv pgservice("PGSERVICE", "local");
+    EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
+  }
+  EXPECT_EQ(Status(), ADBC_STATUS_OK);
+}
+
+TEST_F(MotherDuckConnectParamsTest, OptionsLoneBackslash) {
+  // A trailing backslash would escape the space before the driver's options.
+  SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "s");
+  SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy%5C");
+  EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
+  // An escaped backslash is fine.
+  SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy%5C%5C");
+  EXPECT_THAT(Values("options"),
+              ::testing::ElementsAre("--attach_mode=single -c x=y\\\\ --session_name=s"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, NoRegionLeavesSslmode) {

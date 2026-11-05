@@ -14,6 +14,7 @@
 
 // For #warning Please include winsock2.h before windows.h on RTools/msys2
 #ifdef _WIN32
+#include <windows.h>
 #include <winsock2.h>
 #endif
 
@@ -40,17 +41,70 @@ namespace adbcpq {
 
 namespace {
 constexpr char kDefaultAttachMode[] = "single";
+// MotherDuck's endpoint expects the user postgres.
+constexpr char kDefaultUser[] = "postgres";
 
-// An environment variable, or empty if it's unset.
+// An environment variable, or empty if it's unset. On Windows this reads the
+// process environment rather than this DLL's own (static) C runtime copy, which
+// misses changes the application makes after the DLL loads.
 std::string GetEnv(const char* name) {
+#ifdef _WIN32
+  DWORD size = GetEnvironmentVariableA(name, nullptr, 0);
+  if (size == 0) return "";
+  std::string value(size, '\0');
+  value.resize(GetEnvironmentVariableA(name, value.data(), size));
+  return value;
+#else
   const char* value = std::getenv(name);
   return value ? value : "";
+#endif
+}
+
+// ASCII lowercase, unlike std::tolower, which follows the C locale.
+std::string ToLower(std::string_view value) {
+  std::string lower(value);
+  for (char& c : lower) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  return lower;
+}
+
+// A host for comparison: lowercase, without a trailing dot.
+std::string NormalizeHost(std::string_view host) {
+  if (!host.empty() && host.back() == '.') host.remove_suffix(1);
+  return ToLower(host);
+}
+
+// Whether options ends in a backslash that escapes nothing, which would escape
+// the space before any session option appended after it.
+bool EndsWithLoneBackslash(std::string_view options) {
+  size_t backslashes = 0;
+  while (backslashes < options.size() &&
+         options[options.size() - 1 - backslashes] == '\\') {
+    backslashes++;
+  }
+  return backslashes % 2 == 1;
+}
+
+// A keyword's value in a libpq URI or connection string, or empty.
+std::string UriValue(const std::string& uri, std::string_view keyword) {
+  PQconninfoOption* conninfo = PQconninfoParse(uri.c_str(), nullptr);
+  if (conninfo == nullptr) return "";
+  std::string value;
+  for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
+    if (option->val != nullptr && keyword == option->keyword) value = option->val;
+  }
+  PQconninfoFree(conninfo);
+  return value;
 }
 
 // Whether value can be part of a hostname: dash-separated parts of lowercase
 // ASCII letters and digits. This keeps out anything libpq treats specially in
 // a host, such as a comma, which separates hosts it would also try.
 bool IsHostLabel(std::string_view value) {
+  // DNS limits a label to 63 characters; with the cloud suffix this leaves room
+  // for any real region.
+  if (value.size() > 63 - std::string_view("-azure").size()) return false;
   bool part_empty = true;
   for (char c : value) {
     if (c == '-') {
@@ -83,15 +137,21 @@ std::string RegionHost(std::string_view region) {
   host += region;
   // Without a cloud suffix, AWS names have dashes (us-east-1) and Azure names
   // don't (eastus2).
-  auto ends_with = [region](std::string_view suffix) {
-    return region.size() > suffix.size() &&
-           region.substr(region.size() - suffix.size()) == suffix;
-  };
-  if (!ends_with("-aws") && !ends_with("-azure")) {
+  if (!region.ends_with("-aws") && !region.ends_with("-azure")) {
     host += region.find('-') == std::string_view::npos ? "-azure" : "-aws";
   }
   host += ".motherduck.com";
   return host;
+}
+
+bool DefaultsToRequireSsl(std::string_view uri_sslmode,
+                          std::string_view uri_sslrootcert) {
+  if (!uri_sslmode.empty() || !GetEnv("PGSSLMODE").empty()) return false;
+  // With sslrootcert=system, libpq already defaults to verify-full and rejects
+  // anything weaker.
+  std::string sslrootcert =
+      uri_sslrootcert.empty() ? GetEnv("PGSSLROOTCERT") : std::string(uri_sslrootcert);
+  return sslrootcert != "system";
 }
 
 std::string SessionOption(std::string_view name, std::string_view value) {
@@ -130,7 +190,10 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     optional = &region_;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
-    optional = &username_;
+    // The user the driver connects as.
+    output = username_;
+    if (output.empty() && !uri_.empty()) output = UriValue(uri_, "user");
+    if (output.empty()) output = kDefaultUser;
   } else if (std::strcmp(option, ADBC_OPTION_PASSWORD) == 0 ||
              std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
     InternalAdbcSetError(error, "[libpq] database option '%s' can't be read", option);
@@ -183,15 +246,16 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     session_name_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     // The region becomes part of a hostname. An empty value unsets it.
-    if (*value != '\0' && RegionHost(value).empty()) {
+    std::string region = ToLower(value);
+    if (!region.empty() && RegionHost(region).empty()) {
       InternalAdbcSetError(error,
                            "[libpq] Invalid value for option %s=%s: expected a region "
-                           "such as us-east-1 or eastus2, of lowercase letters, "
-                           "digits and dashes",
+                           "such as us-east-1 or eastus2, of letters, digits and "
+                           "dashes",
                            key, value);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    region_ = value;
+    region_ = std::move(region);
   } else if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
     username_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0 ||
@@ -225,8 +289,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   // Always pass the user, token and application name, so libpq never falls
   // back to PGUSER, PGPASSWORD, a password file, or PGAPPNAME.
   params->clear();
-  const char* env_options = std::getenv("PGOPTIONS");
-  std::string options = env_options ? env_options : "";
+  std::string options = GetEnv("PGOPTIONS");
   std::string password;
   std::string user;
   std::string application_name;
@@ -237,6 +300,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   std::string uri_port;
   std::string uri_sslmode;
   std::string uri_sslrootcert;
+  std::string uri_service;
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
     if (option->val == nullptr) continue;
     std::string_view keyword = option->keyword;
@@ -245,6 +309,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     if (keyword == "port") uri_port = option->val;
     if (keyword == "sslmode") uri_sslmode = option->val;
     if (keyword == "sslrootcert") uri_sslrootcert = option->val;
+    if (keyword == "service") uri_service = option->val;
     if (keyword == "options") {
       options = option->val;
     } else if (keyword == "password") {
@@ -265,31 +330,32 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     // A different host, or any hostaddr (which libpq connects to instead of the
     // host), would send the connection elsewhere.
     std::string region_host = RegionHost(region_);
-    if ((!uri_host.empty() && uri_host != region_host) || !uri_hostaddr.empty() ||
-        !GetEnv("PGHOSTADDR").empty()) {
+    if ((!uri_host.empty() && NormalizeHost(uri_host) != region_host) ||
+        !uri_hostaddr.empty() || !GetEnv("PGHOSTADDR").empty()) {
       InternalAdbcSetError(error,
                            "[libpq] Set either database option '%s' or a different "
                            "host (host or hostaddr in the URI, or PGHOSTADDR), not both",
                            ADBC_MOTHERDUCK_OPTION_REGION);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
+    // libpq fills unset settings, including hostaddr, from a connection service.
+    if (!uri_service.empty() || !GetEnv("PGSERVICE").empty()) {
+      InternalAdbcSetError(error,
+                           "[libpq] Database option '%s' can't be used with a "
+                           "connection service (service in the URI, or PGSERVICE)",
+                           ADBC_MOTHERDUCK_OPTION_REGION);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
     if (uri_host.empty()) params->emplace_back("host", std::move(region_host));
     // Like PGHOST, PGPORT is meant for some other server.
     if (uri_port.empty()) params->emplace_back("port", "5432");
-    // Don't let the default sslmode=prefer send the token in plaintext. With
-    // sslrootcert=system, libpq already defaults to verify-full and rejects
-    // anything weaker.
-    std::string sslrootcert =
-        uri_sslrootcert.empty() ? GetEnv("PGSSLROOTCERT") : uri_sslrootcert;
-    if (uri_sslmode.empty() && GetEnv("PGSSLMODE").empty() && sslrootcert != "system") {
+    // Don't let the default sslmode=prefer send the token in plaintext.
+    if (DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
       params->emplace_back("sslmode", "require");
     }
   }
   if (!password_.empty()) password = password_;
-  if (password.empty()) {
-    const char* token = std::getenv("MOTHERDUCK_TOKEN");
-    if (token != nullptr) password = token;
-  }
+  if (password.empty()) password = GetEnv("MOTHERDUCK_TOKEN");
   if (password.empty()) {
     InternalAdbcSetError(error, "%s",
                          "[libpq] No MotherDuck token: set the 'password' (or "
@@ -298,29 +364,28 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     return ADBC_STATUS_UNAUTHENTICATED;
   }
   params->emplace_back("password", std::move(password));
-  // MotherDuck's endpoint expects the user postgres.
   if (!username_.empty()) user = username_;
-  if (user.empty()) user = "postgres";
+  if (user.empty()) user = kDefaultUser;
   params->emplace_back("user", std::move(user));
+  if (EndsWithLoneBackslash(options)) {
+    InternalAdbcSetError(error, "%s",
+                         "[libpq] Session options (options in the URI, or "
+                         "PGOPTIONS) end in a backslash that escapes nothing");
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  }
   // MotherDuck keeps the last value of a repeated setting, so defaults go
   // before the URI's options (or PGOPTIONS) and explicit options after them.
-  std::vector<std::string> session_options;
-  if (attach_mode_.empty()) {
-    session_options.push_back(SessionOption("attach_mode", kDefaultAttachMode));
-  }
-  if (!options.empty()) session_options.push_back(std::move(options));
-  if (!attach_mode_.empty()) {
-    session_options.push_back(SessionOption("attach_mode", attach_mode_));
-  }
-  if (!session_name_.empty()) {
-    session_options.push_back(SessionOption("session_name", session_name_));
-  }
-  std::string joined;
-  for (const std::string& session_option : session_options) {
-    if (!joined.empty()) joined += ' ';
-    joined += session_option;
-  }
-  params->emplace_back("options", std::move(joined));
+  std::string session_options;
+  auto add = [&session_options](std::string_view session_option) {
+    if (session_option.empty()) return;
+    if (!session_options.empty()) session_options += ' ';
+    session_options += session_option;
+  };
+  if (attach_mode_.empty()) add(SessionOption("attach_mode", kDefaultAttachMode));
+  add(options);
+  if (!attach_mode_.empty()) add(SessionOption("attach_mode", attach_mode_));
+  if (!session_name_.empty()) add(SessionOption("session_name", session_name_));
+  params->emplace_back("options", std::move(session_options));
   // MotherDuck's user agent comes from application_name: append the driver to
   // the application's name. Always passing it means PGAPPNAME is never used.
   if (application_name.empty()) application_name = fallback_application_name;

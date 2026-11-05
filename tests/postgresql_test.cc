@@ -40,6 +40,10 @@
 #include <variant>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #include <arrow-adbc/adbc.h>
 #include <arrow-adbc/driver/postgresql.h>
 #include <gtest/gtest-param-test.h>
@@ -468,12 +472,34 @@ TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
 }
 
 // A uniquely named file in the temp directory, removed when the object is.
+// A uniquely named file in the temp directory holding contents, readable only
+// by its owner from the moment it exists, and removed when the object is.
 class ScopedTempFile {
  public:
-  explicit ScopedTempFile(std::string_view prefix) {
+  ScopedTempFile(std::string_view prefix, std::string_view contents) {
+#ifdef _WIN32
+    // The temp directory is per user on Windows.
     std::random_device random;
     path_ = std::filesystem::temp_directory_path() /
             (std::string(prefix) + "_" + std::to_string(random()));
+    std::ofstream out(path_, std::ios::binary);
+    out << contents;
+#else
+    // mkstemp creates the file exclusively, with mode 0600.
+    std::string name =
+        (std::filesystem::temp_directory_path() / (std::string(prefix) + "_XXXXXX"))
+            .string();
+    int fd = mkstemp(name.data());
+    if (fd < 0) return;
+    path_ = name;
+    size_t written = 0;
+    while (written < contents.size()) {
+      ssize_t n = write(fd, contents.data() + written, contents.size() - written);
+      if (n <= 0) break;
+      written += static_cast<size_t>(n);
+    }
+    close(fd);
+#endif
   }
   ~ScopedTempFile() {
     std::error_code ec;
@@ -523,14 +549,9 @@ TEST_F(PostgresDatabaseTest, IgnoresPostgresPasswords) {
   const std::string token = motherduck_token;
 
   // A valid token in PGPASSWORD or a password file doesn't rescue a bad one.
-  ScopedTempFile scoped_passfile("adbc_motherduck_pgpass");
+  ScopedTempFile scoped_passfile("adbc_motherduck_pgpass", "*:*:*:*:" + token + "\n");
   const std::filesystem::path& passfile = scoped_passfile.path();
-  {
-    std::ofstream out(passfile);
-    out << "*:*:*:*:" << token << "\n";
-  }
-  std::filesystem::permissions(
-      passfile, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+  ASSERT_FALSE(passfile.empty()) << "Couldn't create a password file";
   {
     ScopedEnv pgpassword("PGPASSWORD", token.c_str());
     ScopedEnv pgpassfile("PGPASSFILE", passfile.string().c_str());

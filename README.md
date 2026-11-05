@@ -82,8 +82,10 @@ and `workspace` attaches every database in the account. The driver adds
 `--attach_mode=<mode>` to libpq's `options`. MotherDuck keeps the last value
 of a repeated setting, so the default goes before any session options from the
 URI or `PGOPTIONS`, which can override it, and an explicitly set option goes
-after them, overriding them. Single mode needs a named database; to connect to
-`md:`, set `workspace`.
+after them, overriding them. Session options that end in a backslash escaping
+nothing are rejected, since it would escape the space before the driver's
+options. Single mode needs a named database; to connect to `md:`, set
+`workspace`.
 
 `adbc.motherduck.session_name` (database option) sets MotherDuck's
 [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name),
@@ -109,19 +111,22 @@ connecting fails with `UNAUTHENTICATED`.
 
 The user is `postgres`, which MotherDuck's endpoint expects, so the URI can
 leave it out. The standard ADBC `username` database option, then a user in the
-URI, replace it. `PGUSER` is never used.
+URI, replace it. `PGUSER` is never used. Reading the `username` option returns
+the user the driver connects as.
 
 `adbc.motherduck.region` (database option) sets the host from a MotherDuck
 region, so the URI can leave it out: `us-east-1` connects to
 `pg.us-east-1-aws.motherduck.com`, and `eastus2` connects to
 `pg.eastus2-azure.motherduck.com`. Find your region with `md_user_info()`. A
-region is dash-separated parts of lowercase letters and digits. One with
+region is dash-separated parts of letters and digits, which the driver
+lowercases. One with
 dashes is taken to be on AWS and one without on Azure, unless it ends in
 `-aws` or `-azure`. The driver doesn't check the region against a list, so a
 mistyped one fails at connect with a DNS error naming the host. Setting it
-together with a different host
-or any `hostaddr` in the URI, or with `PGHOSTADDR`, is an error; a host that
-matches the region is allowed. When it's set, `PGHOST` and `PGPORT` are
+together with a different host or any `hostaddr` in the URI, with
+`PGHOSTADDR`, or with a connection service (`service=` or `PGSERVICE`, which
+can set `hostaddr`) is an error; a host that matches the region, ignoring case
+and a trailing dot, is allowed. When it's set, `PGHOST` and `PGPORT` are
 ignored, and the port is 5432 unless the URI sets one. Unless the URI or
 `PGSSLMODE` sets `sslmode`, the driver uses `sslmode=require`, which encrypts
 the connection but doesn't verify the server's certificate; set
