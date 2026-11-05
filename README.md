@@ -166,11 +166,9 @@ to fail.
 - **Rows affected** is wrong for `DELETE` (#19), and is the row count rather
   than -1 for a `SELECT` on the non-COPY path (#50). `ExecuteQuery` on an
   `INSERT` also returns the endpoint's `Count` row as a batch (#49).
-- **Metadata:** `GetObjects` and the current catalog don't reflect MotherDuck
-  databases and schemas (#14), `GetTableSchema` fails its `$1::regclass`
-  lookup (#13), `GetInfo` reports PostgreSQL and queries
-  `server_version_num` (#15), and `GetStatistics` isn't supported (it reads
-  `pg_stats`).
+- **Metadata:** the current catalog reports `md:` rather than the current
+  database when you connect to `md:` (#14), and `GetStatistics` and
+  `GetStatisticNames` aren't supported, since MotherDuck has no `pg_stats`.
 - **Transactions:** DuckDB has a single isolation level and the endpoint
   rejects `SET TRANSACTION`, so isolation levels can't be set.
 - **Types:** PostgreSQL-only types such as `jsonb` and `int2vector` don't
@@ -235,7 +233,9 @@ lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
   version.
 - `motherduck_connection`: `MotherduckConnection`, which leaves the vendor
   version out of `GetInfo` rather than report the endpoint's PostgreSQL
-  `server_version_num`.
+  `server_version_num`, replaces the `GetObjects` schema, table and
+  constraint queries that fail on the endpoint, returns `NOT_FOUND` from
+  `GetTableSchema` for a missing table, and rejects the statistics calls.
 - `motherduck_statement`: `MotherduckStatement`, which accepts the result sets
   MotherDuck returns for DDL, and `MotherduckResultReader`, which runs queries
   without a result through a pipeline.
@@ -251,7 +251,8 @@ The upstream files still differ from Apache's in these ways:
   includes use paths relative to `src/postgres/`.
 - Hooks for the subclasses: `virtual` methods and `protected` members in
   `PostgresDatabase`, `PostgresConnection`, `PostgresStatement`, and
-  `PqResultArrayReader`;
+  `PqResultArrayReader`; `GetObjectsQueryOverrides()`, which lets a
+  subclass replace any of the `GetObjects` queries;
   `DriverName()` and `DriverVersion()`, which `GetInfo` reports; and the
   factory calls in `postgresql.cc`.
 - `BindStream::SerializeCurrentRow()` is split out of

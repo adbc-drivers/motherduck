@@ -25,6 +25,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -36,6 +37,23 @@
 
 namespace adbcpq {
 class PostgresDatabase;
+
+/// \brief Replacements for the queries GetObjects runs; unset ones keep the
+/// default. Each some_* query is its all_* query with the filter for that level
+/// added as the last parameter.
+struct PostgresGetObjectsQueryOverrides {
+  std::optional<std::string> all_catalogs;
+  std::optional<std::string> some_catalogs;
+  std::optional<std::string> all_schemas;
+  std::optional<std::string> some_schemas;
+  std::optional<std::string> all_tables;
+  std::optional<std::string> some_tables;
+  std::optional<std::string> all_columns;
+  std::optional<std::string> some_columns;
+  std::optional<std::string> all_constraints;
+  std::optional<std::string> some_constraints;
+};
+
 class PostgresConnection {
  public:
   PostgresConnection()
@@ -64,13 +82,16 @@ class PostgresConnection {
                                  struct AdbcError* error);
   AdbcStatusCode GetOptionInt(const char* option, int64_t* value,
                               struct AdbcError* error);
-  AdbcStatusCode GetStatistics(const char* catalog, const char* db_schema,
-                               const char* table_name, bool approximate,
-                               struct ArrowArrayStream* out, struct AdbcError* error);
-  AdbcStatusCode GetStatisticNames(struct ArrowArrayStream* out, struct AdbcError* error);
-  AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
-                                const char* table_name, struct ArrowSchema* schema,
-                                struct AdbcError* error);
+  virtual AdbcStatusCode GetStatistics(const char* catalog, const char* db_schema,
+                                       const char* table_name, bool approximate,
+                                       struct ArrowArrayStream* out,
+                                       struct AdbcError* error);
+  virtual AdbcStatusCode GetStatisticNames(struct ArrowArrayStream* out,
+                                           struct AdbcError* error);
+  virtual AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
+                                        const char* table_name,
+                                        struct ArrowSchema* schema,
+                                        struct AdbcError* error);
   AdbcStatusCode GetTableTypes(struct AdbcConnection* connection,
                                struct ArrowArrayStream* out, struct AdbcError* error);
   AdbcStatusCode Init(struct AdbcDatabase* database, struct AdbcError* error);
@@ -90,6 +111,9 @@ class PostgresConnection {
   bool use_copy() const { return use_copy_; }
   std::string_view VendorName();
   const std::array<int, 3>& VendorVersion();
+
+ protected:
+  virtual PostgresGetObjectsQueryOverrides GetObjectsQueryOverrides() const { return {}; }
 
  private:
   friend class PostgresStatement;

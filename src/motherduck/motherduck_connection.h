@@ -32,11 +32,37 @@ namespace adbcpq {
 std::vector<uint32_t> MotherduckInfoCodes(const uint32_t* info_codes,
                                           size_t info_codes_length);
 
+/// \brief The GetObjects queries MotherDuck replaces.
+///
+/// They replace the PostgreSQL driver's queries that fail on the endpoint:
+/// - Schemas come from duckdb_schemas() for the current database, since
+///   pg_namespace also lists the temp database's main schema.
+/// - Tables cast their parameters, which the endpoint can't infer types for.
+/// - Constraints come from duckdb_constraints(), since the pg_constraint query
+///   exceeds the endpoint's memory limit.
+PostgresGetObjectsQueryOverrides MotherduckGetObjectsQueryOverrides();
+
 class MotherduckConnection : public PostgresConnection {
  public:
   AdbcStatusCode GetInfo(struct AdbcConnection* connection, const uint32_t* info_codes,
                          size_t info_codes_length, struct ArrowArrayStream* out,
                          struct AdbcError* error) override;
+  /// Fails with ADBC_STATUS_NOT_IMPLEMENTED: MotherDuck has no pg_stats.
+  AdbcStatusCode GetStatistics(const char* catalog, const char* db_schema,
+                               const char* table_name, bool approximate,
+                               struct ArrowArrayStream* out,
+                               struct AdbcError* error) override;
+  /// Fails with ADBC_STATUS_NOT_IMPLEMENTED, like GetStatistics.
+  AdbcStatusCode GetStatisticNames(struct ArrowArrayStream* out,
+                                   struct AdbcError* error) override;
+  /// Fails with ADBC_STATUS_NOT_FOUND for a missing table. The PostgreSQL
+  /// driver's regclass lookup fails with a generic error on MotherDuck.
+  AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
+                                const char* table_name, struct ArrowSchema* schema,
+                                struct AdbcError* error) override;
+
+ protected:
+  PostgresGetObjectsQueryOverrides GetObjectsQueryOverrides() const override;
 };
 
 }  // namespace adbcpq

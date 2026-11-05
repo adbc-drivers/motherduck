@@ -1095,14 +1095,15 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsPrimaryKey) {
   struct AdbcGetObjectsConstraint* constraint =
       InternalAdbcGetObjectsDataGetConstraintByName(
           *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
-          "adbc_pkey_test", "adbc_pkey_test_pkey");
-  ASSERT_NE(constraint, nullptr) << "could not find adbc_pkey_test_pkey constraint";
+          "adbc_pkey_test", "adbc_pkey_test_id_pkey");
+  // DuckDB names a primary key <table>_<columns>_pkey.
+  ASSERT_NE(constraint, nullptr) << "could not find adbc_pkey_test_id_pkey constraint";
 
   auto constraint_type = std::string(constraint->constraint_type.data,
                                      constraint->constraint_type.size_bytes);
   ASSERT_EQ(constraint_type, "PRIMARY KEY");
   ASSERT_EQ(constraint->n_column_names, 1)
-      << "expected constraint adbc_pkey_test_pkey to be applied to 1 column, found: "
+      << "expected constraint adbc_pkey_test_id_pkey to be applied to 1 column, found: "
       << constraint->n_column_names;
 
   auto constraint_column_name =
@@ -1181,8 +1182,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
       << "expected 1 constraint on adbc_fkey_test table, found: "
       << table->n_table_constraints;
 
-  // The driver reports no vendor version, so expect PostgreSQL 12+ naming.
-  const std::string search_name = "adbc_fkey_test_fid1_fid2_fkey";
+  // DuckDB names a foreign key <table>_<columns>_<referenced columns>_fkey.
+  const std::string search_name = "adbc_fkey_test_fid1_fid2_id1_id2_fkey";
   struct AdbcGetObjectsConstraint* constraint =
       InternalAdbcGetObjectsDataGetConstraintByName(
           *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
@@ -1193,7 +1194,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
                                      constraint->constraint_type.size_bytes);
   ASSERT_EQ(constraint_type, "FOREIGN KEY");
   ASSERT_EQ(constraint->n_column_names, 2)
-      << "expected constraint adbc_fkey_test_fid1_fid2_fkey to be applied to 2 columns, "
+      << "expected constraint adbc_fkey_test_fid1_fid2_id1_id2_fkey to be applied to 2 "
+         "columns, "
          "found: "
       << constraint->n_column_names;
 
@@ -1208,7 +1210,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
   }
 
   ASSERT_EQ(constraint->n_column_usages, 2)
-      << "expected constraint adbc_fkey_test_fid1_fid2_fkey to have 2 usages, found: "
+      << "expected constraint adbc_fkey_test_fid1_fid2_id1_id2_fkey to have 2 usages, "
+         "found: "
       << constraint->n_column_usages;
 
   for (auto i = 0; i < 2; i++) {
