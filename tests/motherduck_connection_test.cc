@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include <arrow-adbc/adbc.h>
 #include <gmock/gmock.h>
@@ -48,6 +49,7 @@ TEST(MotherduckInfoCodesTest, RequestedCodesOmitVendorVersion) {
   EXPECT_THAT(MotherduckInfoCodes(only_version, 1), IsEmpty());
 }
 
+// What the queries return is covered by the integration tests.
 TEST(MotherduckGetObjectsQueriesTest, OverridesFailingQueries) {
   PostgresGetObjectsQueryOverrides overrides = MotherduckGetObjectsQueryOverrides();
 
@@ -57,19 +59,29 @@ TEST(MotherduckGetObjectsQueriesTest, OverridesFailingQueries) {
   EXPECT_EQ(overrides.all_columns, std::nullopt);
   EXPECT_EQ(overrides.some_columns, std::nullopt);
 
-  ASSERT_TRUE(overrides.all_schemas && overrides.some_schemas);
-  EXPECT_THAT(*overrides.all_schemas, HasSubstr("duckdb_schemas()"));
-  EXPECT_THAT(*overrides.some_schemas,
-              AllOf(StartsWith(*overrides.all_schemas), HasSubstr("$1::VARCHAR")));
-  ASSERT_TRUE(overrides.all_tables && overrides.some_tables);
-  EXPECT_THAT(*overrides.all_tables,
-              AllOf(HasSubstr("$1::VARCHAR"), HasSubstr("contains($2::VARCHAR")));
-  EXPECT_THAT(*overrides.some_tables,
-              AllOf(StartsWith(*overrides.all_tables), HasSubstr("$3::VARCHAR")));
-  ASSERT_TRUE(overrides.all_constraints && overrides.some_constraints);
-  EXPECT_THAT(*overrides.all_constraints, HasSubstr("duckdb_constraints()"));
-  EXPECT_THAT(*overrides.some_constraints,
-              AllOf(StartsWith(*overrides.all_constraints), HasSubstr("$3::VARCHAR")));
+  for (const auto& [all, some] :
+       {std::pair{overrides.all_schemas, overrides.some_schemas},
+        std::pair{overrides.all_tables, overrides.some_tables},
+        std::pair{overrides.all_constraints, overrides.some_constraints}}) {
+    ASSERT_TRUE(all.has_value());
+    ASSERT_TRUE(some.has_value());
+    EXPECT_THAT(*some, StartsWith(*all));
+  }
+}
+
+TEST(MotherduckIsMissingRelationTest, MatchesEndpointError) {
+  // As the endpoint reports a missing table and a missing schema.
+  EXPECT_TRUE(MotherduckIsMissingRelation(
+      "[libpq] Failed to execute query 'SELECT ...': ERROR:  Invalid Input Error: "
+      "relation \"\"nope\"\" does not exist"));
+  EXPECT_TRUE(MotherduckIsMissingRelation(
+      "ERROR:  Invalid Input Error: relation \"\"nosuchschema\".\"t\"\" does not "
+      "exist"));
+
+  EXPECT_FALSE(MotherduckIsMissingRelation(nullptr));
+  EXPECT_FALSE(MotherduckIsMissingRelation(
+      "ERROR:  Catalog Error: Scalar Function with name f does not exist!"));
+  EXPECT_FALSE(MotherduckIsMissingRelation("ERROR:  Invalid Input Error: bad input"));
 }
 
 class MotherduckStatisticsTest : public ::testing::Test {

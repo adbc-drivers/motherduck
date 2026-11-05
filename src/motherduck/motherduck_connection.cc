@@ -24,11 +24,10 @@
 #include <cstdint>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "driver/common/utils.h"
-#include "driver/framework/status.h"
-#include "result_helper.h"
 
 namespace adbcpq {
 
@@ -75,25 +74,27 @@ constexpr char kConstraintsQuery[] =
     ") "
     "SELECT conname, contype, colnames, fschema, ftable, fcolnames FROM cons";
 
-// Parameterized on db_schema (current_schema() if empty), table_name.
-constexpr char kTableExistsQuery[] =
-    "SELECT 1 FROM information_schema.tables "
-    "WHERE table_catalog = current_database() "
-    "AND table_schema = COALESCE(NULLIF($1::VARCHAR, ''), current_schema()) "
-    "AND table_name = $2::VARCHAR";
-
 constexpr char kNoStatistics[] =
     "[motherduck] %s is not supported by the MotherDuck driver: MotherDuck has no "
     "pg_stats to read statistics from";
 
 }  // namespace
 
+bool MotherduckIsMissingRelation(const char* message) {
+  if (message == nullptr) return false;
+  std::string_view view(message);
+  return view.find("Invalid Input Error: relation ") != std::string_view::npos &&
+         view.find(" does not exist") != std::string_view::npos;
+}
+
 PostgresGetObjectsQueryOverrides MotherduckGetObjectsQueryOverrides() {
   PostgresGetObjectsQueryOverrides overrides;
   overrides.all_schemas = kSchemasQuery;
-  overrides.some_schemas = std::string(kSchemasQuery) + " AND schema_name = $1::VARCHAR";
+  // DuckDB identifiers are case-insensitive, so the schema and table filters are too.
+  overrides.some_schemas =
+      std::string(kSchemasQuery) + " AND lower(schema_name) = lower($1::VARCHAR)";
   overrides.all_tables = kTablesQuery;
-  overrides.some_tables = std::string(kTablesQuery) + " AND c.relname LIKE $3::VARCHAR";
+  overrides.some_tables = std::string(kTablesQuery) + " AND c.relname ILIKE $3::VARCHAR";
   overrides.all_constraints = kConstraintsQuery;
   overrides.some_constraints =
       std::string(kConstraintsQuery) + " WHERE conname LIKE $3::VARCHAR";
@@ -140,20 +141,13 @@ AdbcStatusCode MotherduckConnection::GetTableSchema(const char* catalog,
                                                     const char* table_name,
                                                     struct ArrowSchema* schema,
                                                     struct AdbcError* error) {
-  // Check first: a failed lookup would abort an open transaction.
-  PqResultHelper exists(conn(), kTableExistsQuery);
-  RAISE_STATUS(error, exists.Execute({db_schema ? db_schema : "", table_name}));
-  if (exists.NumRows() == 0) {
-    if (db_schema) {
-      InternalAdbcSetError(error, "[motherduck] table \"%s\".\"%s\" does not exist",
-                           db_schema, table_name);
-    } else {
-      InternalAdbcSetError(error, "[motherduck] table \"%s\" does not exist", table_name);
-    }
+  AdbcStatusCode status =
+      PostgresConnection::GetTableSchema(catalog, db_schema, table_name, schema, error);
+  if (status == ADBC_STATUS_INTERNAL && error &&
+      MotherduckIsMissingRelation(error->message)) {
     return ADBC_STATUS_NOT_FOUND;
   }
-  return PostgresConnection::GetTableSchema(catalog, db_schema, table_name, schema,
-                                            error);
+  return status;
 }
 
 PostgresGetObjectsQueryOverrides MotherduckConnection::GetObjectsQueryOverrides() const {

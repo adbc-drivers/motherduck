@@ -1447,6 +1447,78 @@ TEST_F(PostgresConnectionTest, MetadataGetSchemaCaseSensitiveTable) {
   // Do we have to release the connection here?
 }
 
+// DuckDB identifiers are case-insensitive, even quoted ones, so a lookup in
+// another case finds the table.
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaIgnoresCase) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "MixedCase", &error), IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database, "CREATE TABLE \"MixedCase\" (ints INT)", &error),
+              IsOkStatus(&error));
+
+  for (const char* db_schema : {static_cast<const char*>(nullptr), "MAIN"}) {
+    SCOPED_TRACE(db_schema ? db_schema : "(no schema)");
+    nanoarrow::UniqueSchema schema;
+    ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, nullptr, db_schema, "mixedcase",
+                                             schema.get(), &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(schema->n_children, 1);
+    EXPECT_STREQ(schema->children[0]->name, "ints");
+  }
+}
+
+// An unqualified name resolves through the search path, which includes
+// pg_catalog, as in a query.
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaSearchPath) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+
+  for (const char* db_schema : {static_cast<const char*>(nullptr), "pg_catalog"}) {
+    SCOPED_TRACE(db_schema ? db_schema : "(no schema)");
+    nanoarrow::UniqueSchema schema;
+    ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, nullptr, db_schema, "pg_class",
+                                             schema.get(), &error),
+                IsOkStatus(&error));
+    EXPECT_GT(schema->n_children, 0);
+  }
+}
+
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaSchemaNotFound) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, nullptr, "thisschemadoesnotexist",
+                                           "t", schema.get(), &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+}
+
+// The schema and table filters ignore case, as DuckDB identifiers do.
+TEST_F(PostgresConnectionTest, GetObjectsFiltersIgnoreCase) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "MixedCase", &error), IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database, "CREATE TABLE \"MixedCase\" (ints INT)", &error),
+              IsOkStatus(&error));
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_TABLES, nullptr,
+                                       "MAIN", "mixedcase", nullptr, nullptr,
+                                       &reader.stream.value, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NE(nullptr, reader.array->release);
+
+  auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+  ASSERT_NE(*get_objects_data, nullptr)
+      << "could not initialize the AdbcGetObjectsData object";
+  // GetObjects reports the names as stored.
+  struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
+      *get_objects_data, quirks()->catalog().c_str(), "main", "MixedCase");
+  ASSERT_NE(table, nullptr) << "could not find main.MixedCase via GetObjects";
+}
+
 TEST_F(PostgresConnectionTest, MetadataGetStatistics) {
   if (!quirks()->supports_statistics()) {
     GTEST_SKIP();

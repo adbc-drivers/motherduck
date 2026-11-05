@@ -32,14 +32,24 @@ namespace adbcpq {
 std::vector<uint32_t> MotherduckInfoCodes(const uint32_t* info_codes,
                                           size_t info_codes_length);
 
+/// \brief Whether an error message is the endpoint's for a missing relation.
+///
+/// The endpoint reports it as an Invalid Input Error with SQLSTATE XXUUU
+/// rather than PostgreSQL's 42P01, so the base driver can't map it to
+/// ADBC_STATUS_NOT_FOUND.
+bool MotherduckIsMissingRelation(const char* message);
+
 /// \brief The GetObjects queries MotherDuck replaces.
 ///
 /// They replace the PostgreSQL driver's queries that fail on the endpoint:
 /// - Schemas come from duckdb_schemas() for the current database, since
 ///   pg_namespace also lists the temp database's main schema.
-/// - Tables cast their parameters, which the endpoint can't infer types for.
+/// - Tables cast their parameters, which the endpoint can't infer types for,
+///   and match table types without casting to an array.
 /// - Constraints come from duckdb_constraints(), since the pg_constraint query
 ///   exceeds the endpoint's memory limit.
+///
+/// The schema and table filters ignore case, as DuckDB identifiers do.
 PostgresGetObjectsQueryOverrides MotherduckGetObjectsQueryOverrides();
 
 class MotherduckConnection : public PostgresConnection {
@@ -55,8 +65,10 @@ class MotherduckConnection : public PostgresConnection {
   /// Fails with ADBC_STATUS_NOT_IMPLEMENTED, like GetStatistics.
   AdbcStatusCode GetStatisticNames(struct ArrowArrayStream* out,
                                    struct AdbcError* error) override;
-  /// Fails with ADBC_STATUS_NOT_FOUND for a missing table. The PostgreSQL
-  /// driver's regclass lookup fails with a generic error on MotherDuck.
+  /// Fails with ADBC_STATUS_NOT_FOUND for a missing table. The lookup is the
+  /// PostgreSQL driver's regclass cast, so names resolve as they do in a query
+  /// (ignoring case, through the search path); only its error is remapped. As
+  /// on PostgreSQL, the failed lookup aborts an open transaction.
   AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
                                 const char* table_name, struct ArrowSchema* schema,
                                 struct AdbcError* error) override;
