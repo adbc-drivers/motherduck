@@ -85,6 +85,42 @@ TEST(MotherDuckRedactTest, UrlUserinfoAndEscapes) {
             "ATTACH E'md:db?motherduck_token=...'");
 }
 
+TEST(MotherDuckRedactTest, UnterminatedEscapeDoesNotThrow) {
+  EXPECT_EQ(RedactSecretStatements("ATTACH E'md:db?motherduck_token=abc\\"),
+            "ATTACH E'md:db?motherduck_token=...");
+  EXPECT_EQ(RedactSecretStatements("SELECT E'abc\\"), "SELECT E'abc\\");
+}
+
+TEST(MotherDuckRedactTest, CommentsAreScrubbed) {
+  EXPECT_EQ(RedactSecretStatements("-- motherduck_token=SUPERSECRET\n"
+                                   "CREATE SECRET s (TYPE s3, SECRET 'x')"),
+            "-- motherduck_token=...\nCREATE SECRET s (...)");
+  EXPECT_EQ(RedactSecretStatements("/* password=SUPERSECRET */ SELECT 1"),
+            "/* password=...*/ SELECT 1");
+  EXPECT_EQ(RedactSecretStatements("SELECT 'md:db?motherduck_token=LEAK' x "
+                                   "CREATE SECRET s (SECRET 'x')"),
+            "SELECT 'md:db?motherduck_token=...' x CREATE SECRET s (...)");
+}
+
+TEST(MotherDuckRedactTest, CredentialNamesInParameters) {
+  EXPECT_EQ(RedactSecretStatements("SELECT 's3://b/o?access_key_id=AKIA&"
+                                   "secret_access_key=sekret'"),
+            "SELECT 's3://b/o?access_key_id=...&secret_access_key=...'");
+  EXPECT_EQ(RedactSecretStatements("SELECT 'https://x?key_id=AKIA&token=ok'"),
+            "SELECT 'https://x?key_id=...&token=...'");
+  EXPECT_EQ(RedactSecretStatements("ATTACH 'md:db?motherduck_token=my secret'"),
+            "ATTACH 'md:db?motherduck_token=...'");
+}
+
+TEST(MotherDuckRedactTest, DollarQuotedBodies) {
+  EXPECT_EQ(RedactSecretStatements("CREATE MACRO m() AS $$ CREATE SECRET s (TYPE s3, "
+                                   "SECRET 'supersecret') $$"),
+            "CREATE MACRO m() AS $$ CREATE SECRET s (...)$$");
+  // $foo bar$ is not a dollar quote, so the secret statement is seen.
+  EXPECT_EQ(RedactSecretStatements("SELECT $foo bar$ CREATE SECRET s (SECRET 'x')"),
+            "SELECT $foo bar$ CREATE SECRET s (...)");
+}
+
 TEST(MotherDuckRedactTest, ConnectionStringTokens) {
   EXPECT_EQ(RedactSecretStatements("ATTACH 'md:db?motherduck_token=abc.def&x=1'"),
             "ATTACH 'md:db?motherduck_token=...&x=1'");
