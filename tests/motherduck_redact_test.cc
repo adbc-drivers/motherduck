@@ -77,6 +77,31 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
       "SELECT 's3://AKIA:ZZ9@bucket/path'",
       "ATTACH 'host=h' AS p (TYPE postgres, PASSWORD 'ZZ9')",
       "SELECT '{\"password\": \"ZZ9\"}'",
+      // DuckDB: Parquet and database file encryption.
+      "PRAGMA add_parquet_key('key128', 'ZZ9')",
+      "CALL add_parquet_key('key128', 'ZZ9')",
+      "ATTACH 'enc.db' AS e (ENCRYPTION_KEY 'ZZ9')",
+      // Scanner connection strings.
+      "ATTACH 'host=h user=u password=ZZ9 dbname=d' AS p (TYPE postgres)",
+      "ATTACH 'host=h user=u passwd=ZZ9' AS m (TYPE mysql)",
+      "SELECT * FROM postgres_scan('host=h password=ZZ9', 'public', 't')",
+      "ATTACH 'host=h sslkey=/k.pem sslpassword=ZZ9' AS p (TYPE postgres)",
+      "ATTACH 'ducklake:postgres:host=h password=ZZ9' AS dl (DATA_PATH 's3://b/')",
+      // httpfs and Azure.
+      "SET s3_session_token = 'ZZ9'",
+      "SET http_proxy_password = 'ZZ9'",
+      "SET hf_token = 'ZZ9'",
+      "SET azure_storage_connection_string = 'AccountName=a;AccountKey=ZZ9'",
+      "SET VARIABLE pw = 'ZZ9'",
+      "CREATE USER u WITH PASSWORD 'ZZ9'",
+      // Credentials in URLs.
+      "SELECT * FROM read_parquet('https://a.blob.core.windows.net/f?sv=1&sig=ZZ9')",
+      "SELECT * FROM read_parquet('https://b.s3.amazonaws.com/f?X-Amz-Signature=ZZ9')",
+      "SELECT * FROM read_csv('https://x/f?apikey=ZZ9')",
+      "SELECT * FROM read_parquet('azure://c/f?AccountKey=ZZ9')",
+      "INSTALL x FROM 'https://u:ZZ9@repo.example.com'",
+      // HTTP headers.
+      "SELECT http_get('https://x', headers = {'Authorization': 'Bearer ZZ9'})",
   };
   for (const char* query : kQueries) {
     const std::string out = RedactSecretStatements(query);
@@ -89,6 +114,9 @@ TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
       "SELECT 1",
       "SELECT keyboard, key FROM t ORDER BY id",
       "SELECT key::int FROM t",
+      "CREATE TABLE t (id INT, PRIMARY KEY (id))",
+      "CREATE TABLE t (id INT PRIMARY KEY, a INT, FOREIGN KEY (a) REFERENCES u(id))",
+      "SELECT author, designation FROM t",
       "SELECT * FROM duckdb_secrets()",
       "DROP SECRET s",
       "CREATE TABLE secrets (id INT)",
@@ -112,6 +140,9 @@ TEST(MotherDuckRedactTest, OverMasksCredentialLookingSql) {
             "SELECT * FROM t WHERE key = ...");
   EXPECT_EQ(RedactSecretStatements("CREATE TABLE t (secret INT, d DECIMAL(10,2))"),
             "CREATE TABLE t (secret INT, d DECIMAL(...)");
+  // Run-together names are matched by their ending.
+  EXPECT_EQ(RedactSecretStatements("SELECT * FROM t WHERE monkey = 1"),
+            "SELECT * FROM t WHERE monkey = ...");
 }
 
 TEST(MotherDuckRedactTest, MalformedInputDoesNotCrash) {

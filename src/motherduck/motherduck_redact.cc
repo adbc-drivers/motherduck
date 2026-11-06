@@ -47,17 +47,31 @@ bool EqualsNoCase(std::string_view a, std::string_view b) {
   return true;  // b is upper case
 }
 
+bool EndsWithNoCase(std::string_view a, std::string_view upper_suffix) {
+  return a.size() > upper_suffix.size() &&
+         EqualsNoCase(a.substr(a.size() - upper_suffix.size()), upper_suffix);
+}
+
 // Whether any '_' or '.' separated part of the name is a credential word, so that
-// s3_access_key_id counts but monkey and tokenizer don't.
+// s3_access_key_id counts but monkey and tokenizer don't. Run-together names such as
+// AccountKey, sslpassword and apikey count too, by their ending.
 bool IsCredentialName(std::string_view name) {
+  for (size_t i = 0; i + 17 <= name.size(); i++) {
+    if (EqualsNoCase(name.substr(i, 17), "CONNECTION_STRING")) return true;
+  }
   size_t start = 0;
   while (start <= name.size()) {
     size_t end = name.find_first_of("_.$", start);
     if (end == std::string_view::npos) end = name.size();
     const std::string_view part = name.substr(start, end - start);
-    for (const char* word :
-         {"SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE", "KEY"}) {
+    for (const char* word : {"SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE", "PWD",
+                             "PW", "KEY", "SIG", "SIGNATURE", "SAS", "AUTH",
+                             "AUTHORIZATION", "CREDENTIAL", "CREDENTIALS"}) {
       if (EqualsNoCase(part, word)) return true;
+    }
+    for (const char* word :
+         {"SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE", "KEY", "SIGNATURE"}) {
+      if (EndsWithNoCase(part, word)) return true;
     }
     start = end + 1;
   }
@@ -83,7 +97,7 @@ size_t SkipSpaceAndComments(std::string_view t, size_t i) {
 
 // After a credential name at t[0, i): is a value about to follow (name = v, name TO v,
 // name: v, name 'v')? A quoted name may have its closing quote first.
-std::optional<Cut> ValueAfterName(std::string_view t, size_t i) {
+std::optional<Cut> ValueAfterName(std::string_view t, std::string_view name, size_t i) {
   if (i < t.size() && (t[i] == '\'' || t[i] == '"')) i++;
   const size_t k = SkipSpaceAndComments(t, i);
   if (k >= t.size()) return std::nullopt;
@@ -91,6 +105,8 @@ std::optional<Cut> ValueAfterName(std::string_view t, size_t i) {
   if (c == '=') return Cut{k + 1, " ..."};
   if (c == ':' && !(k + 1 < t.size() && t[k + 1] == ':')) return Cut{k + 1, " ..."};
   if (c == '\'') return Cut{k, "..."};
+  // add_parquet_key('name', 'key'). Not for a bare KEY, as in PRIMARY KEY (id).
+  if (c == '(' && !EqualsNoCase(name, "KEY")) return Cut{k + 1, "...)"};
   if ((c == 't' || c == 'T') && k + 1 < t.size() &&
       (t[k + 1] == 'o' || t[k + 1] == 'O') &&
       !(k + 2 < t.size() && IsIdentChar(t[k + 2]))) {
@@ -138,7 +154,7 @@ std::optional<Cut> FindCut(std::string_view t) {
       return Cut{paren + 1, "...)"};
     }
     if (IsCredentialName(word)) {
-      if (auto cut = ValueAfterName(t, i)) return cut;
+      if (auto cut = ValueAfterName(t, word, i)) return cut;
     }
   }
   return std::nullopt;
