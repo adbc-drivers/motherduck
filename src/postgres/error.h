@@ -88,7 +88,8 @@ inline std::string PqErrorText(PGresult* result, PGconn* conn) {
     if (text != nullptr) {
       std::string out(text);
       PQfreemem(text);
-      return out;
+      // The server's own message can quote the statement as well.
+      return RedactQuery(out);
     }
   }
   return conn != nullptr ? PQerrorMessage(conn) : "";
@@ -118,11 +119,7 @@ Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
   for (const auto& field : kDetailFields) {
     const char* value = PQresultErrorField(result, field.code);
     if (value) {
-      if (field.code == PG_DIAG_INTERNAL_QUERY) {
-        status.AddDetail(field.key, RedactQuery(value));
-      } else {
-        status.AddDetail(field.key, value);
-      }
+      status.AddDetail(field.key, RedactQuery(value));
     }
   }
 

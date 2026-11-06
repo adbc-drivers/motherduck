@@ -14,7 +14,11 @@
 
 // Tests for masking credentials in SQL text that appears in error messages.
 
+#include <cstdlib>
+#include <string>
+
 #include <gtest/gtest.h>
+#include <libpq-fe.h>
 
 #include "error.h"
 #include "motherduck_redact.h"
@@ -64,6 +68,23 @@ TEST(MotherDuckRedactTest, CredentialSettings) {
   EXPECT_EQ(RedactSecretStatements("SET threads = 4"), "SET threads = 4");
 }
 
+TEST(MotherDuckRedactTest, QuotedAndLookalikeSettings) {
+  EXPECT_EQ(RedactSecretStatements("SET \"s3_secret_access_key\" = 'abc'"),
+            "SET \"s3_secret_access_key\" = ...");
+  EXPECT_EQ(RedactSecretStatements("SET monkey = 'x'"), "SET monkey = 'x'");
+  EXPECT_EQ(RedactSecretStatements("SET tokenizer = 'icu'"), "SET tokenizer = 'icu'");
+}
+
+TEST(MotherDuckRedactTest, UrlUserinfoAndEscapes) {
+  EXPECT_EQ(RedactSecretStatements("ATTACH 'postgresql://user:abc@host/db'"),
+            "ATTACH 'postgresql://user:...@host/db'");
+  EXPECT_EQ(RedactSecretStatements("SELECT 's3://AKIA:abc@bucket/path'"),
+            "SELECT 's3://AKIA:...@bucket/path'");
+  EXPECT_EQ(RedactSecretStatements("SELECT 'keyboard=abc'"), "SELECT 'keyboard=abc'");
+  EXPECT_EQ(RedactSecretStatements("ATTACH E'md:db?motherduck_token=abc\\'def'"),
+            "ATTACH E'md:db?motherduck_token=...'");
+}
+
 TEST(MotherDuckRedactTest, ConnectionStringTokens) {
   EXPECT_EQ(RedactSecretStatements("ATTACH 'md:db?motherduck_token=abc.def&x=1'"),
             "ATTACH 'md:db?motherduck_token=...&x=1'");
@@ -75,6 +96,25 @@ TEST(MotherDuckRedactTest, InstalledRedactorAppliesToErrors) {
   InstallMotherDuckQueryRedactor();
   EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET s (...)");
   SetQueryRedactor(nullptr);
+}
+
+// libpq echoes the statement ("LINE 1: ...") in its default error message. Make sure the
+// text we put in errors never has it.
+TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  if (!uri) GTEST_SKIP() << "ADBC_POSTGRESQL_TEST_URI not set";
+  PGconn* conn = PQconnectdb(uri);
+  ASSERT_EQ(PQstatus(conn), CONNECTION_OK) << PQerrorMessage(conn);
+  PGresult* result = PQexec(conn, "SELECT FROM WHERE 'UNIQUEMARKER' +");
+  ASSERT_EQ(PQresultStatus(result), PGRES_FATAL_ERROR);
+  ASSERT_NE(std::string(PQresultErrorMessage(result)).find("UNIQUEMARKER"),
+            std::string::npos)
+      << "server did not echo the statement; test is vacuous";
+  const std::string text = PqErrorText(result, conn);
+  EXPECT_EQ(text.find("UNIQUEMARKER"), std::string::npos) << text;
+  EXPECT_EQ(text.find("LINE"), std::string::npos) << text;
+  PQclear(result);
+  PQfinish(conn);
 }
 
 }  // namespace adbcpq

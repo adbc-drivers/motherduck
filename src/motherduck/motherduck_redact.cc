@@ -69,7 +69,15 @@ std::vector<Token> Tokenize(const std::string& sql) {
       }
     } else if (c == '\'' || c == '"') {
       const size_t begin = i++;
+      // E'...' strings treat backslash as an escape.
+      const bool escapes = c == '\'' && begin > 0 &&
+                           (sql[begin - 1] == 'E' || sql[begin - 1] == 'e') &&
+                           (begin < 2 || !is_word(sql[begin - 2]));
       while (i < n) {
+        if (escapes && sql[i] == '\\') {
+          i += 2;
+          continue;
+        }
         if (sql[i] == c) {
           if (i + 1 < n && sql[i + 1] == c) {
             i += 2;  // doubled quote escapes itself
@@ -143,12 +151,26 @@ size_t MatchCredentialSetting(const std::string& sql, const std::vector<Token>& 
       IsWord(sql, tokens, j, "SESSION") || IsWord(sql, tokens, j, "VARIABLE")) {
     j++;
   }
-  if (j >= tokens.size() || tokens[j].kind != TokenKind::kWord) return 0;
-  const std::string name = Upper(sql, tokens[j]);
-  const bool credential = name.find("SECRET") != std::string::npos ||
-                          name.find("TOKEN") != std::string::npos ||
-                          name.find("PASSWORD") != std::string::npos ||
-                          name.find("KEY") != std::string::npos;
+  if (j >= tokens.size() || tokens[j].kind == TokenKind::kPunct) return 0;
+  std::string name = Upper(sql, tokens[j]);
+  if (tokens[j].kind == TokenKind::kString) {
+    if (name.size() < 2 || name.front() != '"') return 0;
+    name = name.substr(1, name.size() - 2);
+  }
+  // Match whole underscore/dot-separated parts, so monkey and tokenizer don't count.
+  bool credential = false;
+  size_t start = 0;
+  while (start <= name.size()) {
+    size_t end = name.find_first_of("_.", start);
+    if (end == std::string::npos) end = name.size();
+    const std::string part = name.substr(start, end - start);
+    if (part == "SECRET" || part == "TOKEN" || part == "PASSWORD" || part == "PASSWD" ||
+        part == "KEY") {
+      credential = true;
+      break;
+    }
+    start = end + 1;
+  }
   if (!credential) return 0;
   j++;
   return IsPunct(sql, tokens, j, '=') || IsWord(sql, tokens, j, "TO") ? j : 0;
@@ -176,14 +198,18 @@ std::string RedactSecretStatements(std::string_view query) {
 
   // Connection strings such as ATTACH 'md:db?motherduck_token=...'.
   static const std::regex kCredentialParam(
-      R"(((?:token|password|secret|access_key|key)[A-Za-z_]*=)[^&\s'"]+)",
+      R"(\b((?:[A-Za-z0-9]+_)*(?:token|password|passwd|secret|key)=)(?:\\.|[^&\s'"\\])+)",
       std::regex::icase | std::regex::optimize);
+  // user:password@host in URLs.
+  static const std::regex kUserinfo(R"((://[^/:@\s'"]*:)[^/@\s'"]+@)",
+                                    std::regex::optimize);
   std::string out;
   size_t copied = 0;
   for (const Token& token : tokens) {
     if (token.kind != TokenKind::kString) continue;
     const std::string literal = text.substr(token.begin, token.end - token.begin);
-    const std::string redacted = std::regex_replace(literal, kCredentialParam, "$1...");
+    const std::string redacted = std::regex_replace(
+        std::regex_replace(literal, kUserinfo, "$1...@"), kCredentialParam, "$1...");
     if (redacted != literal) {
       out += text.substr(copied, token.begin - copied) + redacted;
       copied = token.end;
