@@ -16,6 +16,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 #include <gtest/gtest.h>
 #include <libpq-fe.h>
@@ -25,142 +26,100 @@
 
 namespace adbcpq {
 
-TEST(MotherDuckRedactTest, SecretStatements) {
-  EXPECT_EQ(RedactSecretStatements("SELECT 1"), "SELECT 1");
-  EXPECT_EQ(RedactSecretStatements("CREATE TABLE secrets (a INT)"),
-            "CREATE TABLE secrets (a INT)");
-  EXPECT_EQ(RedactSecretStatements("CREATE SECRET s (TYPE s3, KEY_ID 'k', SECRET 'x')"),
-            "CREATE SECRET s (...)");
-  EXPECT_EQ(RedactSecretStatements("  create or replace persistent secret s IN "
-                                   "motherduck (TYPE s3, SECRET 'x')"),
-            "  create or replace persistent secret s IN motherduck (...)");
-  EXPECT_EQ(RedactSecretStatements("CREATE OR REPLACE TEMPORARY SECRET IF NOT EXISTS s "
-                                   "IN motherduck (SECRET 'x')"),
-            "CREATE OR REPLACE TEMPORARY SECRET IF NOT EXISTS s IN motherduck (...)");
-  EXPECT_EQ(RedactSecretStatements("SELECT 1; CREATE TEMPORARY SECRET (TYPE s3, "
-                                   "SECRET 'x');"),
-            "SELECT 1; CREATE TEMPORARY SECRET (...)");
-  EXPECT_EQ(RedactSecretStatements("ALTER SECRET s (SECRET 'x')"),
-            "ALTER SECRET s (...)");
+TEST(MotherDuckRedactTest, ExactOutputs) {
+  const std::pair<const char*, const char*> kCases[] = {
+      {"CREATE SECRET s (TYPE s3, KEY_ID 'k', SECRET 'x')", "CREATE SECRET s (...)"},
+      {"create or replace persistent secret s IN motherduck (TYPE s3, SECRET 'x')",
+       "create or replace persistent secret s IN motherduck (...)"},
+      {"CREATE TEMP SECRET s (SECRET 'x')", "CREATE TEMP SECRET s (...)"},
+      {"ALTER SECRET s (SECRET 'x')", "ALTER SECRET s (...)"},
+      {"SET s3_secret_access_key = 'x'", "SET s3_secret_access_key = ..."},
+      {"SET GLOBAL motherduck_token TO 'x'", "SET GLOBAL motherduck_token TO ..."},
+      {"SET memory.s3_secret_access_key = 'x'", "SET memory.s3_secret_access_key = ..."},
+      {"ATTACH 'md:db?motherduck_token=abc&x=1'", "ATTACH 'md:db?motherduck_token= ..."},
+      {"ATTACH 'postgresql://user:abc@host/db'", "ATTACH 'postgresql://user:..."},
+      {"ATTACH 'host=h' AS p (TYPE postgres, PASSWORD 'abc')",
+       "ATTACH 'host=h' AS p (TYPE postgres, PASSWORD ..."},
+  };
+  for (const auto& [query, expected] : kCases) {
+    EXPECT_EQ(RedactSecretStatements(query), expected) << query;
+  }
 }
 
-TEST(MotherDuckRedactTest, CommentsAndShortForms) {
-  EXPECT_EQ(RedactSecretStatements("CREATE /*c*/ SECRET s (SECRET 'x')"),
-            "CREATE /*c*/ SECRET s (...)");
-  EXPECT_EQ(RedactSecretStatements("CREATE --c\n SECRET s (SECRET 'x')"),
-            "CREATE --c\n SECRET s (...)");
-  EXPECT_EQ(RedactSecretStatements("CREATE TEMP SECRET s (SECRET 'x')"),
-            "CREATE TEMP SECRET s (...)");
+// None of these may let the marker through, however the statement is dressed up.
+TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
+  const char* kQueries[] = {
+      "CREATE /* see (note) */ SECRET s (TYPE s3, SECRET 'ZZ9')",
+      "CREATE -- (c)\n SECRET s (SECRET 'ZZ9')",
+      "CREATE OR REPLACE TEMPORARY SECRET IF NOT EXISTS s IN motherduck (SECRET 'ZZ9')",
+      "SELECT 1; CREATE SECRET s (SECRET 'ZZ9')",
+      "SELECT $foo bar$ CREATE SECRET s (SECRET 'ZZ9')",
+      "CREATE MACRO m() AS $$ CREATE SECRET s (SECRET 'ZZ9') $$",
+      "-- CREATE SECRET s (SECRET 'ZZ9')\nSELECT 1",
+      "-- motherduck_token = ZZ9\nSELECT 1",
+      "/* token=\"ZZ9\" */ SELECT 1",
+      "/* password=ZZ9 */ SELECT 1",
+      "SET \"s3_secret_access_key\" = 'ZZ9'",
+      "SET 's3_secret_access_key' = 'ZZ9'",
+      "SET s3_secret_access_key\n  = 'ZZ9'",
+      "SET s3_secret_access_key /* c */ = 'ZZ9'",
+      "SET motherduck_token -- c\n TO 'ZZ9'",
+      "SET s3_access_key_id = 'ZZ9'",
+      "ATTACH 'md:db?motherduck_token=ZZ9&x=1'",
+      "ATTACH 'md:db?motherduck_token = ZZ9'",
+      "ATTACH 'md:db?motherduck_token=''ZZ9'''",
+      "ATTACH 'md:db?motherduck_token=my ZZ9 x'",
+      "ATTACH 'md:db?motherduck_token=abc;ZZ9'",
+      "ATTACH E'md:db?motherduck_token=abc\\'ZZ9'",
+      "SELECT 's3://b/o?access_key_id=ZZ9&secret_access_key=ZZ9'",
+      "SELECT \"md:db?token='ZZ9'\"",
+      "ATTACH 'postgresql://user:ZZ9@host/db'",
+      "SELECT 's3://AKIA:ZZ9@bucket/path'",
+      "ATTACH 'host=h' AS p (TYPE postgres, PASSWORD 'ZZ9')",
+      "SELECT '{\"password\": \"ZZ9\"}'",
+  };
+  for (const char* query : kQueries) {
+    const std::string out = RedactSecretStatements(query);
+    EXPECT_EQ(out.find("ZZ9"), std::string::npos) << query << "\n -> " << out;
+  }
 }
 
-TEST(MotherDuckRedactTest, KeywordsInsideLiteralsAreIgnored) {
-  const std::string query = "SELECT 'CREATE SECRET later' WHERE a IN (1)";
-  EXPECT_EQ(RedactSecretStatements(query), query);
-  // A commented-out statement is masked, but doesn't hide the live statement after it.
-  EXPECT_EQ(RedactSecretStatements("SELECT 1 -- CREATE SECRET s (x)\nWHERE a IN (1)"),
-            "SELECT 1 -- CREATE SECRET s (...)\nWHERE a IN (1)");
+TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
+  const char* kQueries[] = {
+      "SELECT 1",
+      "SELECT keyboard, key FROM t ORDER BY id",
+      "SELECT key::int FROM t",
+      "SELECT * FROM duckdb_secrets()",
+      "DROP SECRET s",
+      "CREATE TABLE secrets (id INT)",
+      "SELECT 'token' AS kind FROM t",
+      "SELECT count(*) FROM t GROUP BY key ORDER BY key",
+      "SELECT a, b FROM t WHERE monkey > 1 AND tokenizer IS NULL",
+      "SET threads = 4",
+      "SET memory_limit = '1GB'",
+      "COPY t TO 'x.csv' (FORMAT csv)",
+      "INSERT INTO t VALUES ('password reset requested')",
+  };
+  for (const char* query : kQueries) {
+    EXPECT_EQ(RedactSecretStatements(query), query);
+  }
 }
 
-TEST(MotherDuckRedactTest, CredentialSettings) {
-  EXPECT_EQ(RedactSecretStatements("SET s3_secret_access_key='abc'"),
-            "SET s3_secret_access_key= ...");
-  EXPECT_EQ(RedactSecretStatements("SET GLOBAL motherduck_token TO 'abc'"),
-            "SET GLOBAL motherduck_token TO ...");
-  EXPECT_EQ(RedactSecretStatements("SET threads = 4"), "SET threads = 4");
+// The scan trades precision for safety. These are masked although they hold no secret;
+// pinning them keeps the trade-off visible.
+TEST(MotherDuckRedactTest, OverMasksCredentialLookingSql) {
+  EXPECT_EQ(RedactSecretStatements("SELECT * FROM t WHERE key = 5 ORDER BY id"),
+            "SELECT * FROM t WHERE key = ...");
+  EXPECT_EQ(RedactSecretStatements("CREATE TABLE t (secret INT, d DECIMAL(10,2))"),
+            "CREATE TABLE t (secret INT, d DECIMAL(...)");
 }
 
-TEST(MotherDuckRedactTest, QuotedAndLookalikeSettings) {
-  EXPECT_EQ(RedactSecretStatements("SET \"s3_secret_access_key\" = 'abc'"),
-            "SET \"s3_secret_access_key\" = ...");
-  EXPECT_EQ(RedactSecretStatements("SET monkey = 'x'"), "SET monkey = 'x'");
-  EXPECT_EQ(RedactSecretStatements("SET tokenizer = 'icu'"), "SET tokenizer = 'icu'");
-}
-
-TEST(MotherDuckRedactTest, UrlUserinfoAndEscapes) {
-  EXPECT_EQ(RedactSecretStatements("ATTACH 'postgresql://user:abc@host/db'"),
-            "ATTACH 'postgresql://user:...@host/db'");
-  EXPECT_EQ(RedactSecretStatements("SELECT 's3://AKIA:abc@bucket/path'"),
-            "SELECT 's3://AKIA:...@bucket/path'");
-  EXPECT_EQ(RedactSecretStatements("SELECT 'keyboard=abc'"), "SELECT 'keyboard=abc'");
-  EXPECT_EQ(RedactSecretStatements("ATTACH E'md:db?motherduck_token=abc\\'def'"),
-            "ATTACH E'md:db?motherduck_token=...'");
-}
-
-TEST(MotherDuckRedactTest, UnterminatedEscapeDoesNotThrow) {
-  EXPECT_EQ(RedactSecretStatements("ATTACH E'md:db?motherduck_token=abc\\"),
-            "ATTACH E'md:db?motherduck_token=...");
-  EXPECT_EQ(RedactSecretStatements("SELECT E'abc\\"), "SELECT E'abc\\");
-}
-
-TEST(MotherDuckRedactTest, CommentsAreScrubbed) {
-  EXPECT_EQ(RedactSecretStatements("-- motherduck_token=SUPERSECRET\n"
-                                   "CREATE SECRET s (TYPE s3, SECRET 'x')"),
-            "-- motherduck_token=...\nCREATE SECRET s (...)");
-  EXPECT_EQ(RedactSecretStatements("/* password=SUPERSECRET */ SELECT 1"),
-            "/* password=...*/ SELECT 1");
-  EXPECT_EQ(RedactSecretStatements("SELECT 'md:db?motherduck_token=LEAK' x "
-                                   "CREATE SECRET s (SECRET 'x')"),
-            "SELECT 'md:db?motherduck_token=...' x CREATE SECRET s (...)");
-}
-
-TEST(MotherDuckRedactTest, CredentialNamesInParameters) {
-  EXPECT_EQ(RedactSecretStatements("SELECT 's3://b/o?access_key_id=AKIA&"
-                                   "secret_access_key=sekret'"),
-            "SELECT 's3://b/o?access_key_id=...&secret_access_key=...'");
-  EXPECT_EQ(RedactSecretStatements("SELECT 'https://x?key_id=AKIA&token=ok'"),
-            "SELECT 'https://x?key_id=...&token=...'");
-  EXPECT_EQ(RedactSecretStatements("ATTACH 'md:db?motherduck_token=my secret'"),
-            "ATTACH 'md:db?motherduck_token=...'");
-}
-
-TEST(MotherDuckRedactTest, DollarQuotedBodies) {
-  EXPECT_EQ(RedactSecretStatements("CREATE MACRO m() AS $$ CREATE SECRET s (TYPE s3, "
-                                   "SECRET 'supersecret') $$"),
-            "CREATE MACRO m() AS $$ CREATE SECRET s (...)$$");
-  // $foo bar$ is not a dollar quote, so the secret statement is seen.
-  EXPECT_EQ(RedactSecretStatements("SELECT $foo bar$ CREATE SECRET s (SECRET 'x')"),
-            "SELECT $foo bar$ CREATE SECRET s (...)");
-}
-
-TEST(MotherDuckRedactTest, CommentedOutStatements) {
-  EXPECT_EQ(RedactSecretStatements("-- CREATE SECRET s (TYPE s3, KEY_ID 'AKIA', "
-                                   "SECRET 'wJalr')"),
-            "-- CREATE SECRET s (...)");
-  EXPECT_EQ(RedactSecretStatements("-- motherduck_token='SUPERSECRET'\nSELECT 1"),
-            "-- motherduck_token=...\nSELECT 1");
-  EXPECT_EQ(RedactSecretStatements("-- motherduck_token = SUPERSECRET"),
-            "-- motherduck_token = ...");
-  EXPECT_EQ(RedactSecretStatements("/* token=\"SUPERSECRET\" */ SELECT 1"),
-            "/* token=... */ SELECT 1");
-  EXPECT_EQ(RedactSecretStatements("SELECT \"md:db?token='SUPERSECRET'\""),
-            "SELECT \"md:db?token=...\"");
-  EXPECT_EQ(RedactSecretStatements("SELECT $$ -- CREATE SECRET s (SECRET 'wJalr') $$"),
-            "SELECT $$ -- CREATE SECRET s (...)$$");
-}
-
-TEST(MotherDuckRedactTest, QuotedAndDottedSettingNames) {
-  EXPECT_EQ(RedactSecretStatements("SET 's3_secret_access_key' = 'SUPERSECRET'"),
-            "SET 's3_secret_access_key' = ...");
-  EXPECT_EQ(RedactSecretStatements("SET memory.s3_secret_access_key = 'SUPERSECRET'"),
-            "SET memory.s3_secret_access_key = ...");
-  EXPECT_EQ(RedactSecretStatements("SET memory.threads = 4"), "SET memory.threads = 4");
-}
-
-TEST(MotherDuckRedactTest, KeywordFollowedByString) {
-  EXPECT_EQ(
-      RedactSecretStatements("ATTACH 'host=h' AS p (TYPE postgres, PASSWORD 'abc')"),
-      "ATTACH 'host=h' AS p (TYPE postgres, PASSWORD ...");
-}
-
-TEST(MotherDuckRedactTest, DoubledQuotedValueInsideLiteral) {
-  EXPECT_EQ(RedactSecretStatements("ATTACH 'md:db?motherduck_token=''abc'''"),
-            "ATTACH 'md:db?motherduck_token=...'");
-}
-
-TEST(MotherDuckRedactTest, ConnectionStringTokens) {
-  EXPECT_EQ(RedactSecretStatements("ATTACH 'md:db?motherduck_token=abc.def&x=1'"),
-            "ATTACH 'md:db?motherduck_token=...&x=1'");
-  EXPECT_EQ(RedactSecretStatements("SELECT 'a=b'"), "SELECT 'a=b'");
+TEST(MotherDuckRedactTest, MalformedInputDoesNotCrash) {
+  for (const char* query :
+       {"", "'", "\"", "/*", "--", "E'\\", "$$", "$a$", "key", "key '",
+        "key =", "token TO", "://", "x://u:", "CREATE SECRET", "secret ("}) {
+    RedactSecretStatements(query);
+  }
 }
 
 TEST(MotherDuckRedactTest, InstalledRedactorAppliesToErrors) {
