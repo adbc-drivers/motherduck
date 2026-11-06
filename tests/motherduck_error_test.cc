@@ -22,10 +22,6 @@ namespace adbcpq {
 
 // The primary messages the endpoint sends, all with SQLSTATE XXUUU.
 TEST(MotherduckErrorTest, MissingObjects) {
-  EXPECT_TRUE(MotherduckIsMissingObject(
-      "Invalid Input Error: relation \"\"nope\"\" does not exist"));
-  EXPECT_TRUE(MotherduckIsMissingObject(
-      "Invalid Input Error: relation \"\"nosuchschema\".\"t\"\" does not exist"));
   EXPECT_TRUE(
       MotherduckIsMissingObject("Binder Error: Catalog \"nosuchdb\" does not exist!"));
   EXPECT_TRUE(MotherduckIsMissingObject(
@@ -36,6 +32,9 @@ TEST(MotherduckErrorTest, MissingObjects) {
 TEST(MotherduckErrorTest, OtherErrors) {
   EXPECT_FALSE(MotherduckIsMissingObject(nullptr));
   EXPECT_FALSE(MotherduckIsMissingObject("Invalid Input Error: bad input"));
+  // A regclass cast also reports this for a table that exists (#13).
+  EXPECT_FALSE(MotherduckIsMissingObject(
+      "Invalid Input Error: relation \"\"main\" . \"numeric_ingest\"\" does not exist"));
   EXPECT_FALSE(MotherduckIsMissingObject(
       "Binder Error: Referenced column \"x\" not found in FROM clause!"));
   // The phrase alone, outside the server's error clause, doesn't count.

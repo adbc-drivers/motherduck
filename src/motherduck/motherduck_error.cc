@@ -37,10 +37,10 @@ bool Contains(std::string_view text, std::string_view part) {
 bool MotherduckIsMissingObject(const char* primary_message) {
   if (primary_message == nullptr) return false;
   std::string_view message(primary_message);
-  // relation ""t"" does not exist
-  if (StartsWith(message, "Invalid Input Error: relation ")) {
-    return Contains(message, " does not exist");
-  }
+  // Not a regclass cast's "Invalid Input Error: relation ... does not exist":
+  // the endpoint also reports that for a quoted, qualified name of a table that
+  // exists (#13), so it doesn't show that the table is missing.
+
   // Catalog "db" does not exist!
   if (StartsWith(message, "Binder Error: Catalog \"")) {
     return Contains(message, "\" does not exist");

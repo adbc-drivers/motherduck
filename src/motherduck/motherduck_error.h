@@ -18,13 +18,12 @@
 
 namespace adbcpq {
 
-/// \brief Whether a server error's primary message says that a relation,
-/// catalog or other named object doesn't exist.
+/// \brief Whether a server error's primary message says that a catalog or
+/// other named object doesn't exist.
 ///
-/// The endpoint reports most such errors with the generic SQLSTATE XXUUU
-/// rather than PostgreSQL's codes: a regclass cast of a missing relation,
-/// a missing catalog, a missing function or type. A missing table in a
-/// query already arrives as 42P01.
+/// The endpoint reports a missing catalog, function or type with the generic
+/// SQLSTATE XXUUU rather than PostgreSQL's codes. A missing table in a query
+/// already arrives as 42P01.
 bool MotherduckIsMissingObject(const char* primary_message);
 
 }  // namespace adbcpq
