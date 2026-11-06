@@ -100,6 +100,18 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
       "SELECT * FROM read_csv('https://x/f?apikey=ZZ9')",
       "SELECT * FROM read_parquet('azure://c/f?AccountKey=ZZ9')",
       "INSTALL x FROM 'https://u:ZZ9@repo.example.com'",
+      // MotherDuck connection strings.
+      "ATTACH 'md:ZZ9@mydb'",
+      "ATTACH 'md:ZZ9@mydb;attach_mode=single'",
+      "ATTACH 'motherduck:ZZ9@mydb'",
+      "ATTACH 'md:mydb?slt=ZZ9'",
+      "SET motherduck_slt = 'ZZ9'",
+      "SET motherduck_oauth_token = 'ZZ9'",
+      "PRAGMA md_connect('slt=ZZ9')",
+      "PRAGMA md_connect('token=ZZ9;host=h')",
+      // MotherDuck Flights carry free-form payloads.
+      "CALL md_create_flight(name := 'f', source_code := 'ZZ9')",
+      "CALL md_run_flight(id := 'x', config := MAP {'A': 'ZZ9'})",
       // HTTP headers.
       "SELECT http_get('https://x', headers = {'Authorization': 'Bearer ZZ9'})",
   };
@@ -114,6 +126,8 @@ TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
       "SELECT 1",
       "SELECT keyboard, key FROM t ORDER BY id",
       "SELECT key::int FROM t",
+      "ATTACH 'md:my_db' AS d (READ_ONLY)",
+      "SELECT * FROM md_list_flights()",
       "CREATE TABLE t (id INT, PRIMARY KEY (id))",
       "CREATE TABLE t (id INT PRIMARY KEY, a INT, FOREIGN KEY (a) REFERENCES u(id))",
       "SELECT author, designation FROM t",

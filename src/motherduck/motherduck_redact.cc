@@ -56,6 +56,8 @@ bool EndsWithNoCase(std::string_view a, std::string_view upper_suffix) {
 // s3_access_key_id counts but monkey and tokenizer don't. Run-together names such as
 // AccountKey, sslpassword and apikey count too, by their ending.
 bool IsCredentialName(std::string_view name) {
+  // md_create_flight(source_code => ..., config => ...) carry free-form payloads.
+  if (EqualsNoCase(name, "SOURCE_CODE") || EqualsNoCase(name, "CONFIG")) return true;
   for (size_t i = 0; i + 17 <= name.size(); i++) {
     if (EqualsNoCase(name.substr(i, 17), "CONNECTION_STRING")) return true;
   }
@@ -66,7 +68,7 @@ bool IsCredentialName(std::string_view name) {
     const std::string_view part = name.substr(start, end - start);
     for (const char* word : {"SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE", "PWD",
                              "PW", "KEY", "SIG", "SIGNATURE", "SAS", "AUTH",
-                             "AUTHORIZATION", "CREDENTIAL", "CREDENTIALS"}) {
+                             "AUTHORIZATION", "CREDENTIAL", "CREDENTIALS", "SLT"}) {
       if (EqualsNoCase(part, word)) return true;
     }
     for (const char* word :
@@ -129,21 +131,37 @@ std::optional<Cut> UserinfoPassword(std::string_view t, size_t i) {
   return std::nullopt;
 }
 
+// md:<token>@database (also motherduck:<token>@database): cut after the scheme. i is the
+// index of the ':'.
+std::optional<Cut> TokenBeforeAt(std::string_view t, size_t i) {
+  for (size_t j = i + 1; j < t.size(); j++) {
+    if (std::string_view("/?'\" \t\r\n;").find(t[j]) != std::string_view::npos) break;
+    if (t[j] == '@') return Cut{i + 1, "..."};
+  }
+  return std::nullopt;
+}
+
 // Find the first place that needs masking. Everything after it is dropped.
 std::optional<Cut> FindCut(std::string_view t) {
   bool create_or_alter_seen = false;
+  std::string_view last_word;
   size_t i = 0;
   while (i < t.size()) {
     if (!IsIdentChar(t[i])) {
       if (t.compare(i, 3, "://") == 0) {
         if (auto cut = UserinfoPassword(t, i)) return cut;
+      } else if (t[i] == ':' && (EqualsNoCase(last_word, "MD") ||
+                                 EqualsNoCase(last_word, "MOTHERDUCK"))) {
+        if (auto cut = TokenBeforeAt(t, i)) return cut;
       }
+      last_word = {};
       i++;
       continue;
     }
     const size_t start = i;
     while (i < t.size() && IsIdentChar(t[i])) i++;
     const std::string_view word = t.substr(start, i - start);
+    last_word = word;
 
     if (EqualsNoCase(word, "CREATE") || EqualsNoCase(word, "ALTER")) {
       create_or_alter_seen = true;
