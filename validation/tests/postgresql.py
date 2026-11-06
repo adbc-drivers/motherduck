@@ -84,21 +84,17 @@ class PostgreSQLQuirks(model.DriverQuirks):
         """PostgreSQL uses $1, $2, $3, etc. for parameter placeholders."""
         return f"${index}"
 
-    def is_table_not_found(self, table_name: str, error: Exception) -> bool:
-        """Check if the error indicates a table not found condition."""
+    def is_table_not_found(self, table_name: str | None, error: Exception) -> bool:
+        """Check if the error indicates a table not found condition.
+
+        With no table name, any table not found error matches.
+        """
         error_str = str(error).lower()
-        return (
-            (
-                "relation" in error_str
-                and "does not exist" in error_str
-                and table_name.lower() in error_str
-            )
-            or (
-                "table" in error_str
-                and "does not exist" in error_str
-                and table_name.lower() in error_str
-            )
-            or ("undefined_table" in error_str and table_name.lower() in error_str)
+        names_table = table_name is None or table_name.lower() in error_str
+        return names_table and (
+            ("relation" in error_str and "does not exist" in error_str)
+            or ("table" in error_str and "does not exist" in error_str)
+            or "undefined_table" in error_str
         )
 
     def quote_one_identifier(self, identifier: str) -> str:

@@ -22,6 +22,9 @@
 
 // part: metadata
 
+# DuckDB reads E'\\x...' as a string with escapes rather than as hex, and
+# rejects an empty one ("Invalid hex escape code"), so the setup uses
+# from_hex().
 [tags]
 sql-type-name = "bytea"
 
@@ -32,8 +35,8 @@ CREATE TABLE test_binary (
     res BYTEA
 );
 
-INSERT INTO test_binary (idx, res) VALUES (1, E'\\xe38193e38293e381abe381a1e381afe38081e4b896e7958cefbc81');  -- 'こんにちは、世界！' in UTF-8
-INSERT INTO test_binary (idx, res) VALUES (2, E'\\x00');
-INSERT INTO test_binary (idx, res) VALUES (3, E'\\xdeadbeef');
-INSERT INTO test_binary (idx, res) VALUES (4, E'\\x');
+INSERT INTO test_binary (idx, res) VALUES (1, from_hex('e38193e38293e381abe381a1e381afe38081e4b896e7958cefbc81'));  -- 'こんにちは、世界！' in UTF-8
+INSERT INTO test_binary (idx, res) VALUES (2, from_hex('00'));
+INSERT INTO test_binary (idx, res) VALUES (3, from_hex('deadbeef'));
+INSERT INTO test_binary (idx, res) VALUES (4, from_hex(''));
 INSERT INTO test_binary (idx, res) VALUES (5, NULL);
