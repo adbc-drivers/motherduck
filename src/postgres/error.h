@@ -75,6 +75,25 @@ void SetQueryRedactor(QueryRedactor redactor);
 /// \brief Apply the installed redactor to SQL text destined for an error message.
 std::string RedactQuery(std::string_view query);
 
+/// \brief The server's error text without the echoed statement.
+///
+/// libpq's default verbosity appends a "LINE n:" window of the statement around the
+/// error position and, for internal queries, a "QUERY:" line. Both can contain
+/// credentials, so use the terse form for errors on user-supplied SQL. Falls back to
+/// the connection's error message when there is no result.
+inline std::string PqErrorText(PGresult* result, PGconn* conn) {
+  if (result != nullptr) {
+    char* text =
+        PQresultVerboseErrorMessage(result, PQERRORS_TERSE, PQSHOW_CONTEXT_NEVER);
+    if (text != nullptr) {
+      std::string out(text);
+      PQfreemem(text);
+      return out;
+    }
+  }
+  return conn != nullptr ? PQerrorMessage(conn) : "";
+}
+
 template <typename... Args>
 Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
   auto message = ::fmt::vformat(format_string, ::fmt::make_format_args(args...));

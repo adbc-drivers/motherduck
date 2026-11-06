@@ -324,7 +324,7 @@ void KeepPipelineResult(PqResultHelper* helper, PGresult* result,
       if (status->ok()) {
         helper->SetResult(result);
         *status = MakeStatus(result, "[libpq] Failed to execute query '{}': {}",
-                             RedactQuery(statement), PQresultErrorMessage(result));
+                             RedactQuery(statement), PqErrorText(result, nullptr));
       } else {
         PQclear(result);
       }

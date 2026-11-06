@@ -16,26 +16,181 @@
 
 #include "motherduck_redact.h"
 
+#include <cctype>
 #include <regex>
+#include <vector>
 
 #include "error.h"
 
 namespace adbcpq {
 
+namespace {
+
+enum class TokenKind { kWord, kString, kPunct };
+
+struct Token {
+  TokenKind kind;
+  size_t begin;
+  size_t end;
+};
+
+// Splits SQL into words, string literals (including quoted identifiers and
+// dollar-quoted strings) and single-character punctuation. Comments and
+// whitespace are dropped, as the parser treats them as whitespace.
+std::vector<Token> Tokenize(const std::string& sql) {
+  std::vector<Token> tokens;
+  const size_t n = sql.size();
+  size_t i = 0;
+  auto is_word_start = [](char c) {
+    return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
+  };
+  auto is_word = [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+  };
+  while (i < n) {
+    const char c = sql[i];
+    if (std::isspace(static_cast<unsigned char>(c))) {
+      i++;
+    } else if (c == '-' && i + 1 < n && sql[i + 1] == '-') {
+      while (i < n && sql[i] != '\n') i++;
+    } else if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
+      int depth = 1;
+      i += 2;
+      while (i < n && depth > 0) {
+        if (sql.compare(i, 2, "*/") == 0) {
+          depth--;
+          i += 2;
+        } else if (sql.compare(i, 2, "/*") == 0) {
+          depth++;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+    } else if (c == '\'' || c == '"') {
+      const size_t begin = i++;
+      while (i < n) {
+        if (sql[i] == c) {
+          if (i + 1 < n && sql[i + 1] == c) {
+            i += 2;  // doubled quote escapes itself
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      tokens.push_back({TokenKind::kString, begin, i});
+    } else if (c == '$' && sql.find('$', i + 1) != std::string::npos &&
+               (sql.find('$', i + 1) == i + 1 || is_word_start(sql[i + 1]))) {
+      // $tag$ ... $tag$
+      const size_t tag_end = sql.find('$', i + 1);
+      const std::string tag = sql.substr(i, tag_end - i + 1);
+      const size_t close = sql.find(tag, tag_end + 1);
+      const size_t end = close == std::string::npos ? n : close + tag.size();
+      tokens.push_back({TokenKind::kString, i, end});
+      i = end;
+    } else if (is_word_start(c)) {
+      const size_t begin = i;
+      while (i < n && is_word(sql[i])) i++;
+      tokens.push_back({TokenKind::kWord, begin, i});
+    } else {
+      tokens.push_back({TokenKind::kPunct, i, i + 1});
+      i++;
+    }
+  }
+  return tokens;
+}
+
+std::string Upper(const std::string& sql, const Token& token) {
+  std::string out = sql.substr(token.begin, token.end - token.begin);
+  for (char& c : out) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  return out;
+}
+
+bool IsWord(const std::string& sql, const std::vector<Token>& tokens, size_t i,
+            const char* word) {
+  return i < tokens.size() && tokens[i].kind == TokenKind::kWord &&
+         Upper(sql, tokens[i]) == word;
+}
+
+bool IsPunct(const std::string& sql, const std::vector<Token>& tokens, size_t i, char c) {
+  return i < tokens.size() && tokens[i].kind == TokenKind::kPunct &&
+         sql[tokens[i].begin] == c;
+}
+
+// CREATE|ALTER [OR REPLACE] [PERSISTENT|TEMPORARY|TEMP] SECRET ... (
+// Returns the index of the token after SECRET, or 0 if there is no match.
+size_t MatchSecretStatement(const std::string& sql, const std::vector<Token>& tokens,
+                            size_t i) {
+  if (!IsWord(sql, tokens, i, "CREATE") && !IsWord(sql, tokens, i, "ALTER")) return 0;
+  size_t j = i + 1;
+  if (IsWord(sql, tokens, j, "OR") && IsWord(sql, tokens, j + 1, "REPLACE")) j += 2;
+  if (IsWord(sql, tokens, j, "PERSISTENT") || IsWord(sql, tokens, j, "TEMPORARY") ||
+      IsWord(sql, tokens, j, "TEMP")) {
+    j++;
+  }
+  return IsWord(sql, tokens, j, "SECRET") ? j + 1 : 0;
+}
+
+// SET [GLOBAL|LOCAL|SESSION|VARIABLE] <name> {=|TO} ... where the name looks like a
+// credential setting, e.g. s3_secret_access_key. Returns the index of the operator.
+size_t MatchCredentialSetting(const std::string& sql, const std::vector<Token>& tokens,
+                              size_t i) {
+  if (!IsWord(sql, tokens, i, "SET")) return 0;
+  size_t j = i + 1;
+  if (IsWord(sql, tokens, j, "GLOBAL") || IsWord(sql, tokens, j, "LOCAL") ||
+      IsWord(sql, tokens, j, "SESSION") || IsWord(sql, tokens, j, "VARIABLE")) {
+    j++;
+  }
+  if (j >= tokens.size() || tokens[j].kind != TokenKind::kWord) return 0;
+  const std::string name = Upper(sql, tokens[j]);
+  const bool credential = name.find("SECRET") != std::string::npos ||
+                          name.find("TOKEN") != std::string::npos ||
+                          name.find("PASSWORD") != std::string::npos ||
+                          name.find("KEY") != std::string::npos;
+  if (!credential) return 0;
+  j++;
+  return IsPunct(sql, tokens, j, '=') || IsWord(sql, tokens, j, "TO") ? j : 0;
+}
+
+}  // namespace
+
 std::string RedactSecretStatements(std::string_view query) {
-  static const std::regex kSecretStatement(
-      R"((CREATE|ALTER)\s+(OR\s+REPLACE\s+)?((PERSISTENT|TEMPORARY)\s+)?SECRET\b)",
-      std::regex::icase | std::regex::optimize);
   const std::string text(query);
-  std::smatch match;
-  if (!std::regex_search(text, match, kSecretStatement)) {
-    return text;
+  const std::vector<Token> tokens = Tokenize(text);
+
+  for (size_t i = 0; i < tokens.size(); i++) {
+    if (const size_t after = MatchSecretStatement(text, tokens, i)) {
+      for (size_t j = after; j < tokens.size(); j++) {
+        if (IsPunct(text, tokens, j, '(')) {
+          return text.substr(0, tokens[j].begin) + "(...)";
+        }
+      }
+      continue;
+    }
+    if (const size_t op = MatchCredentialSetting(text, tokens, i)) {
+      return text.substr(0, tokens[op].end) + " ...";
+    }
   }
-  const size_t paren = text.find('(', match.position(0) + match.length(0));
-  if (paren == std::string::npos) {
-    return text;
+
+  // Connection strings such as ATTACH 'md:db?motherduck_token=...'.
+  static const std::regex kCredentialParam(
+      R"(((?:token|password|secret|access_key|key)[A-Za-z_]*=)[^&\s'"]+)",
+      std::regex::icase | std::regex::optimize);
+  std::string out;
+  size_t copied = 0;
+  for (const Token& token : tokens) {
+    if (token.kind != TokenKind::kString) continue;
+    const std::string literal = text.substr(token.begin, token.end - token.begin);
+    const std::string redacted = std::regex_replace(literal, kCredentialParam, "$1...");
+    if (redacted != literal) {
+      out += text.substr(copied, token.begin - copied) + redacted;
+      copied = token.end;
+    }
   }
-  return text.substr(0, paren) + "(...)";
+  if (copied == 0) return text;
+  return out + text.substr(copied);
 }
 
 void InstallMotherDuckQueryRedactor() { SetQueryRedactor(&RedactSecretStatements); }

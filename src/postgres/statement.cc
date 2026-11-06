@@ -104,7 +104,7 @@ int TupleReader::GetCopyData() {
     int errno_result = ENODATA;
     if (pq_status != PGRES_COMMAND_OK) {
       status_ = MakeStatus(result_, "[libpq] Execution error [{}]: {}",
-                           PQresStatus(pq_status), PQresultErrorMessage(result_))
+                           PQresStatus(pq_status), PqErrorText(result_, conn_))
                     .ToAdbc(&error_);
       errno_result = InternalAdbcStatusCodeToErrno(status_);
     }

@@ -23,9 +23,12 @@ namespace adbcpq {
 
 /// \brief Mask credentials in SQL text before it goes into an error message.
 ///
-/// If the text contains CREATE/ALTER [OR REPLACE] [PERSISTENT|TEMPORARY] SECRET, everything
-/// from the first '(' after that point is replaced with "(...)". Other text is returned
-/// unchanged.
+/// Comments and string literals are skipped when looking for keywords. Masks:
+///  - CREATE/ALTER [OR REPLACE] [PERSISTENT|TEMPORARY|TEMP] SECRET: everything from the
+///    first '(' on becomes "(...)".
+///  - SET of a setting whose name contains secret, token, password or key: the value.
+///  - token=/password=/secret=/key= values inside string literals (connection strings).
+/// Other text is returned unchanged.
 std::string RedactSecretStatements(std::string_view query);
 
 /// \brief Install RedactSecretStatements as the driver's error-message query redactor.
