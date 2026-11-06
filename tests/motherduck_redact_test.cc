@@ -56,8 +56,9 @@ TEST(MotherDuckRedactTest, CommentsAndShortForms) {
 TEST(MotherDuckRedactTest, KeywordsInsideLiteralsAreIgnored) {
   const std::string query = "SELECT 'CREATE SECRET later' WHERE a IN (1)";
   EXPECT_EQ(RedactSecretStatements(query), query);
-  const std::string commented = "SELECT 1 -- CREATE SECRET s (x)\nWHERE a IN (1)";
-  EXPECT_EQ(RedactSecretStatements(commented), commented);
+  // A commented-out statement is masked, but doesn't hide the live statement after it.
+  EXPECT_EQ(RedactSecretStatements("SELECT 1 -- CREATE SECRET s (x)\nWHERE a IN (1)"),
+            "SELECT 1 -- CREATE SECRET s (...)\nWHERE a IN (1)");
 }
 
 TEST(MotherDuckRedactTest, CredentialSettings) {
@@ -119,6 +120,30 @@ TEST(MotherDuckRedactTest, DollarQuotedBodies) {
   // $foo bar$ is not a dollar quote, so the secret statement is seen.
   EXPECT_EQ(RedactSecretStatements("SELECT $foo bar$ CREATE SECRET s (SECRET 'x')"),
             "SELECT $foo bar$ CREATE SECRET s (...)");
+}
+
+TEST(MotherDuckRedactTest, CommentedOutStatements) {
+  EXPECT_EQ(RedactSecretStatements("-- CREATE SECRET s (TYPE s3, KEY_ID 'AKIA', "
+                                   "SECRET 'wJalr')"),
+            "-- CREATE SECRET s (...)");
+  EXPECT_EQ(RedactSecretStatements("-- motherduck_token='SUPERSECRET'\nSELECT 1"),
+            "-- motherduck_token=...\nSELECT 1");
+  EXPECT_EQ(RedactSecretStatements("-- motherduck_token = SUPERSECRET"),
+            "-- motherduck_token = ...");
+  EXPECT_EQ(RedactSecretStatements("/* token=\"SUPERSECRET\" */ SELECT 1"),
+            "/* token=... */ SELECT 1");
+  EXPECT_EQ(RedactSecretStatements("SELECT \"md:db?token='SUPERSECRET'\""),
+            "SELECT \"md:db?token=...\"");
+  EXPECT_EQ(RedactSecretStatements("SELECT $$ -- CREATE SECRET s (SECRET 'wJalr') $$"),
+            "SELECT $$ -- CREATE SECRET s (...)$$");
+}
+
+TEST(MotherDuckRedactTest, QuotedAndDottedSettingNames) {
+  EXPECT_EQ(RedactSecretStatements("SET 's3_secret_access_key' = 'SUPERSECRET'"),
+            "SET 's3_secret_access_key' = ...");
+  EXPECT_EQ(RedactSecretStatements("SET memory.s3_secret_access_key = 'SUPERSECRET'"),
+            "SET memory.s3_secret_access_key = ...");
+  EXPECT_EQ(RedactSecretStatements("SET memory.threads = 4"), "SET memory.threads = 4");
 }
 
 TEST(MotherDuckRedactTest, ConnectionStringTokens) {

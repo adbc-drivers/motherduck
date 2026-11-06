@@ -85,14 +85,14 @@ inline std::string PqErrorText(PGresult* result, PGconn* conn) {
   if (result != nullptr) {
     char* text =
         PQresultVerboseErrorMessage(result, PQERRORS_TERSE, PQSHOW_CONTEXT_NEVER);
-    if (text != nullptr) {
-      std::string out(text);
-      PQfreemem(text);
-      // The server's own message can quote the statement as well.
-      return RedactQuery(out);
-    }
+    // Never fall back to the default message, which echoes the statement.
+    if (text == nullptr) return "(server error text unavailable)";
+    std::string out(text);
+    PQfreemem(text);
+    // The server's own message can quote the statement as well.
+    return RedactQuery(out);
   }
-  return conn != nullptr ? PQerrorMessage(conn) : "";
+  return conn != nullptr ? RedactQuery(PQerrorMessage(conn)) : "";
 }
 
 template <typename... Args>

@@ -201,14 +201,22 @@ size_t MatchCredentialSetting(const std::string& sql, const std::vector<Token>& 
       IsWord(sql, tokens, j, "SESSION") || IsWord(sql, tokens, j, "VARIABLE")) {
     j++;
   }
-  if (j >= tokens.size() || tokens[j].kind == TokenKind::kPunct) return 0;
-  std::string name = sql.substr(tokens[j].begin, tokens[j].end - tokens[j].begin);
-  if (tokens[j].kind == TokenKind::kString) {
-    if (name.size() < 2 || name.front() != '"') return 0;
-    name = name.substr(1, name.size() - 2);
+  // The name may be quoted, and dotted (catalog.setting).
+  std::string name;
+  while (j < tokens.size() &&
+         (tokens[j].kind == TokenKind::kWord ||
+          (tokens[j].kind == TokenKind::kString && !tokens[j].dollar_quoted))) {
+    std::string part = sql.substr(tokens[j].begin, tokens[j].end - tokens[j].begin);
+    if (tokens[j].kind == TokenKind::kString && part.size() >= 2) {
+      part = part.substr(1, part.size() - 2);
+    }
+    name += part;
+    j++;
+    if (!IsPunct(sql, tokens, j, '.')) break;
+    name += '.';
+    j++;
   }
-  if (!IsCredentialName(name)) return 0;
-  j++;
+  if (name.empty() || !IsCredentialName(name)) return 0;
   return IsPunct(sql, tokens, j, '=') || IsWord(sql, tokens, j, "TO") ? j : 0;
 }
 
@@ -230,9 +238,33 @@ std::string ScrubParameters(const std::string& text) {
     size_t end = i;
     while (end < n && IsNameChar(text[end])) end++;
     out.append(text, i, end - i);
-    if (end < n && text[end] == '=' && IsCredentialName(text.substr(i, end - i))) {
-      out += '=';
-      size_t j = end + 1;
+    size_t eq = end;
+    while (eq < n && (text[eq] == ' ' || text[eq] == '\t')) eq++;
+    if (eq < n && text[eq] == '=' && IsCredentialName(text.substr(i, end - i))) {
+      out.append(text, end, eq + 1 - end);
+      size_t j = eq + 1;
+      while (j < n && (text[j] == ' ' || text[j] == '\t')) out += text[j++];
+      if (j < n && (text[j] == '\'' || text[j] == '"')) {
+        // A quoted value runs through its matching quote.
+        const char quote = text[j++];
+        while (j < n) {
+          if (text[j] == '\\') {
+            j = std::min(j + 2, n);
+          } else if (text[j] == quote) {
+            if (j + 1 < n && text[j + 1] == quote) {
+              j += 2;
+            } else {
+              j++;
+              break;
+            }
+          } else {
+            j++;
+          }
+        }
+        out += "...";
+        i = j;
+        continue;
+      }
       while (j < n && text[j] != '&') {
         if (text[j] == '\\') {
           j = std::min(j + 2, n);
@@ -334,7 +366,10 @@ std::string Redact(const std::string& text, int depth) {
       out.append(text, token.body_end, token.end - token.body_end);
     } else if (token.kind == TokenKind::kComment) {
       out.append(text, token.begin, token.body_begin - token.begin);
-      out += ScrubText(text.substr(token.body_begin, token.body_end - token.body_begin));
+      // A commented-out statement is still script text, so redact it as one.
+      const std::string body =
+          text.substr(token.body_begin, token.body_end - token.body_begin);
+      out += ScrubText(depth >= kMaxDollarDepth ? body : Redact(body, depth + 1));
       out.append(text, token.body_end, token.end - token.body_end);
     } else {
       out += ScrubText(text.substr(token.begin, token.end - token.begin));
