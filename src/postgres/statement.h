@@ -131,7 +131,8 @@ class PostgresStatement {
                                 struct AdbcError* error);
   AdbcStatusCode GetOptionDouble(const char* key, double* value, struct AdbcError* error);
   AdbcStatusCode GetOptionInt(const char* key, int64_t* value, struct AdbcError* error);
-  AdbcStatusCode GetParameterSchema(struct ArrowSchema* schema, struct AdbcError* error);
+  virtual AdbcStatusCode GetParameterSchema(struct ArrowSchema* schema,
+                                            struct AdbcError* error);
   AdbcStatusCode New(struct AdbcConnection* connection, struct AdbcError* error);
   AdbcStatusCode Prepare(struct AdbcError* error);
   AdbcStatusCode Release(struct AdbcError* error);

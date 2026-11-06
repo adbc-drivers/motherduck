@@ -45,6 +45,10 @@ class MotherduckResultReader : public PqResultArrayReader {
 };
 
 class MotherduckStatement : public PostgresStatement {
+ public:
+  AdbcStatusCode GetParameterSchema(struct ArrowSchema* schema,
+                                    struct AdbcError* error) override;
+
  protected:
   std::unique_ptr<PqResultArrayReader> MakeResultReader(
       PGconn* conn, std::shared_ptr<PostgresTypeResolver> type_resolver,

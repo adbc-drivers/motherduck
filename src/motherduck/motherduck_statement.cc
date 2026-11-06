@@ -20,6 +20,7 @@
 #include "motherduck_statement.h"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -115,6 +116,18 @@ std::unique_ptr<PqResultArrayReader> MotherduckStatement::MakeResultReader(
     std::string query) {
   return std::make_unique<MotherduckResultReader>(conn, std::move(type_resolver),
                                                   std::move(query));
+}
+
+// MotherDuck refuses to prepare a query whose parameter types it can't infer.
+// ADBC asks for NOT_IMPLEMENTED when the parameter schema can't be determined.
+AdbcStatusCode MotherduckStatement::GetParameterSchema(struct ArrowSchema* schema,
+                                                       struct AdbcError* error) {
+  const AdbcStatusCode code = PostgresStatement::GetParameterSchema(schema, error);
+  if (code == ADBC_STATUS_INTERNAL && error != nullptr && error->message != nullptr &&
+      std::strstr(error->message, "ambiguous result column types") != nullptr) {
+    return ADBC_STATUS_NOT_IMPLEMENTED;
+  }
+  return code;
 }
 
 // MotherDuck answers DDL with an empty result set instead of a command tag.

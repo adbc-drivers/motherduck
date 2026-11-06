@@ -874,18 +874,7 @@ AdbcStatusCode PostgresStatement::GetParameterSchema(struct ArrowSchema* schema,
   }
 
   PqResultHelper helper(connection_->conn(), query_);
-  Status prepare_status = helper.Prepare();
-  if (!prepare_status.ok()) {
-    // MotherDuck refuses to prepare a query whose parameter types it can't infer.
-    // ADBC asks for NOT_IMPLEMENTED when the schema can't be determined.
-    if (prepare_status.message().find("ambiguous result column types") !=
-        std::string::npos) {
-      InternalAdbcSetError(error, "[libpq] Cannot determine parameter types: %s",
-                           prepare_status.message().c_str());
-      return ADBC_STATUS_NOT_IMPLEMENTED;
-    }
-    return prepare_status.ToAdbc(error);
-  }
+  RAISE_STATUS(error, helper.Prepare());
   RAISE_STATUS(error, helper.DescribePrepared());
   PostgresType param_types;
   RAISE_STATUS(error,
