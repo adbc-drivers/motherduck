@@ -1619,10 +1619,6 @@ class PostgresStatementTest : public ::testing::Test,
   void TestSqlPrepareErrorParamCountMismatch() { GTEST_SKIP() << "Not yet implemented"; }
 
   void TestSqlPrepareSelectParams() { GTEST_SKIP() << "Not yet implemented"; }
-  void TestSqlPrepareGetParameterSchema() {
-    GTEST_SKIP()
-        << "MotherDuck rejects preparing SELECT $1, $2: ambiguous parameter types";
-  }
   void TestSqlIngestColumnEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
   void TestSqlIngestTableEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
 
