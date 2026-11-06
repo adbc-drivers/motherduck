@@ -167,9 +167,23 @@ std::optional<Cut> FindCut(std::string_view t) {
       create_or_alter_seen = true;
     } else if (create_or_alter_seen && EqualsNoCase(word, "SECRET")) {
       // CREATE [OR REPLACE] [PERSISTENT|TEMPORARY] SECRET name (options)
+      // Keep the header up to '(' only if it is just a name and IN <storage>. Anything
+      // else there (a string, a comment, ';') means the options aren't where we expect
+      // them.
       const size_t paren = t.find('(', i);
-      if (paren == std::string_view::npos) return Cut{i, " ..."};
-      return Cut{paren + 1, "...)"};
+      if (paren != std::string_view::npos) {
+        bool header_only = true;
+        for (size_t j = i; j < paren; j++) {
+          const char c = t[j];
+          if (!IsIdentChar(c) && c != '"' &&
+              !std::isspace(static_cast<unsigned char>(c))) {
+            header_only = false;
+            break;
+          }
+        }
+        if (header_only) return Cut{paren + 1, "...)"};
+      }
+      return Cut{i, " ..."};
     }
     if (IsCredentialName(word)) {
       if (auto cut = ValueAfterName(t, word, i)) return cut;

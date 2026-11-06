@@ -51,6 +51,9 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
   const char* kQueries[] = {
       "CREATE /* see (note) */ SECRET s (TYPE s3, SECRET 'ZZ9')",
       "CREATE -- (c)\n SECRET s (SECRET 'ZZ9')",
+      "CREATE SECRET s SECRET 'ZZ9' -- (forgot parens)",
+      "CREATE SECRET s SECRET 'ZZ9' FROM read_parquet('s3://b')",
+      "CREATE SECRET s -- (note)\n (SECRET 'ZZ9')",
       "CREATE OR REPLACE TEMPORARY SECRET IF NOT EXISTS s IN motherduck (SECRET 'ZZ9')",
       "SELECT 1; CREATE SECRET s (SECRET 'ZZ9')",
       "SELECT $foo bar$ CREATE SECRET s (SECRET 'ZZ9')",
