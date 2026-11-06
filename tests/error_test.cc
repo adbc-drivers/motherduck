@@ -20,11 +20,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <string>
+
 #include <gtest/gtest.h>
 
 #include "error.h"
 
 namespace adbcpq {
+
+TEST(PostgresErrorTest, RedactQueryTruncates) {
+  EXPECT_EQ(RedactQuery("SELECT 1"), "SELECT 1");
+  const std::string long_query = "SELECT '" + std::string(kMaxQueryBytes, 'a') + "'";
+  const std::string out = RedactQuery(long_query);
+  EXPECT_EQ(out, long_query.substr(0, kMaxQueryBytes) + "... [truncated]");
+  // Server text gets a larger cap.
+  EXPECT_EQ(RedactMessage(long_query), long_query);
+}
+
+TEST(PostgresErrorTest, RedactQueryKeepsUtf8Intact) {
+  // U+00E9 is two bytes; put its lead byte last in the kept prefix.
+  std::string query(kMaxQueryBytes - 1, 'a');
+  query += "\xC3\xA9 tail";
+  const std::string out = RedactQuery(query);
+  EXPECT_EQ(out, std::string(kMaxQueryBytes - 1, 'a') + "... [truncated]");
+}
+
+TEST(PostgresErrorTest, RedactorSeesOnlyThePrefix) {
+  SetQueryRedactor([](std::string_view text) { return std::to_string(text.size()); });
+  const std::string long_query(kMaxQueryBytes + 500, 'x');
+  EXPECT_EQ(RedactQuery(long_query), std::to_string(kMaxQueryBytes) + "... [truncated]");
+  SetQueryRedactor(nullptr);
+}
 
 TEST(PostgresErrorTest, ClassifySqlState) {
   struct Case {

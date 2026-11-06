@@ -220,6 +220,17 @@ size_t MatchCredentialSetting(const std::string& sql, const std::vector<Token>& 
   return IsPunct(sql, tokens, j, '=') || IsWord(sql, tokens, j, "TO") ? j : 0;
 }
 
+// PASSWORD|PASSWD|SECRET|TOKEN followed by a single-quoted string, with no '='.
+bool IsCredentialKeyword(const std::string& sql, const std::vector<Token>& tokens,
+                         size_t i) {
+  if (!(IsWord(sql, tokens, i, "PASSWORD") || IsWord(sql, tokens, i, "PASSWD") ||
+        IsWord(sql, tokens, i, "SECRET") || IsWord(sql, tokens, i, "TOKEN"))) {
+    return false;
+  }
+  return i + 1 < tokens.size() && tokens[i + 1].kind == TokenKind::kString &&
+         !tokens[i + 1].dollar_quoted && sql[tokens[i + 1].begin] == '\'';
+}
+
 bool IsNameChar(char c) {
   return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.';
 }
@@ -245,9 +256,20 @@ std::string ScrubParameters(const std::string& text) {
       size_t j = eq + 1;
       while (j < n && (text[j] == ' ' || text[j] == '\t')) out += text[j++];
       if (j < n && (text[j] == '\'' || text[j] == '"')) {
-        // A quoted value runs through its matching quote.
+        // A quoted value runs through its matching quote. Inside a string literal the
+        // quotes are doubled (token=''x''), so a doubled opener needs a doubled closer.
         const char quote = text[j++];
+        const bool doubled = j < n && text[j] == quote;
+        if (doubled) j++;
         while (j < n) {
+          if (doubled) {
+            if (text.compare(j, 2, std::string(2, quote)) == 0) {
+              j += 2;
+              break;
+            }
+            j++;
+            continue;
+          }
           if (text[j] == '\\') {
             j = std::min(j + 2, n);
           } else if (text[j] == quote) {
@@ -342,6 +364,10 @@ std::string Redact(const std::string& text, int depth) {
       }
     } else if (const size_t op = MatchCredentialSetting(text, significant, i)) {
       cut = significant[op].end;
+      suffix = " ...";
+    } else if (IsCredentialKeyword(text, significant, i)) {
+      // Option lists such as (TYPE postgres, PASSWORD 'x').
+      cut = significant[i].end;
       suffix = " ...";
     }
   }

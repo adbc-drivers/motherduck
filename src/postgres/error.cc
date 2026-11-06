@@ -38,11 +38,36 @@ std::atomic<QueryRedactor> query_redactor{nullptr};
 
 void SetQueryRedactor(QueryRedactor redactor) { query_redactor.store(redactor); }
 
-std::string RedactQuery(std::string_view query) {
-  if (QueryRedactor redactor = query_redactor.load()) {
-    return redactor(query);
+namespace {
+
+// Cut text to at most max_bytes, redact the prefix, and mark the cut.
+std::string TruncateAndRedact(std::string_view text, size_t max_bytes) {
+  bool truncated = false;
+  if (text.size() > max_bytes) {
+    size_t cut = max_bytes;
+    // Don't split a UTF-8 sequence.
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) cut--;
+    text = text.substr(0, cut);
+    truncated = true;
   }
-  return std::string(query);
+  std::string out;
+  if (QueryRedactor redactor = query_redactor.load()) {
+    out = redactor(text);
+  } else {
+    out = std::string(text);
+  }
+  if (truncated) out += "... [truncated]";
+  return out;
+}
+
+}  // namespace
+
+std::string RedactQuery(std::string_view query) {
+  return TruncateAndRedact(query, kMaxQueryBytes);
+}
+
+std::string RedactMessage(std::string_view message) {
+  return TruncateAndRedact(message, kMaxMessageBytes);
 }
 
 AdbcStatusCode ClassifySqlState(const char* sqlstate) {

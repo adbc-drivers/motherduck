@@ -146,6 +146,17 @@ TEST(MotherDuckRedactTest, QuotedAndDottedSettingNames) {
   EXPECT_EQ(RedactSecretStatements("SET memory.threads = 4"), "SET memory.threads = 4");
 }
 
+TEST(MotherDuckRedactTest, KeywordFollowedByString) {
+  EXPECT_EQ(
+      RedactSecretStatements("ATTACH 'host=h' AS p (TYPE postgres, PASSWORD 'abc')"),
+      "ATTACH 'host=h' AS p (TYPE postgres, PASSWORD ...");
+}
+
+TEST(MotherDuckRedactTest, DoubledQuotedValueInsideLiteral) {
+  EXPECT_EQ(RedactSecretStatements("ATTACH 'md:db?motherduck_token=''abc'''"),
+            "ATTACH 'md:db?motherduck_token=...'");
+}
+
 TEST(MotherDuckRedactTest, ConnectionStringTokens) {
   EXPECT_EQ(RedactSecretStatements("ATTACH 'md:db?motherduck_token=abc.def&x=1'"),
             "ATTACH 'md:db?motherduck_token=...&x=1'");

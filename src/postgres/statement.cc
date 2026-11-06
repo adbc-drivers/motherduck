@@ -91,7 +91,7 @@ int TupleReader::GetCopyData() {
   int get_copy_res = PQgetCopyData(conn_, &pgbuf_, /*async=*/0);
   if (get_copy_res == -2) {
     InternalAdbcSetError(&error_, "[libpq] PQgetCopyData() failed: %s",
-                         RedactQuery(PQerrorMessage(conn_)).c_str());
+                         RedactMessage(PQerrorMessage(conn_)).c_str());
     status_ = ADBC_STATUS_IO;
     return InternalAdbcStatusCodeToErrno(status_);
   }

@@ -66,14 +66,30 @@ static const std::vector<DetailField> kDetailFields = {
 AdbcStatusCode ClassifySqlState(const char* sqlstate);
 
 /// \brief Hook that masks sensitive text in SQL before it goes into an error message.
+///
+/// The hook is only ever called with a bounded prefix of the text (see
+/// kMaxQueryBytes and kMaxMessageBytes), so it may use algorithms that are not safe on
+/// arbitrarily large input.
 using QueryRedactor = std::string (*)(std::string_view query);
+
+/// Longest SQL text kept in an error message. Longer queries are cut before redaction,
+/// so nothing past the cut is ever seen, let alone logged.
+constexpr size_t kMaxQueryBytes = 2048;
+/// Longest server-authored text (messages and diagnostic fields) kept in an error.
+constexpr size_t kMaxMessageBytes = 8192;
 
 /// \brief Install the redactor used by RedactQuery. Passing nullptr restores the default,
 /// which returns the query unchanged. Call once at driver initialization.
 void SetQueryRedactor(QueryRedactor redactor);
 
-/// \brief Apply the installed redactor to SQL text destined for an error message.
+/// \brief Truncate SQL text to kMaxQueryBytes, then apply the installed redactor.
+///
+/// Truncation comes first, so the redactor sees every statement header in the kept
+/// prefix and nothing else.
 std::string RedactQuery(std::string_view query);
+
+/// \brief As RedactQuery, for text the server wrote (kMaxMessageBytes).
+std::string RedactMessage(std::string_view message);
 
 /// \brief The server's error text without the echoed statement.
 ///
@@ -90,9 +106,9 @@ inline std::string PqErrorText(PGresult* result, PGconn* conn) {
     std::string out(text);
     PQfreemem(text);
     // The server's own message can quote the statement as well.
-    return RedactQuery(out);
+    return RedactMessage(out);
   }
-  return conn != nullptr ? RedactQuery(PQerrorMessage(conn)) : "";
+  return conn != nullptr ? RedactMessage(PQerrorMessage(conn)) : "";
 }
 
 template <typename... Args>
@@ -119,7 +135,7 @@ Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
   for (const auto& field : kDetailFields) {
     const char* value = PQresultErrorField(result, field.code);
     if (value) {
-      status.AddDetail(field.key, RedactQuery(value));
+      status.AddDetail(field.key, RedactMessage(value));
     }
   }
 
