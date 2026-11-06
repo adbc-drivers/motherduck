@@ -1619,6 +1619,10 @@ class PostgresStatementTest : public ::testing::Test,
   void TestSqlPrepareErrorParamCountMismatch() { GTEST_SKIP() << "Not yet implemented"; }
 
   void TestSqlPrepareSelectParams() { GTEST_SKIP() << "Not yet implemented"; }
+  void TestSqlPrepareGetParameterSchema() {
+    GTEST_SKIP()
+        << "MotherDuck rejects preparing SELECT $1, $2: ambiguous parameter types";
+  }
   void TestSqlIngestColumnEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
   void TestSqlIngestTableEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
 
@@ -2692,7 +2696,7 @@ TEST_F(PostgresStatementTest, ExecuteSchemaParameterizedQuery) {
   nanoarrow::EmptyArrayStream(schema_bind.get()).ToArrayStream(bind.get());
 
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT CAST($1 AS VARCHAR)", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementBindStream(&statement, bind.get(), &error), IsOkStatus());
 
@@ -2783,7 +2787,7 @@ TEST_F(PostgresStatementTest, ExecuteParameterizedQueryWithResult) {
               adbc_validation::IsOkErrno());
 
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT CAST($1 AS INTEGER)", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), schema_bind.get(), &error),
               IsOkStatus());
