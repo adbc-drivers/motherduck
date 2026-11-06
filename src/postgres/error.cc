@@ -22,6 +22,8 @@
 
 #include "error.h"
 
+#include <atomic>
+#include <string>
 #include <string_view>
 
 #include <libpq-fe.h>
@@ -29,6 +31,19 @@
 #include "driver/common/utils.h"
 
 namespace adbcpq {
+
+namespace {
+std::atomic<QueryRedactor> query_redactor{nullptr};
+}  // namespace
+
+void SetQueryRedactor(QueryRedactor redactor) { query_redactor.store(redactor); }
+
+std::string RedactQuery(std::string_view query) {
+  if (QueryRedactor redactor = query_redactor.load()) {
+    return redactor(query);
+  }
+  return std::string(query);
+}
 
 AdbcStatusCode ClassifySqlState(const char* sqlstate) {
   if (!sqlstate) {

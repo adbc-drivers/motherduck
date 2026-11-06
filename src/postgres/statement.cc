@@ -468,7 +468,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
       if (!IsCommandOk(result)) {
         AdbcStatusCode code =
             MakeStatus(result, "[libpq] Failed to drop table: {}\nQuery was: {}",
-                       PQerrorMessage(conn), drop)
+                       PQerrorMessage(conn), RedactQuery(drop))
                 .ToAdbc(error);
         PQclear(result);
         return code;
@@ -531,7 +531,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
   if (!IsCommandOk(result)) {
     AdbcStatusCode code =
         MakeStatus(result, "[libpq] Failed to create table: {}\nQuery was: {}",
-                   PQerrorMessage(conn), create)
+                   PQerrorMessage(conn), RedactQuery(create))
             .ToAdbc(error);
     PQclear(result);
     return code;
@@ -784,7 +784,7 @@ AdbcStatusCode PostgresStatement::ExecuteIngest(struct ArrowArrayStream* stream,
   if (PQresultStatus(result) != PGRES_COPY_IN) {
     AdbcStatusCode code =
         MakeStatus(result, "[libpq] COPY query failed: {}\nQuery was: {}",
-                   PQerrorMessage(connection_->conn()), query)
+                   PQerrorMessage(connection_->conn()), RedactQuery(query))
             .ToAdbc(error);
     PQclear(result);
     return code;

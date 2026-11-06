@@ -324,7 +324,7 @@ void KeepPipelineResult(PqResultHelper* helper, PGresult* result,
       if (status->ok()) {
         helper->SetResult(result);
         *status = MakeStatus(result, "[libpq] Failed to execute query '{}': {}",
-                             statement, PQresultErrorMessage(result));
+                             RedactQuery(statement), PQresultErrorMessage(result));
       } else {
         PQclear(result);
       }
@@ -348,7 +348,7 @@ Status ExecuteBatch(PGconn* conn, const std::vector<std::string>& statements,
                               /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                               static_cast<int>(PqResultHelper::Format::kText)) != 1) {
           return MakeStatus(nullptr, "[libpq] Failed to send query '{}': {}",
-                            statements[next], PQerrorMessage(conn));
+                            RedactQuery(statements[next]), PQerrorMessage(conn));
         }
         next++;
         return Status::Ok();

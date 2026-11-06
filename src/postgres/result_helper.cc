@@ -45,7 +45,7 @@ Status PqResultHelper::PrepareInternal(int n_params, const Oid* param_oids) cons
       PQprepare(conn_, /*stmtName=*/"", query_.c_str(), n_params, param_oids);
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
     auto status = MakeStatus(result, "Failed to prepare query: {}\nQuery was: {}",
-                             PQerrorMessage(conn_), query_.c_str());
+                             PQerrorMessage(conn_), RedactQuery(query_));
     PQclear(result);
     return status;
   }
@@ -66,7 +66,7 @@ Status PqResultHelper::DescribePrepared() {
   if (PQresultStatus(result_) != PGRES_COMMAND_OK) {
     Status status = MakeStatus(
         result_, "[libpq] Failed to describe prepared statement: {}\nQuery was: {}",
-        PQerrorMessage(conn_), query_.c_str());
+        PQerrorMessage(conn_), RedactQuery(query_));
     ClearResult();
     return status;
   }
@@ -108,7 +108,7 @@ Status PqResultHelper::Execute(const std::vector<std::string>& params,
 
   ExecStatusType status = PQresultStatus(result_);
   if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
-    return MakeStatus(result_, "[libpq] Failed to execute query '{}': {}", query_.c_str(),
+    return MakeStatus(result_, "[libpq] Failed to execute query '{}': {}", RedactQuery(query_),
                       PQerrorMessage(conn_));
   }
 
@@ -132,7 +132,7 @@ Status PqResultHelper::ExecuteCopy() {
     Status status = MakeStatus(
         result_,
         "[libpq] Failed to execute query: could not begin COPY: {}\nQuery was: {}",
-        PQerrorMessage(conn_), copy_query.c_str());
+        PQerrorMessage(conn_), RedactQuery(copy_query));
     ClearResult();
     return status;
   }

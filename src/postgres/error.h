@@ -26,6 +26,7 @@
 
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <arrow-adbc/adbc.h>
@@ -64,6 +65,16 @@ static const std::vector<DetailField> kDetailFields = {
 
 AdbcStatusCode ClassifySqlState(const char* sqlstate);
 
+/// \brief Hook that masks sensitive text in SQL before it goes into an error message.
+using QueryRedactor = std::string (*)(std::string_view query);
+
+/// \brief Install the redactor used by RedactQuery. Passing nullptr restores the default,
+/// which returns the query unchanged. Call once at driver initialization.
+void SetQueryRedactor(QueryRedactor redactor);
+
+/// \brief Apply the installed redactor to SQL text destined for an error message.
+std::string RedactQuery(std::string_view query);
+
 template <typename... Args>
 Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
   auto message = ::fmt::vformat(format_string, ::fmt::make_format_args(args...));
@@ -88,7 +99,11 @@ Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
   for (const auto& field : kDetailFields) {
     const char* value = PQresultErrorField(result, field.code);
     if (value) {
-      status.AddDetail(field.key, value);
+      if (field.code == PG_DIAG_INTERNAL_QUERY) {
+        status.AddDetail(field.key, RedactQuery(value));
+      } else {
+        status.AddDetail(field.key, value);
+      }
     }
   }
 
