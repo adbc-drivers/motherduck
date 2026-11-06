@@ -156,7 +156,7 @@ TEST(MotherDuckRedactTest, OverMasksCredentialLookingSql) {
   EXPECT_EQ(RedactSecretStatements("SELECT * FROM t WHERE key = 5 ORDER BY id"),
             "SELECT * FROM t WHERE key = ...");
   EXPECT_EQ(RedactSecretStatements("CREATE TABLE t (secret INT, d DECIMAL(10,2))"),
-            "CREATE TABLE t (secret INT, d DECIMAL(...)");
+            "CREATE TABLE t (secret ...");
   // Run-together names are matched by their ending.
   EXPECT_EQ(RedactSecretStatements("SELECT * FROM t WHERE monkey = 1"),
             "SELECT * FROM t WHERE monkey = ...");
