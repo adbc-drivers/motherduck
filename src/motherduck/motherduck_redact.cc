@@ -78,16 +78,18 @@ bool IsCredentialName(std::string_view name) {
   return false;
 }
 
+// An unclosed comment doesn't hide the rest of the text: skip only its opener, so what
+// follows is still scanned as if the comment weren't there.
 size_t SkipSpaceAndComments(std::string_view t, size_t i) {
   while (i < t.size()) {
     if (std::isspace(static_cast<unsigned char>(t[i]))) {
       i++;
     } else if (t.compare(i, 2, "/*") == 0) {
       const size_t end = t.find("*/", i + 2);
-      i = end == std::string_view::npos ? t.size() : end + 2;
+      i = end == std::string_view::npos ? i + 2 : end + 2;
     } else if (t.compare(i, 2, "--") == 0) {
       const size_t end = t.find('\n', i);
-      i = end == std::string_view::npos ? t.size() : end + 1;
+      i = end == std::string_view::npos ? i + 2 : end + 1;
     } else {
       break;
     }
@@ -95,16 +97,23 @@ size_t SkipSpaceAndComments(std::string_view t, size_t i) {
   return i;
 }
 
-// After a credential name at t[0, i): is a value about to follow (name = v, name TO v,
-// name: v, name 'v')? A quoted name may have its closing quote first.
-std::optional<Cut> ValueAfterName(std::string_view t, std::string_view name, size_t i) {
-  if (i < t.size() && (t[i] == '\'' || t[i] == '"')) i++;
+bool IsQuote(char c) { return c == '\'' || c == '"'; }
+
+// After a credential name t[start, i): is a value about to follow (name = v, name TO v,
+// name: v, name 'v', name"v")? A quoted name ("token") has its closing quote right after
+// it; any other quote glued to the name is already the value.
+std::optional<Cut> ValueAfterName(std::string_view t, size_t start, size_t i) {
+  const std::string_view name = t.substr(start, i - start);
+  if (i < t.size() && IsQuote(t[i])) {
+    if (start == 0 || t[start - 1] != t[i]) return Cut{i, "..."};
+    i++;
+  }
   const size_t k = SkipSpaceAndComments(t, i);
   if (k >= t.size()) return std::nullopt;
   const char c = t[k];
   if (c == '=') return Cut{k + 1, " ..."};
   if (c == ':' && !(k + 1 < t.size() && t[k + 1] == ':')) return Cut{k + 1, " ..."};
-  if (c == '\'') return Cut{k, "..."};
+  if (IsQuote(c)) return Cut{k, "..."};
   // add_parquet_key('name', 'key'). Not for a bare KEY, as in PRIMARY KEY (id).
   if (c == '(' && !EqualsNoCase(name, "KEY")) return Cut{k + 1, "...)"};
   if ((c == 't' || c == 'T') && k + 1 < t.size() &&
@@ -129,10 +138,10 @@ std::optional<Cut> UserinfoPassword(std::string_view t, size_t i) {
   return std::nullopt;
 }
 
-// md:<token>@database (also motherduck:<token>@database): cut after the scheme. i is the
-// index of the ':'.
+// md:<token>@database (also motherduck:<token>@database, with optional space after the
+// colon): cut after the scheme. i is the index of the ':'.
 std::optional<Cut> TokenBeforeAt(std::string_view t, size_t i) {
-  for (size_t j = i + 1; j < t.size(); j++) {
+  for (size_t j = SkipSpaceAndComments(t, i + 1); j < t.size(); j++) {
     if (std::string_view("/?'\" \t\r\n;").find(t[j]) != std::string_view::npos) break;
     if (t[j] == '@') return Cut{i + 1, "..."};
   }
@@ -225,7 +234,7 @@ std::optional<Cut> FindCut(std::string_view t) {
       if (auto cut = KeyDetail(t, i)) return cut;
     }
     if (IsCredentialName(word)) {
-      if (auto cut = ValueAfterName(t, word, i)) return cut;
+      if (auto cut = ValueAfterName(t, start, i)) return cut;
     }
   }
   return std::nullopt;

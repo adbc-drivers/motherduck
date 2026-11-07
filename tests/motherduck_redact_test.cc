@@ -97,6 +97,15 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
       "SET azure_storage_connection_string = 'AccountName=a;AccountKey=ZZ9'",
       "SET VARIABLE pw = 'ZZ9'",
       "CREATE USER u WITH PASSWORD 'ZZ9'",
+      // A string glued to the keyword, or double-quoted, is still the value.
+      "CREATE USER u WITH PASSWORD'ZZ9'",
+      "CREATE USER u WITH PASSWORD \"ZZ9\"",
+      "CREATE USER u WITH PASSWORD\"ZZ9\"",
+      "SET \"s3_secret_access_key\" = 'ZZ9'",
+      // An unclosed comment doesn't hide what follows it.
+      "SET s3_secret_access_key /* = 'ZZ9'",
+      "SET s3_secret_access_key -- = 'ZZ9'",
+      "CALL md_create_flight(source_code /* := 'ZZ9'",
       // Credentials in URLs.
       "SELECT * FROM read_parquet('https://a.blob.core.windows.net/f?sv=1&sig=ZZ9')",
       "SELECT * FROM read_parquet('https://b.s3.amazonaws.com/f?X-Amz-Signature=ZZ9')",
@@ -106,6 +115,8 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
       // MotherDuck connection strings.
       "ATTACH 'md:ZZ9@mydb'",
       "ATTACH 'md:ZZ9@mydb;attach_mode=single'",
+      "ATTACH 'md: ZZ9@mydb'",
+      "ATTACH 'md:/* c */ZZ9@mydb'",
       "ATTACH 'motherduck:ZZ9@mydb'",
       "ATTACH 'md:mydb?slt=ZZ9'",
       "SET motherduck_slt = 'ZZ9'",
@@ -148,6 +159,8 @@ TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
       "DROP SECRET s",
       "CREATE TABLE secrets (id INT)",
       "SELECT 'token' AS kind FROM t",
+      "SELECT \"password\", \"api_key\" FROM t",
+      "SELECT * FROM t WHERE kind = 'password' AND x = 'y'",
       "SELECT count(*) FROM t GROUP BY key ORDER BY key",
       "SELECT a, b FROM t WHERE monkey > 1 AND tokenizer IS NULL",
       "SET threads = 4",
