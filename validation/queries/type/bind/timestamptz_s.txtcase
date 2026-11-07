@@ -22,8 +22,19 @@
 
 // part: metadata
 
+# MotherDuck's TIMESTAMPTZ takes no precision parameter ("Type 'TIMESTAMP
+# WITH TIME ZONE' does not take any type parameters"), so the table uses
+# plain TIMESTAMPTZ.
 [tags]
 sql-type-name = "timestamptz"
+
+// part: setup_query
+
+CREATE TABLE test_timestamptz (
+    idx INT,
+    res TIMESTAMPTZ,
+    res2 TIMESTAMPTZ
+);
 
 // part: expected_schema
 
