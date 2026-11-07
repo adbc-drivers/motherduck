@@ -73,10 +73,10 @@ uri_for() {
     "$host" "${1//:/%3A}" "$ca_bundle"
 }
 
-# PGPASSWORD rather than the URI keeps the token out of test output.
+# The driver reads the token from MOTHERDUCK_TOKEN, which keeps it out of the
+# URI and test output.
 {
   printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$(uri_for "$database")"
-  printf 'PGPASSWORD=%q\n' "$MOTHERDUCK_TOKEN"
   printf 'MOTHERDUCK_TEST_CATALOG=%q\n' "$database"
   if [[ "$manage_database" == true ]]; then
     # The tests create and drop the database through this connection.

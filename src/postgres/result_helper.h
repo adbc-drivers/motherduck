@@ -25,11 +25,9 @@
 #include <cassert>
 #include <charconv>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -154,11 +152,6 @@ class PqResultHelper {
   // Replace result_ with the next chunk. A finished query leaves no result.
   Status NextPacket();
   bool streaming() const { return streaming_; }
-  // Like Execute, but run a query of several statements as separate commands
-  // in one pipeline. The endpoint binds every statement of a multi-statement
-  // simple query before running any of them, so later statements can't see
-  // objects created by earlier ones.
-  Status ExecuteScript();
   Status ExecuteCopy();
   Status ResolveParamTypes(PostgresTypeResolver& type_resolver,
                            PostgresType* param_types);
@@ -237,48 +230,6 @@ class PqResultHelper {
   // Cancel an open row stream and discard whatever is left, so releasing the
   // reader early leaves the connection usable.
   void AbandonStream();
-  // Run statements in one pipeline, with at most max_in_flight unanswered.
-  Status ExecuteBatch(const std::vector<std::string>& statements, size_t max_in_flight);
-  // Keep a statement's result if it's the last so far or the first error.
-  void KeepPipelineResult(PGresult* result, const std::string& statement, Status* status);
 };
-
-// Split a query on the semicolons between its statements, skipping those inside
-// string literals, quoted identifiers, dollar quotes and comments. Statements
-// with nothing but whitespace or comments are dropped. backslash_escapes says
-// whether backslashes escape quotes in every literal, as they do when
-// standard_conforming_strings is off, rather than only in E'' literals.
-std::vector<std::string> SplitStatements(std::string_view query,
-                                         bool backslash_escapes = false);
-
-// Whether a statement is a COPY, ignoring leading whitespace and comments.
-bool IsCopyStatement(std::string_view statement);
-
-// Whether a statement that isn't a COPY succeeded. MotherDuck answers DDL with
-// an empty result set (a Count or Success column) instead of a command tag, so
-// PGRES_TUPLES_OK counts as success alongside PGRES_COMMAND_OK.
-inline bool IsResultOk(const PGresult* result) {
-  ExecStatusType status = PQresultStatus(result);
-  return status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK;
-}
-
-// Run commands through one libpq pipeline ending in a single sync, sending and
-// reading at the same time so neither side waits on the other. send_next
-// queues the next command (e.g. with PQsendQueryParams) and sets *sent, or
-// leaves it false once there are none left. on_result takes ownership of each
-// result other than the sync, along with the index of its command. At most
-// max_in_flight commands go unanswered at a time.
-//
-// As with a multi-statement query, the commands share one implicit
-// transaction: after a command fails the server skips the rest, so sending
-// stops; if send_next fails, a failing command is sent so the commands
-// already run aren't committed either. Commands' own errors only reach
-// on_result; the returned status covers send_next's errors and failures to
-// send, receive, or run the pipeline. A COPY is ended and reported as not
-// supported; a caller that may run one passes max_in_flight = 1, since ending
-// it lets the server run whatever is queued behind it.
-Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_next,
-                   const std::function<void(size_t, PGresult*)>& on_result,
-                   size_t max_in_flight = SIZE_MAX);
 
 }  // namespace adbcpq

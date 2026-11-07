@@ -36,6 +36,7 @@
 #include "database.h"
 #include "driver/common/utils.h"
 #include "driver/framework/status.h"
+#include "motherduck_factory.h"
 #include "result_reader.h"
 #include "statement.h"
 
@@ -132,7 +133,7 @@ AdbcStatusCode PostgresDatabaseNew(struct AdbcDatabase* database,
     InternalAdbcSetError(error, "%s", "[libpq] database is already initialized");
     return ADBC_STATUS_INVALID_STATE;
   }
-  auto impl = std::make_shared<PostgresDatabase>();
+  auto impl = adbcpq::MakeDatabase();
   database->private_data = new std::shared_ptr<PostgresDatabase>(impl);
   return ADBC_STATUS_OK;
 }
@@ -397,7 +398,7 @@ AdbcStatusCode PostgresConnectionInit(struct AdbcConnection* connection,
 
 AdbcStatusCode PostgresConnectionNew(struct AdbcConnection* connection,
                                      struct AdbcError* error) {
-  auto impl = std::make_shared<PostgresConnection>();
+  auto impl = adbcpq::MakeConnection();
   connection->private_data = new std::shared_ptr<PostgresConnection>(impl);
   return ADBC_STATUS_OK;
 }
@@ -712,7 +713,7 @@ AdbcStatusCode PostgresStatementGetParameterSchema(struct AdbcStatement* stateme
 AdbcStatusCode PostgresStatementNew(struct AdbcConnection* connection,
                                     struct AdbcStatement* statement,
                                     struct AdbcError* error) {
-  auto impl = std::make_shared<PostgresStatement>();
+  auto impl = adbcpq::MakeStatement();
   statement->private_data = new std::shared_ptr<PostgresStatement>(impl);
   return impl->New(connection, error);
 }

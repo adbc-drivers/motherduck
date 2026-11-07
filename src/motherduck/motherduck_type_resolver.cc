@@ -1,33 +1,25 @@
 // Copyright (c) 2026 ADBC Drivers Contributors
 //
-// This file has been modified from its original version, which is
-// under the Apache License:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-#include "type_resolver_init.h"
+#include "motherduck_type_resolver.h"
 
 #include <array>
 #include <memory>
 #include <string>
 #include <utility>
 
-#include "codegen/pgtype.h"
+#include "type_resolver_init.h"
 
 using adbc::driver::Status;
 
@@ -61,23 +53,21 @@ constexpr std::array<PostgresTypeResolver::Item, 19> kMotherDuckTypeItems = {{
 
 }  // namespace
 
-Status InitializeTypeResolver(PostgresTypeResolver& resolver) {
-  ArrowError na_error = {};
+Status InitializeMotherduckTypeResolver(PostgresTypeResolver& resolver) {
   // PostgreSQL types first, so GetOID() keeps returning the standard OIDs
-  for (const auto& item : kBuiltinTypeItems) {
-    UNWRAP_NANOARROW(na_error, Internal, resolver.Insert(item, &na_error));
-  }
+  UNWRAP_STATUS(InitializeTypeResolver(resolver));
+  ArrowError na_error = {};
   for (const auto& item : kMotherDuckTypeItems) {
     UNWRAP_NANOARROW(na_error, Internal, resolver.Insert(item, &na_error));
   }
   return Status::Ok();
 }
 
-Status SharedTypeResolver(std::shared_ptr<PostgresTypeResolver>* out) {
+Status SharedMotherduckTypeResolver(std::shared_ptr<PostgresTypeResolver>* out) {
   static const auto kShared =
       []() -> std::pair<std::shared_ptr<PostgresTypeResolver>, std::string> {
     auto resolver = std::make_shared<PostgresTypeResolver>();
-    Status status = InitializeTypeResolver(*resolver);
+    Status status = InitializeMotherduckTypeResolver(*resolver);
     if (!status.ok()) return {nullptr, status.message()};
     return {std::move(resolver), ""};
   }();
@@ -89,7 +79,3 @@ Status SharedTypeResolver(std::shared_ptr<PostgresTypeResolver>* out) {
 }
 
 }  // namespace adbcpq
-
-Status InternalAdbcInitializeTypeResolver(adbcpq::PostgresTypeResolver& resolver) {
-  return adbcpq::InitializeTypeResolver(resolver);
-}

@@ -326,6 +326,19 @@ void TupleReader::ReleaseTrampoline(struct ArrowArrayStream* self) {
   self->release = nullptr;
 }
 
+PostgresStatement::~PostgresStatement() = default;
+
+std::unique_ptr<PqResultArrayReader> PostgresStatement::MakeResultReader(
+    PGconn* conn, std::shared_ptr<PostgresTypeResolver> type_resolver,
+    std::string query) {
+  return std::make_unique<PqResultArrayReader>(conn, std::move(type_resolver),
+                                               std::move(query));
+}
+
+bool PostgresStatement::IsCommandOk(PGresult* result) {
+  return PQresultStatus(result) == PGRES_COMMAND_OK;
+}
+
 AdbcStatusCode PostgresStatement::New(struct AdbcConnection* connection,
                                       struct AdbcError* error) {
   if (!connection || !connection->private_data) {
@@ -452,7 +465,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                       /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
                                       /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                                       /*resultFormat=*/1 /*(binary)*/);
-      if (!IsResultOk(result)) {
+      if (!IsCommandOk(result)) {
         AdbcStatusCode code =
             MakeStatus(result, "[libpq] Failed to drop table: {}\nQuery was: {}",
                        PQerrorMessage(conn), drop)
@@ -515,7 +528,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                   /*paramTypes=*/nullptr, /*paramValues=*/nullptr,
                                   /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                                   /*resultFormat=*/1 /*(binary)*/);
-  if (!IsResultOk(result)) {
+  if (!IsCommandOk(result)) {
     AdbcStatusCode code =
         MakeStatus(result, "[libpq] Failed to create table: {}\nQuery was: {}",
                    PQerrorMessage(conn), create)
@@ -581,11 +594,11 @@ AdbcStatusCode PostgresStatement::ResolveCopyTargetTypes(
 AdbcStatusCode PostgresStatement::ExecuteBind(struct ArrowArrayStream* stream,
                                               int64_t* rows_affected,
                                               struct AdbcError* error) {
-  PqResultArrayReader reader(connection_->conn(), type_resolver_, query_);
-  reader.SetAutocommit(connection_->autocommit());
-  reader.SetBind(&bind_);
-  reader.SetVendorName(connection_->VendorName());
-  RAISE_STATUS(error, reader.ToArrayStream(rows_affected, stream));
+  auto reader = MakeResultReader(connection_->conn(), type_resolver_, query_);
+  reader->SetAutocommit(connection_->autocommit());
+  reader->SetBind(&bind_);
+  reader->SetVendorName(connection_->VendorName());
+  RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
   return ADBC_STATUS_OK;
 }
 
@@ -614,10 +627,10 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
   // If we have been requested to avoid COPY or there is no output requested,
   // execute using the PqResultArrayReader.
   if (!stream || !use_copy()) {
-    PqResultArrayReader reader(connection_->conn(), type_resolver_, query_);
-    reader.SetVendorName(connection_->VendorName());
-    reader.SetBatchSizeHint(batch_size_hint_bytes_);
-    RAISE_STATUS(error, reader.ToArrayStream(rows_affected, stream));
+    auto reader = MakeResultReader(connection_->conn(), type_resolver_, query_);
+    reader->SetVendorName(connection_->VendorName());
+    reader->SetBatchSizeHint(batch_size_hint_bytes_);
+    RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
     return ADBC_STATUS_OK;
   }
 
@@ -634,10 +647,10 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
   // If there will be no columns in the result, we can also avoid COPY
   if (root_type.n_children() == 0) {
     // Could/should move the helper into the reader instead of repreparing
-    PqResultArrayReader reader(connection_->conn(), type_resolver_, query_);
-    reader.SetVendorName(connection_->VendorName());
-    reader.SetBatchSizeHint(batch_size_hint_bytes_);
-    RAISE_STATUS(error, reader.ToArrayStream(rows_affected, stream));
+    auto reader = MakeResultReader(connection_->conn(), type_resolver_, query_);
+    reader->SetVendorName(connection_->VendorName());
+    reader->SetBatchSizeHint(batch_size_hint_bytes_);
+    RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
     return ADBC_STATUS_OK;
   }
 
@@ -907,6 +920,11 @@ AdbcStatusCode PostgresStatement::SetSqlQuery(const char* query,
 
 AdbcStatusCode PostgresStatement::SetOption(const char* key, const char* value,
                                             struct AdbcError* error) {
+  // Only the target schema accepts NULL, which clears it.
+  if (value == nullptr && std::strcmp(key, ADBC_INGEST_OPTION_TARGET_DB_SCHEMA) != 0) {
+    InternalAdbcSetError(error, "[libpq] Option %s requires a value", key);
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  }
   if (std::strcmp(key, ADBC_INGEST_OPTION_TARGET_TABLE) == 0) {
     query_.clear();
     ingest_.target = value;

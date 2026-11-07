@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -43,12 +44,13 @@ class PostgresConnection {
         cancel_(nullptr),
         autocommit_(true),
         use_copy_(true) {}
+  virtual ~PostgresConnection() = default;
 
   AdbcStatusCode Cancel(struct AdbcError* error);
   AdbcStatusCode Commit(struct AdbcError* error);
-  AdbcStatusCode GetInfo(struct AdbcConnection* connection, const uint32_t* info_codes,
-                         size_t info_codes_length, struct ArrowArrayStream* out,
-                         struct AdbcError* error);
+  virtual AdbcStatusCode GetInfo(struct AdbcConnection* connection,
+                                 const uint32_t* info_codes, size_t info_codes_length,
+                                 struct ArrowArrayStream* out, struct AdbcError* error);
   AdbcStatusCode GetObjects(struct AdbcConnection* connection, int depth,
                             const char* catalog, const char* db_schema,
                             const char* table_name, const char** table_types,
@@ -87,6 +89,7 @@ class PostgresConnection {
   bool autocommit() const { return autocommit_; }
   bool use_copy() const { return use_copy_; }
   std::string_view VendorName();
+  const std::array<int, 3>& VendorVersion();
 
  private:
   friend class PostgresStatement;
