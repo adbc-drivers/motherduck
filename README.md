@@ -164,9 +164,13 @@ to fail.
   whole result at once, so it ignores `adbc.postgresql.batch_size_hint_bytes`,
   the connection reports idle in a transaction rather than active while you
   read (#11), and a running query can't be cancelled (#48).
-- **Parameterized queries** fail or return wrong results (#17), and
-  `GetParameterSchema` fails on queries whose result types the endpoint
-  can't infer.
+- **Parameter types:** the endpoint can't prepare a query whose result
+  column types depend on its parameters, as in `SELECT $1`, and ignores the
+  parameter types sent with the prepare (ECO-1351). When that happens with
+  parameters bound, the driver prepares the query again with each `$n` cast to
+  its bound type, so such queries work once parameters are bound; without
+  bound parameters, `GetParameterSchema` and `ExecuteSchema` return
+  `NOT_IMPLEMENTED` for them.
 - **Rows affected** is wrong for `DELETE` (#19), and is the row count rather
   than -1 for a `SELECT` on the non-COPY path (#50). `ExecuteQuery` on an
   `INSERT` also returns the endpoint's `Count` row as a batch (#49).
@@ -242,9 +246,10 @@ lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
   `server_version_num`.
 - `motherduck_statement`: `MotherduckStatement`, which accepts the result sets
   MotherDuck returns for DDL, and `MotherduckResultReader`, which runs queries
-  without a result through a pipeline.
-- `motherduck_pipeline`: pipelined execution and splitting multi-statement
-  queries.
+  without a result through a pipeline. Both cast parameters to their bound
+  types when the endpoint can't prepare a query without them.
+- `motherduck_pipeline`: pipelined execution, splitting multi-statement
+  queries, and casting a query's parameters.
 - `motherduck_type_resolver`: DuckDB-only type OIDs.
 - `motherduck_factory`: the subclasses `postgresql.cc` creates.
 - `motherduck.cc`: the `AdbcDriverMotherduckInit` entry point.

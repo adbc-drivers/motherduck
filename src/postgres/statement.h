@@ -33,6 +33,7 @@
 
 #include "copy/reader.h"
 #include "driver/common/utils.h"
+#include "driver/framework/status.h"
 #include "postgres_type.h"
 
 #define ADBC_POSTGRESQL_OPTION_BATCH_SIZE_HINT_BYTES \
@@ -43,6 +44,9 @@
   "adbc.postgresql.disable_decimal_fast_path"
 
 namespace adbcpq {
+
+using adbc::driver::Status;
+
 class PostgresConnection;
 class PostgresStatement;
 class PqResultArrayReader;
@@ -169,6 +173,13 @@ class PostgresStatement {
       std::string query);
   // Whether a DDL command run by CreateBulkTable succeeded
   virtual bool IsCommandOk(PGresult* result);
+  // Prepare query as the unnamed statement with the given parameter types, or
+  // with none to let the server infer them. bind_schema describes the bound
+  // parameters, or is null if none are bound.
+  virtual Status PrepareQuery(PGconn* conn, const std::string& query,
+                              const std::vector<Oid>& param_oids,
+                              const struct ArrowSchema* bind_schema);
+  const PostgresTypeResolver& type_resolver() const { return *type_resolver_; }
 
  private:
   std::shared_ptr<PostgresTypeResolver> type_resolver_;

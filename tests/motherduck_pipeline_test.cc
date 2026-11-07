@@ -83,6 +83,38 @@ TEST(SplitStatementsTest, Unterminated) {
               ElementsAre("SELECT 1", "SELECT /* a; b"));
 }
 
+TEST(CastParametersTest, Casts) {
+  EXPECT_EQ(CastParameters("SELECT $1", {"int4"}), "SELECT CAST($1 AS int4)");
+  EXPECT_EQ(CastParameters("SELECT 1 + $2, $1, $2", {"text", "int8"}),
+            "SELECT 1 + CAST($2 AS int8), CAST($1 AS text), CAST($2 AS int8)");
+  EXPECT_EQ(CastParameters("SELECT $1::int4", {"text ARRAY"}),
+            "SELECT CAST($1 AS text ARRAY)::int4");
+  EXPECT_EQ(CastParameters("SELECT $10", std::vector<std::string>(10, "bool")),
+            "SELECT CAST($10 AS bool)");
+}
+
+TEST(CastParametersTest, LeavesUntyped) {
+  // No type, or a parameter past the bound ones.
+  EXPECT_EQ(CastParameters("SELECT $1, $2, $3", {"", "int4"}),
+            "SELECT $1, CAST($2 AS int4), $3");
+  EXPECT_EQ(CastParameters("SELECT $0, $99999999999999999999999", {"int4"}),
+            "SELECT $0, $99999999999999999999999");
+  EXPECT_EQ(CastParameters("SELECT 1", {"int4"}), "SELECT 1");
+}
+
+TEST(CastParametersTest, SkipsNonParameters) {
+  EXPECT_EQ(CastParameters(R"(SELECT '$1', "$1", E'\'$1', $1)", {"int4"}),
+            R"(SELECT '$1', "$1", E'\'$1', CAST($1 AS int4))");
+  EXPECT_EQ(CastParameters("SELECT $$ $1 $$, $q$ $1 $q$, a$1, $1", {"int4"}),
+            "SELECT $$ $1 $$, $q$ $1 $q$, a$1, CAST($1 AS int4)");
+  EXPECT_EQ(CastParameters("SELECT $1 -- $1\n/* $1 /* $1 */ */", {"int4"}),
+            "SELECT CAST($1 AS int4) -- $1\n/* $1 /* $1 */ */");
+  EXPECT_EQ(CastParameters(R"(SELECT 'a\', $1)", {"int4"}),
+            R"(SELECT 'a\', CAST($1 AS int4))");
+  EXPECT_EQ(CastParameters(R"(SELECT 'a\', $1)", {"int4"}, /*backslash_escapes=*/true),
+            R"(SELECT 'a\', $1)");
+}
+
 TEST(IsCopyStatementTest, Copy) {
   EXPECT_TRUE(IsCopyStatement("COPY t FROM STDIN"));
   EXPECT_TRUE(IsCopyStatement("copy (SELECT 1) TO STDOUT"));

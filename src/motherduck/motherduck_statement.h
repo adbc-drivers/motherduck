@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <libpq-fe.h>
 
@@ -39,6 +40,7 @@ class MotherduckResultReader : public PqResultArrayReader {
 
  protected:
   Status ExecuteAll(int64_t* affected_rows) override;
+  Status PrepareWithParamTypes() override;
 
  private:
   std::string query_;
@@ -50,6 +52,9 @@ class MotherduckStatement : public PostgresStatement {
       PGconn* conn, std::shared_ptr<PostgresTypeResolver> type_resolver,
       std::string query) override;
   bool IsCommandOk(PGresult* result) override;
+  Status PrepareQuery(PGconn* conn, const std::string& query,
+                      const std::vector<Oid>& param_oids,
+                      const struct ArrowSchema* bind_schema) override;
 };
 
 }  // namespace adbcpq

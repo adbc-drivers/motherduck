@@ -365,12 +365,7 @@ Status ExecuteBatch(PGconn* conn, const std::vector<std::string>& statements,
 }  // namespace
 
 Status ExecuteScript(PGconn* conn, const std::string& query, PqResultHelper* helper) {
-  // With standard_conforming_strings off, backslashes escape quotes in every
-  // string literal, not just E'' ones.
-  const char* conforming = PQparameterStatus(conn, "standard_conforming_strings");
-  const bool backslash_escapes =
-      conforming != nullptr && std::strcmp(conforming, "off") == 0;
-  std::vector<std::string> statements = SplitStatements(query, backslash_escapes);
+  std::vector<std::string> statements = SplitStatements(query, BackslashEscapes(conn));
   if (statements.size() <= 1) {
     return helper->Execute();
   }
@@ -461,6 +456,27 @@ std::string_view DollarQuoteTag(std::string_view query, size_t start) {
   return {};
 }
 
+// If a string literal, quoted identifier or dollar quote starts at query[start],
+// return the index just past it; otherwise return start.
+size_t SkipLiteral(std::string_view query, size_t start, bool backslash_escapes) {
+  const char c = query[start];
+  if (c == '\'') {
+    // E'...' strings take backslash escapes.
+    const bool escape_string = start > 0 &&
+                               (query[start - 1] == 'E' || query[start - 1] == 'e') &&
+                               !(start > 1 && IsIdentifierChar(query[start - 2]));
+    return SkipQuoted(query, start, backslash_escapes || escape_string);
+  }
+  if (c == '"') {
+    return SkipQuoted(query, start, /*backslash_escapes=*/false);
+  }
+  if (std::string_view tag = DollarQuoteTag(query, start); !tag.empty()) {
+    size_t close = query.find(tag, start + tag.size());
+    return close == std::string_view::npos ? query.size() : close + tag.size();
+  }
+  return start;
+}
+
 std::string_view TrimWhitespace(std::string_view text) {
   size_t begin = 0;
   size_t end = text.size();
@@ -503,16 +519,8 @@ std::vector<std::string> SplitStatements(std::string_view query, bool backslash_
     }
 
     has_content = true;
-    if (c == '\'') {
-      // E'...' strings take backslash escapes.
-      const bool escape_string = i > 0 && (query[i - 1] == 'E' || query[i - 1] == 'e') &&
-                                 !(i > 1 && IsIdentifierChar(query[i - 2]));
-      i = SkipQuoted(query, i, backslash_escapes || escape_string);
-    } else if (c == '"') {
-      i = SkipQuoted(query, i, /*backslash_escapes=*/false);
-    } else if (std::string_view tag = DollarQuoteTag(query, i); !tag.empty()) {
-      size_t close = query.find(tag, i + tag.size());
-      i = close == std::string_view::npos ? query.size() : close + tag.size();
+    if (const size_t end = SkipLiteral(query, i, backslash_escapes); end != i) {
+      i = end;
     } else {
       i++;
     }
@@ -520,6 +528,49 @@ std::vector<std::string> SplitStatements(std::string_view query, bool backslash_
   finish_statement(query.size());
 
   return statements;
+}
+
+std::string CastParameters(std::string_view query, const std::vector<std::string>& types,
+                           bool backslash_escapes) {
+  std::string out;
+  size_t copied = 0;  // query[copied, i) has yet to be copied to out
+  size_t i = 0;
+  while (i < query.size()) {
+    if (const size_t end = SkipComment(query, i); end != i) {
+      i = end;
+    } else if (const size_t end = SkipLiteral(query, i, backslash_escapes); end != i) {
+      i = end;
+    } else if (query[i] == '$' && !(i > 0 && IsIdentifierChar(query[i - 1])) &&
+               i + 1 < query.size() &&
+               std::isdigit(static_cast<unsigned char>(query[i + 1]))) {
+      size_t end = i + 1;
+      size_t number = 0;
+      while (end < query.size() && std::isdigit(static_cast<unsigned char>(query[end]))) {
+        // Saturate rather than overflow; no query has that many parameters.
+        number = std::min<size_t>(number * 10 + (query[end] - '0'), SIZE_MAX / 10);
+        end++;
+      }
+      if (number >= 1 && number <= types.size() && !types[number - 1].empty()) {
+        out.append(query.substr(copied, i - copied));
+        out += "CAST(";
+        out.append(query.substr(i, end - i));
+        out += " AS ";
+        out += types[number - 1];
+        out += ")";
+        copied = end;
+      }
+      i = end;
+    } else {
+      i++;
+    }
+  }
+  out.append(query.substr(copied));
+  return out;
+}
+
+bool BackslashEscapes(PGconn* conn) {
+  const char* conforming = PQparameterStatus(conn, "standard_conforming_strings");
+  return conforming != nullptr && std::strcmp(conforming, "off") == 0;
 }
 
 bool IsCopyStatement(std::string_view statement) {

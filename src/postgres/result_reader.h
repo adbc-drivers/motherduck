@@ -100,6 +100,8 @@ class PqResultArrayReader {
 
   Status BindNextAndExecute(int64_t* affected_rows);
   virtual Status ExecuteAll(int64_t* affected_rows);
+  // Prepare the query with the bind stream's parameter types
+  virtual Status PrepareWithParamTypes();
 
   void ResetErrors() {
     ArrowErrorInit(&na_error_);

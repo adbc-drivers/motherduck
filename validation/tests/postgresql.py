@@ -80,6 +80,19 @@ class PostgreSQLQuirks(model.DriverQuirks):
     def queries_paths(self) -> tuple[Path, ...]:
         return (Path(__file__).parent.parent / "queries",)
 
+    def query_override(self, context: str, default: str) -> str:
+        # With nothing bound, the endpoint can't infer the type of a parameter
+        # that decides a result column's type, as in SELECT 1 + $1 (ECO-1351),
+        # and the driver reports the parameter schema as not implemented. Ask
+        # about parameters it can type from the rest of the query instead.
+        overrides = {
+            "TestStatement.test_parameter_schema::1": "SELECT 1 WHERE 1 = $1",
+            "TestStatement.test_parameter_schema::2": (
+                "SELECT 1 WHERE 1 = $1 AND 2 = $2"
+            ),
+        }
+        return overrides.get(context, default)
+
     def bind_parameter(self, index: int) -> str:
         """PostgreSQL uses $1, $2, $3, etc. for parameter placeholders."""
         return f"${index}"

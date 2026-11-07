@@ -174,7 +174,7 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
     UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
 
     // Re-prepare with the actual parameter types
-    UNWRAP_STATUS(helper_.Prepare(bind_stream_->param_types));
+    UNWRAP_STATUS(PrepareWithParamTypes());
 
     UNWRAP_STATUS(BindNextAndExecute(nullptr));
 
@@ -224,6 +224,10 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
   }
 
   return Status::Ok();
+}
+
+Status PqResultArrayReader::PrepareWithParamTypes() {
+  return helper_.Prepare(bind_stream_->param_types);
 }
 
 Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
@@ -298,7 +302,7 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
     }
 
     UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
-    UNWRAP_STATUS(helper_.Prepare(bind_stream_->param_types));
+    UNWRAP_STATUS(PrepareWithParamTypes());
 
     // Reset affected rows to zero before binding and executing any
     if (affected_rows) {
