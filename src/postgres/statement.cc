@@ -918,6 +918,11 @@ AdbcStatusCode PostgresStatement::SetSqlQuery(const char* query,
 
 AdbcStatusCode PostgresStatement::SetOption(const char* key, const char* value,
                                             struct AdbcError* error) {
+  // Only the target schema accepts NULL, which clears it.
+  if (value == nullptr && std::strcmp(key, ADBC_INGEST_OPTION_TARGET_DB_SCHEMA) != 0) {
+    InternalAdbcSetError(error, "[libpq] Option %s requires a value", key);
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  }
   if (std::strcmp(key, ADBC_INGEST_OPTION_TARGET_TABLE) == 0) {
     query_.clear();
     ingest_.target = value;
