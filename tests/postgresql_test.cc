@@ -2997,42 +2997,61 @@ TEST_F(PostgresStatementTest, AdbcErrorBackwardsCompatibility) {
   error.release(&error);
 }
 
-TEST_F(PostgresStatementTest, Cancel) {
+TEST_F(PostgresStatementTest, ResultStreamBatchSizeHint) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
-  // One statement per query; MultipleStatementsSingleQuery covers batches.
   for (const char* query :
-       {"DROP TABLE IF EXISTS test_cancel", "CREATE TABLE test_cancel (ints INT)",
-        "INSERT INTO test_cancel (ints) "
-        "SELECT g :: INT FROM GENERATE_SERIES(1, 65536) temp(g)"}) {
+       {"DROP TABLE IF EXISTS test_batch_hint", "CREATE TABLE test_batch_hint (ints INT)",
+        "INSERT INTO test_batch_hint (ints) VALUES (1), (2), (3)"}) {
     ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
                 IsOkStatus(&error));
   }
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT * FROM test_cancel", &error),
+  ASSERT_THAT(AdbcStatementSetOption(&statement, "adbc.postgresql.batch_size_hint_bytes",
+                                     "1", &error),
               IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "SELECT ints FROM test_batch_hint ORDER BY ints", &error),
+              IsOkStatus(&error));
+
   adbc_validation::StreamReader reader;
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                         &reader.rows_affected, &error),
               IsOkStatus(&error));
-
-  ASSERT_THAT(AdbcStatementCancel(&statement, &error), IsOkStatus(&error));
-
-  int retcode = 0;
-  while (true) {
-    retcode = reader.MaybeNext();
-    if (retcode != 0 || !reader.array->release) break;
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  for (int32_t expected = 1; expected <= 3; expected++) {
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_EQ(reader.array->length, 1);
+    ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), expected);
   }
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->release, nullptr);
+}
 
-  ASSERT_EQ(ECANCELED, retcode);
-  AdbcStatusCode status = ADBC_STATUS_OK;
-  const struct AdbcError* detail =
-      AdbcErrorFromArrayStream(&reader.stream.value, &status);
-  ASSERT_NE(nullptr, detail);
-  ASSERT_EQ(ADBC_STATUS_CANCELLED, status);
-  ASSERT_EQ("57014", std::string_view(detail->sqlstate, 5));
-  ASSERT_NE(0, AdbcErrorGetDetailCount(detail));
+TEST_F(PostgresStatementTest, Cancel) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // The endpoint does not send a row until every sleep_ms in the query has
+  // finished, so Cancel has to arrive while ExecuteQuery is still blocked.
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT sleep_ms(5000)", &error),
+              IsOkStatus(&error));
+
+  std::thread canceller([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    struct AdbcError cancel_error = ADBC_ERROR_INIT;
+    AdbcStatementCancel(&statement, &cancel_error);
+    if (cancel_error.release != nullptr) cancel_error.release(&cancel_error);
+  });
+
+  adbc_validation::StreamReader reader;
+  const AdbcStatusCode status =
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, &reader.rows_affected,
+                                &error);
+  canceller.join();
+  ASSERT_THAT(status, IsStatus(ADBC_STATUS_CANCELLED, &error));
+  ASSERT_EQ("57014", std::string_view(error.sqlstate, 5));
+  if (error.release != nullptr) error.release(&error);
 }
 
 TEST_F(PostgresStatementTest, MultipleStatementsSingleQuery) {

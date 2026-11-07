@@ -616,6 +616,7 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
   if (!stream || !use_copy()) {
     PqResultArrayReader reader(connection_->conn(), type_resolver_, query_);
     reader.SetVendorName(connection_->VendorName());
+    reader.SetBatchSizeHint(batch_size_hint_bytes_);
     RAISE_STATUS(error, reader.ToArrayStream(rows_affected, stream));
     return ADBC_STATUS_OK;
   }
@@ -635,6 +636,7 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
     // Could/should move the helper into the reader instead of repreparing
     PqResultArrayReader reader(connection_->conn(), type_resolver_, query_);
     reader.SetVendorName(connection_->VendorName());
+    reader.SetBatchSizeHint(batch_size_hint_bytes_);
     RAISE_STATUS(error, reader.ToArrayStream(rows_affected, stream));
     return ADBC_STATUS_OK;
   }

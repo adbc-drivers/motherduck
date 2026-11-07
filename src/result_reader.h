@@ -66,10 +66,15 @@ class PqResultArrayReader {
   void SetVendorName(std::string_view vendor_name) {
     vendor_name_ = std::string(vendor_name);
   }
+  void SetBatchSizeHint(int64_t batch_size_hint_bytes) {
+    batch_size_hint_bytes_ = batch_size_hint_bytes;
+  }
 
   int GetSchema(struct ArrowSchema* out);
   int GetNext(struct ArrowArray* out);
   const char* GetLastError();
+  static const struct AdbcError* ErrorFromArrayStream(struct ArrowArrayStream* stream,
+                                                      AdbcStatusCode* status);
 
   Status ToArrayStream(int64_t* affected_rows, struct ArrowArrayStream* out);
 
@@ -84,6 +89,10 @@ class PqResultArrayReader {
   nanoarrow::UniqueSchema schema_;
   bool autocommit_;
   std::string vendor_name_;
+  int64_t batch_size_hint_bytes_ = 16777216;
+  int next_row_ = 0;
+  bool streaming_rows_ = false;
+  AdbcStatusCode status_ = ADBC_STATUS_OK;
   struct AdbcError error_;
   struct ArrowError na_error_;
 
@@ -93,13 +102,25 @@ class PqResultArrayReader {
         bind_stream_(std::move(other->bind_stream_)),
         type_resolver_(std::move(other->type_resolver_)),
         field_readers_(std::move(other->field_readers_)),
-        schema_(std::move(other->schema_)) {
+        schema_(std::move(other->schema_)),
+        batch_size_hint_bytes_(other->batch_size_hint_bytes_),
+        next_row_(other->next_row_),
+        streaming_rows_(other->streaming_rows_),
+        status_(other->status_) {
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
   }
 
   Status BindNextAndExecute(int64_t* affected_rows);
   Status ExecuteAll(int64_t* affected_rows);
+  int GetNextStream(struct ArrowArray* out);
+  int Fail(const Status& status);
+
+  static int GetSchemaTrampoline(struct ArrowArrayStream* stream,
+                                 struct ArrowSchema* out);
+  static int GetNextTrampoline(struct ArrowArrayStream* stream, struct ArrowArray* out);
+  static const char* GetLastErrorTrampoline(struct ArrowArrayStream* stream);
+  static void ReleaseTrampoline(struct ArrowArrayStream* stream);
 
   void ResetErrors() {
     ArrowErrorInit(&na_error_);

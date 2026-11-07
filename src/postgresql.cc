@@ -36,6 +36,7 @@
 #include "database.h"
 #include "driver/common/utils.h"
 #include "driver/framework/status.h"
+#include "result_reader.h"
 #include "statement.h"
 
 using adbc::driver::Status;
@@ -65,8 +66,11 @@ using adbcpq::PostgresStatement;
 namespace {
 const struct AdbcError* PostgresErrorFromArrayStream(struct ArrowArrayStream* stream,
                                                      AdbcStatusCode* status) {
-  // Currently only valid for TupleReader
-  return adbcpq::TupleReader::ErrorFromArrayStream(stream, status);
+  if (const struct AdbcError* error =
+          adbcpq::TupleReader::ErrorFromArrayStream(stream, status)) {
+    return error;
+  }
+  return adbcpq::PqResultArrayReader::ErrorFromArrayStream(stream, status);
 }
 
 int PostgresErrorGetDetailCount(const struct AdbcError* error) {

@@ -31,6 +31,7 @@
 #include <utility>
 
 #include "copy/reader.h"
+#include "driver/common/utils.h"
 #include "driver/framework/status.h"
 
 namespace adbcpq {
@@ -51,6 +52,7 @@ int PqResultArrayReader::GetSchema(struct ArrowSchema* out) {
 
 int PqResultArrayReader::GetNext(struct ArrowArray* out) {
   ResetErrors();
+  status_ = ADBC_STATUS_OK;
 
   Status status;
   if (schema_->release == nullptr) {
@@ -60,6 +62,8 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
       return EINVAL;
     }
   }
+
+  if (streaming_rows_) return GetNextStream(out);
 
   // If don't already have a result, populate it by binding the next row
   // in the bind stream. If this is the first call to GetNext(), we have
@@ -192,7 +196,19 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
       *rows_affected = -1;
     }
   } else {
-    UNWRAP_STATUS(helper_.Execute());
+    // shortcut: libpq chunks by row count before the row width is known, so one
+    // chunk can overshoot the byte hint; size the chunk from the first row if a
+    // wide column makes that matter.
+    constexpr int64_t kAssumedBytesPerRow = 64;
+    int64_t chunk_rows = batch_size_hint_bytes_ / kAssumedBytesPerRow;
+    if (chunk_rows < 1) chunk_rows = 1;
+    if (chunk_rows > 8192) chunk_rows = 8192;
+    UNWRAP_STATUS(helper_.BeginRowStream(static_cast<int>(chunk_rows)));
+    UNWRAP_STATUS(helper_.NextPacket());
+    if (!helper_.HasResult()) {
+      return Status::IO("[libpq] Query returned no result");
+    }
+    streaming_rows_ = true;
     if (rows_affected != nullptr) {
       *rows_affected = helper_.AffectedRows();
     }
@@ -226,6 +242,23 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
   return Status::Ok();
 }
 
+namespace {
+
+struct ExportedPqResultArrayReader {
+  PqResultArrayReader* reader;
+};
+
+int64_t RowBytes(PqResultRow row, int columns) {
+  int64_t bytes = 1;
+  for (int column = 0; column < columns; column++) {
+    PqRecord value = row[column];
+    if (!value.is_null) bytes += value.len;
+  }
+  return bytes;
+}
+
+}  // namespace
+
 Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
                                           struct ArrowArrayStream* out) {
   if (out == nullptr) {
@@ -242,8 +275,12 @@ Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
   // errors until this reader class is wired up to provide extended AdbcError information.
   UNWRAP_STATUS(Initialize(affected_rows));
 
-  nanoarrow::ArrayStreamFactory<PqResultArrayReader>::InitArrayStream(
-      new PqResultArrayReader(this), out);
+  auto* exported = new ExportedPqResultArrayReader{new PqResultArrayReader(this)};
+  out->get_schema = &GetSchemaTrampoline;
+  out->get_next = &GetNextTrampoline;
+  out->get_last_error = &GetLastErrorTrampoline;
+  out->release = &ReleaseTrampoline;
+  out->private_data = exported;
 
   return Status::Ok();
 }
@@ -354,6 +391,104 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
   }
 
   return Status::Ok();
+}
+
+int PqResultArrayReader::Fail(const Status& status) {
+  status_ = status.ToAdbc(&error_);
+  return InternalAdbcStatusCodeToErrno(status_);
+}
+
+int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
+  nanoarrow::UniqueArray tmp;
+  bool started = false;
+  int64_t bytes = 0;
+  int64_t nrows = 0;
+  // The current PGresult is cleared once its rows are consumed, so the schema
+  // is what still knows how many columns the batch has.
+  const int columns = static_cast<int>(schema_->n_children);
+
+  while (true) {
+    if (!helper_.HasResult() || next_row_ >= helper_.NumRows()) {
+      Status status = helper_.NextPacket();
+      next_row_ = 0;
+      if (!status.ok()) return Fail(status);
+      if (!helper_.HasResult() || helper_.NumRows() == 0) break;
+    }
+
+    if (!started) {
+      NANOARROW_RETURN_NOT_OK(
+          ArrowArrayInitFromSchema(tmp.get(), schema_.get(), &na_error_));
+      NANOARROW_RETURN_NOT_OK(ArrowArrayStartAppending(tmp.get()));
+      for (int i = 0; i < columns; i++) {
+        NANOARROW_RETURN_NOT_OK(field_readers_[i]->InitArray(tmp->children[i]));
+      }
+      started = true;
+    }
+
+    PqResultRow row = helper_.Row(next_row_);
+    struct ArrowBufferView item;
+    for (int i = 0; i < columns; i++) {
+      PqRecord value = row[i];
+      item.data.data = value.data;
+      item.size_bytes = value.is_null ? -1 : value.len;
+      NANOARROW_RETURN_NOT_OK(field_readers_[i]->Read(
+          &item, static_cast<int32_t>(item.size_bytes), tmp->children[i], &na_error_));
+    }
+    bytes += RowBytes(row, columns);
+    next_row_++;
+    nrows++;
+    if (bytes >= batch_size_hint_bytes_) break;
+  }
+
+  if (nrows == 0) {
+    out->release = nullptr;
+    return NANOARROW_OK;
+  }
+
+  for (int i = 0; i < columns; i++) {
+    NANOARROW_RETURN_NOT_OK(field_readers_[i]->FinishArray(tmp->children[i], &na_error_));
+  }
+  tmp->length = nrows;
+  tmp->null_count = 0;
+  NANOARROW_RETURN_NOT_OK(ArrowArrayFinishBuildingDefault(tmp.get(), &na_error_));
+  ArrowArrayMove(tmp.get(), out);
+  return NANOARROW_OK;
+}
+
+int PqResultArrayReader::GetSchemaTrampoline(struct ArrowArrayStream* stream,
+                                             struct ArrowSchema* out) {
+  auto* exported = static_cast<ExportedPqResultArrayReader*>(stream->private_data);
+  return exported->reader->GetSchema(out);
+}
+
+int PqResultArrayReader::GetNextTrampoline(struct ArrowArrayStream* stream,
+                                           struct ArrowArray* out) {
+  auto* exported = static_cast<ExportedPqResultArrayReader*>(stream->private_data);
+  return exported->reader->GetNext(out);
+}
+
+const char* PqResultArrayReader::GetLastErrorTrampoline(struct ArrowArrayStream* stream) {
+  auto* exported = static_cast<ExportedPqResultArrayReader*>(stream->private_data);
+  return exported->reader->GetLastError();
+}
+
+void PqResultArrayReader::ReleaseTrampoline(struct ArrowArrayStream* stream) {
+  auto* exported = static_cast<ExportedPqResultArrayReader*>(stream->private_data);
+  delete exported->reader;
+  delete exported;
+  stream->private_data = nullptr;
+  stream->release = nullptr;
+}
+
+const struct AdbcError* PqResultArrayReader::ErrorFromArrayStream(
+    struct ArrowArrayStream* stream, AdbcStatusCode* status) {
+  if (stream == nullptr || stream->private_data == nullptr ||
+      stream->release != &ReleaseTrampoline) {
+    return nullptr;
+  }
+  auto* exported = static_cast<ExportedPqResultArrayReader*>(stream->private_data);
+  if (status != nullptr) *status = exported->reader->status_;
+  return &exported->reader->error_;
 }
 
 }  // namespace adbcpq

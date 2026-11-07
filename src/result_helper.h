@@ -134,6 +134,8 @@ class PqResultHelper {
       : PqResultHelper(other.conn_, std::move(other.query_)) {
     result_ = other.result_;
     other.result_ = nullptr;
+    streaming_ = other.streaming_;
+    other.streaming_ = false;
   }
 
   ~PqResultHelper();
@@ -146,6 +148,12 @@ class PqResultHelper {
   Status DescribePrepared();
   Status Execute(const std::vector<std::string>& params = {},
                  PostgresType* param_types = nullptr);
+  // Send the query and have libpq return rows as they arrive, instead of
+  // buffering the whole result the way Execute() does.
+  Status BeginRowStream(int chunk_rows);
+  // Replace result_ with the next chunk. A finished query leaves no result.
+  Status NextPacket();
+  bool streaming() const { return streaming_; }
   // Like Execute, but run a query of several statements as separate commands
   // in one pipeline. The endpoint binds every statement of a multi-statement
   // simple query before running any of them, so later statements can't see
@@ -221,10 +229,14 @@ class PqResultHelper {
   PGresult* result_ = nullptr;
   PGconn* conn_;
   std::string query_;
+  bool streaming_ = false;
   Format param_format_ = Format::kText;
   Format output_format_ = Format::kText;
 
   Status PrepareInternal(int n_params, const Oid* param_oids) const;
+  // Cancel an open row stream and discard whatever is left, so releasing the
+  // reader early leaves the connection usable.
+  void AbandonStream();
   // Run statements in one pipeline, with at most max_in_flight unanswered.
   Status ExecuteBatch(const std::vector<std::string>& statements, size_t max_in_flight);
   // Keep a statement's result if it's the last so far or the first error.

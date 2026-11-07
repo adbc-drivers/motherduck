@@ -46,7 +46,104 @@
 
 namespace adbcpq {
 
-PqResultHelper::~PqResultHelper() { ClearResult(); }
+PqResultHelper::~PqResultHelper() {
+  ClearResult();
+  if (streaming_) AbandonStream();
+}
+
+void PqResultHelper::AbandonStream() {
+  streaming_ = false;
+  char errbuf[256];
+  PGcancel* cancel = PQgetCancel(conn_);
+  if (cancel != nullptr) {
+    (void)PQcancel(cancel, errbuf, sizeof(errbuf));
+    PQfreeCancel(cancel);
+  }
+  PGresult* result;
+  while ((result = PQgetResult(conn_)) != nullptr) {
+    PQclear(result);
+  }
+}
+
+namespace {
+
+bool IsRowPacket(ExecStatusType status) {
+  if (status == PGRES_SINGLE_TUPLE) return true;
+#ifdef LIBPQ_HAS_CHUNK_MODE
+  if (status == PGRES_TUPLES_CHUNK) return true;
+#endif
+  return false;
+}
+
+}  // namespace
+
+Status PqResultHelper::BeginRowStream(int chunk_rows) {
+  ClearResult();
+  if (PQsendQueryParams(conn_, query_.c_str(), /*nParams=*/0, /*paramTypes=*/nullptr,
+                        /*paramValues=*/nullptr, /*paramLengths=*/nullptr,
+                        /*paramFormats=*/nullptr,
+                        static_cast<int>(output_format_)) != 1) {
+    return MakeStatus(nullptr, "[libpq] Failed to send query '{}': {}", query_.c_str(),
+                      PQerrorMessage(conn_));
+  }
+
+  int armed;
+#ifdef LIBPQ_HAS_CHUNK_MODE
+  if (chunk_rows < 1) chunk_rows = 1;
+  armed = PQsetChunkedRowsMode(conn_, chunk_rows);
+#else
+  (void)chunk_rows;
+  armed = PQsetSingleRowMode(conn_);
+#endif
+  if (armed != 1) {
+    streaming_ = true;
+    AbandonStream();
+    return MakeStatus(nullptr, "[libpq] Failed to read query '{}' in batches: {}",
+                      query_.c_str(), PQerrorMessage(conn_));
+  }
+  streaming_ = true;
+  return Status::Ok();
+}
+
+Status PqResultHelper::NextPacket() {
+  if (!streaming_) {
+    ClearResult();
+    return Status::Ok();
+  }
+
+  ClearResult();
+  result_ = PQgetResult(conn_);
+  if (result_ == nullptr) {
+    streaming_ = false;
+    if (PQstatus(conn_) == CONNECTION_BAD) {
+      return Status::IO("[libpq] Failed to read query: ", PQerrorMessage(conn_));
+    }
+    return Status::Ok();
+  }
+
+  const ExecStatusType status = PQresultStatus(result_);
+  if (IsRowPacket(status)) return Status::Ok();
+
+  if (status == PGRES_TUPLES_OK || status == PGRES_COMMAND_OK ||
+      status == PGRES_EMPTY_QUERY) {
+    PGresult* extra;
+    while ((extra = PQgetResult(conn_)) != nullptr) {
+      PQclear(extra);
+    }
+    streaming_ = false;
+    return Status::Ok();
+  }
+
+  Status error = MakeStatus(result_, "[libpq] Failed to execute query '{}': {}",
+                            query_.c_str(), PQresultErrorMessage(result_));
+  ClearResult();
+  PGresult* extra;
+  while ((extra = PQgetResult(conn_)) != nullptr) {
+    PQclear(extra);
+  }
+  streaming_ = false;
+  return error;
+}
 
 Status PqResultHelper::PrepareInternal(int n_params, const Oid* param_oids) const {
   // TODO: make stmtName a unique identifier?
