@@ -29,6 +29,29 @@ TEST(MotherduckDriverTest, InitSupportedVersions) {
   }
 }
 
+// The generic entry point is not declared in adbc.h; driver managers look it up by name.
+extern "C" AdbcStatusCode AdbcDriverInit(int version, void* raw_driver,
+                                         struct AdbcError* error);
+
+// AdbcDriverInit forwards to AdbcDriverMotherduckInit, which also installs the error
+// message redactor. The redactor lives in the shared library, so it can't be observed
+// from here; check that the two entry points hand back the same driver.
+TEST(MotherduckDriverTest, GenericInitMatchesMotherduckInit) {
+  AdbcDriver generic = {};
+  AdbcDriver motherduck = {};
+  ASSERT_EQ(ADBC_STATUS_OK, AdbcDriverInit(ADBC_VERSION_1_1_0, &generic, nullptr));
+  ASSERT_EQ(ADBC_STATUS_OK,
+            AdbcDriverMotherduckInit(ADBC_VERSION_1_1_0, &motherduck, nullptr));
+  EXPECT_EQ(generic.DatabaseNew, motherduck.DatabaseNew);
+  EXPECT_EQ(generic.ConnectionInit, motherduck.ConnectionInit);
+  EXPECT_EQ(generic.StatementExecuteQuery, motherduck.StatementExecuteQuery);
+  for (AdbcDriver* driver : {&generic, &motherduck}) {
+    if (driver->release) {
+      ASSERT_EQ(ADBC_STATUS_OK, driver->release(driver, nullptr));
+    }
+  }
+}
+
 TEST(MotherduckDriverTest, RejectUnsupportedVersion) {
   AdbcDriver driver = {};
   AdbcError error = {};
