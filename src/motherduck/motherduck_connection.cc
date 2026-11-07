@@ -99,8 +99,22 @@ AdbcStatusCode MotherduckConnection::GetTableSchema(const char* catalog,
     InternalAdbcSetError(error, "[motherduck] GetTableSchema requires a table name");
     return ADBC_STATUS_INVALID_ARGUMENT;
   }
-  // A catalog without a schema means that catalog's default schema.
-  if (catalog != nullptr && db_schema == nullptr) db_schema = "main";
+  // A catalog without a schema means the session's schema in the current
+  // database, as an unqualified name does, and main in any other.
+  std::string default_schema;
+  if (catalog != nullptr && db_schema == nullptr) {
+    PqResultHelper helper(
+        conn(),
+        "SELECT CASE WHEN lower(current_database()) = lower($1::VARCHAR) "
+        "THEN current_schema() ELSE 'main' END");
+    RAISE_STATUS(error, helper.Execute({catalog}));
+    if (helper.NumRows() != 1) {
+      InternalAdbcSetError(error, "[motherduck] Failed to look up the default schema");
+      return ADBC_STATUS_INTERNAL;
+    }
+    default_schema = helper.Row(0)[0].data;
+    db_schema = default_schema.c_str();
+  }
 
   std::string name;
   for (const char* part : {catalog, db_schema, table_name}) {

@@ -1011,6 +1011,15 @@ TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
   struct AdbcGetObjectsSchema* schema = InternalAdbcGetObjectsDataGetSchemaByName(
       *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str());
   ASSERT_NE(schema, nullptr) << "schema " << quirks()->db_schema() << " not found";
+
+  // DuckDB marks main internal in every database, so GetObjects filters on the
+  // database. The system schemas live only in the internal system database.
+  for (const char* system_schema : {"pg_catalog", "information_schema"}) {
+    EXPECT_EQ(InternalAdbcGetObjectsDataGetSchemaByName(
+                  *get_objects_data, quirks()->catalog().c_str(), system_schema),
+              nullptr)
+        << "unexpected schema " << system_schema;
+  }
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsSchemaFilterFindsTablesOutsideSearchPath) {
@@ -1552,6 +1561,32 @@ TEST_F(PostgresConnectionTest, MetadataGetTableSchemaCatalog) {
               IsStatus(ADBC_STATUS_NOT_FOUND, &error));
 }
 
+// With a catalog and no schema, GetTableSchema looks in the current schema of
+// the current database, as an unqualified name does.
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaCatalogCurrentSchema) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database,
+                         "CREATE SCHEMA IF NOT EXISTS adbc_current_schema_test; "
+                         "CREATE OR REPLACE TABLE adbc_current_schema_test.only_here "
+                         "(ints INT)",
+                         &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+                              "adbc_current_schema_test", &error),
+      IsOkStatus(&error));
+
+  std::string catalog = quirks()->catalog();
+  for (char& c : catalog) c = static_cast<char>(std::toupper(c));
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, catalog.c_str(), nullptr,
+                                           "only_here", schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(schema->n_children, 1);
+  EXPECT_STREQ(schema->children[0]->name, "ints");
+}
+
 // Every GetObjects filter ignores case, as DuckDB identifiers do, and a
 // column filter keeps the constraints on a matching column.
 TEST_F(PostgresConnectionTest, GetObjectsFiltersIgnoreCase) {
@@ -1595,6 +1630,150 @@ TEST_F(PostgresConnectionTest, GetObjectsFiltersIgnoreCase) {
     const struct ArrowStringView name = table->table_columns[0]->column_name;
     EXPECT_EQ(std::string(name.data, name.size_bytes), test_case.column);
     EXPECT_EQ(table->n_table_constraints, test_case.n_constraints);
+  }
+}
+
+// GetObjects reports UNIQUE and CHECK constraints along with keys.
+TEST_F(PostgresConnectionTest, GetObjectsFindsUniqueAndCheck) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "adbc_unique_check_test", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database,
+                         "CREATE TABLE adbc_unique_check_test (a INT UNIQUE, "
+                         "b INT CHECK (b > 0), c INT, UNIQUE (c, a))",
+                         &error),
+              IsOkStatus(&error));
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr,
+                                       nullptr, "adbc_unique_check_test", nullptr,
+                                       nullptr, &reader.stream.value, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NE(nullptr, reader.array->release);
+
+  auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+  ASSERT_NE(*get_objects_data, nullptr)
+      << "could not initialize the AdbcGetObjectsData object";
+  struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
+      *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+      "adbc_unique_check_test");
+  ASSERT_NE(table, nullptr) << "could not find adbc_unique_check_test table";
+
+  std::vector<std::pair<std::string, std::vector<std::string>>> constraints;
+  for (int i = 0; i < table->n_table_constraints; i++) {
+    const struct AdbcGetObjectsConstraint* constraint = table->table_constraints[i];
+    std::vector<std::string> columns;
+    for (int j = 0; j < constraint->n_column_names; j++) {
+      columns.emplace_back(constraint->constraint_column_names[j].data,
+                           constraint->constraint_column_names[j].size_bytes);
+    }
+    constraints.emplace_back(std::string(constraint->constraint_type.data,
+                                         constraint->constraint_type.size_bytes),
+                             std::move(columns));
+  }
+  using Constraint = std::pair<std::string, std::vector<std::string>>;
+  EXPECT_THAT(constraints,
+              ::testing::UnorderedElementsAre(Constraint{"UNIQUE", {"a"}},
+                                              Constraint{"UNIQUE", {"c", "a"}},
+                                              Constraint{"CHECK", {"b"}}));
+}
+
+// GetObjects lists a view's columns, and GetTableSchema describes a view.
+TEST_F(PostgresConnectionTest, MetadataViewColumns) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropView(&connection, "adbc_view_columns_test", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database,
+                         "CREATE VIEW adbc_view_columns_test AS "
+                         "SELECT 1::INTEGER AS id, 'x'::VARCHAR AS name",
+                         &error),
+              IsOkStatus(&error));
+
+  {
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr,
+                                         nullptr, "adbc_view_columns_test", nullptr,
+                                         nullptr, &reader.stream.value, &error),
+                IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_NE(nullptr, reader.array->release);
+
+    auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+    ASSERT_NE(*get_objects_data, nullptr)
+        << "could not initialize the AdbcGetObjectsData object";
+    struct AdbcGetObjectsTable* view = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_view_columns_test");
+    ASSERT_NE(view, nullptr) << "could not find adbc_view_columns_test view";
+    EXPECT_EQ(std::string(view->table_type.data, view->table_type.size_bytes), "view");
+    ASSERT_EQ(view->n_table_columns, 2);
+    struct AdbcGetObjectsColumn* column = InternalAdbcGetObjectsDataGetColumnByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_view_columns_test", "name");
+    ASSERT_NE(column, nullptr) << "could not find name column on the view";
+    EXPECT_EQ(column->ordinal_position, 2);
+    EXPECT_EQ(std::string(column->xdbc_type_name.data, column->xdbc_type_name.size_bytes),
+              "VARCHAR");
+  }
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(
+      AdbcConnectionGetTableSchema(&connection, nullptr, nullptr,
+                                   "adbc_view_columns_test", schema.get(), &error),
+      IsOkStatus(&error));
+  ASSERT_EQ(schema->n_children, 2);
+  EXPECT_STREQ(schema->children[0]->name, "id");
+  EXPECT_STREQ(schema->children[1]->name, "name");
+}
+
+// GetObjects name filters are search patterns: % matches any run of
+// characters and _ any one character.
+TEST_F(PostgresConnectionTest, GetObjectsFilterPatterns) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "adbc_pattern_test", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database, "CREATE TABLE adbc_pattern_test (ints INT)", &error),
+              IsOkStatus(&error));
+
+  // n_columns is -1 when the table shouldn't be found.
+  struct Case {
+    const char* table_filter;
+    const char* column_filter;
+    int n_columns;
+  };
+  for (const Case& test_case :
+       {Case{"adbc_pattern%", "i%", 1}, Case{"adbc_pattern_tes_", "int_", 1},
+        Case{"adbc_pattern_te_", nullptr, -1}, Case{"adbc_pattern_test", "x%", 0}}) {
+    SCOPED_TRACE(std::string(test_case.table_filter) + " / " +
+                 (test_case.column_filter ? test_case.column_filter : "(none)"));
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr, nullptr,
+                                 test_case.table_filter, nullptr, test_case.column_filter,
+                                 &reader.stream.value, &error),
+        IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_NE(nullptr, reader.array->release);
+
+    auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+    ASSERT_NE(*get_objects_data, nullptr)
+        << "could not initialize the AdbcGetObjectsData object";
+    struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_pattern_test");
+    if (test_case.n_columns < 0) {
+      EXPECT_EQ(table, nullptr);
+    } else {
+      ASSERT_NE(table, nullptr) << "could not find adbc_pattern_test via GetObjects";
+      EXPECT_EQ(table->n_table_columns, test_case.n_columns);
+    }
   }
 }
 
