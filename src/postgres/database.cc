@@ -135,6 +135,10 @@ AdbcStatusCode PostgresDatabase::Release(struct AdbcError* error) {
 
 AdbcStatusCode PostgresDatabase::SetOption(const char* key, const char* value,
                                            struct AdbcError* error) {
+  if (value == nullptr) {
+    InternalAdbcSetError(error, "[libpq] Option %s requires a value", key);
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  }
   if (std::strcmp(key, "uri") == 0) {
     uri_ = value;
   } else if (std::strcmp(key, ADBC_POSTGRESQL_OPTION_USE_COPY) == 0) {
