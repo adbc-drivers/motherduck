@@ -27,10 +27,12 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <limits>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -38,10 +40,15 @@
 #include <variant>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #include <arrow-adbc/adbc.h>
 #include <arrow-adbc/driver/postgresql.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
+#include <libpq-fe.h>
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow.hpp>
 
@@ -49,6 +56,7 @@
 #include "common/options.h"
 #include "common/utils.h"
 #include "motherduck_database.h"
+#include "motherduck_test_util.h"
 #include "validation/adbc_validation.h"
 #include "validation/adbc_validation_util.h"
 
@@ -56,6 +64,9 @@ using adbc_validation::Handle;
 using adbc_validation::IsOkStatus;
 using adbc_validation::IsStatus;
 using std::string_literals::operator""s;
+
+// Bulk ingest needs COPY FROM STDIN, which the Postgres endpoint lacks (ECO-587).
+#define SKIP_WITHOUT_COPY_FROM_STDIN() GTEST_SKIP() << "Needs COPY FROM STDIN (ECO-587)"
 
 class PostgresQuirks : public adbc_validation::DriverQuirks {
  public:
@@ -79,13 +90,9 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return SetupDatabase(database, uri, error);
   }
 
-  // Works around https://github.com/adbc-drivers/motherduck/issues/11;
-  // MotherDuckDefaultsSelect covers the default.
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database, const char* uri,
                                struct AdbcError* error) const {
-    AdbcStatusCode status = AdbcDatabaseSetOption(database, "uri", uri, error);
-    if (status != ADBC_STATUS_OK) return status;
-    return AdbcDatabaseSetOption(database, "adbc.postgresql.use_copy", "false", error);
+    return AdbcDatabaseSetOption(database, "uri", uri, error);
   }
 
   std::string QuoteIdentifier(std::string_view name) const override {
@@ -118,6 +125,35 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     RAISE_ADBC(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), error));
     RAISE_ADBC(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, error));
     return AdbcStatementRelease(&statement.value, error);
+  }
+
+  // Bulk ingest isn't available (ECO-587), so build the sample table with SQL.
+  AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
+                                   const std::string& name,
+                                   struct AdbcError* error) const override {
+    return CreateSampleTableSql(connection, QuoteIdentifier(name), error);
+  }
+
+  AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
+                                   const std::string& name, const std::string& schema,
+                                   struct AdbcError* error) const override {
+    return CreateSampleTableSql(
+        connection, QuoteIdentifier(schema) + "." + QuoteIdentifier(name), error);
+  }
+
+  AdbcStatusCode CreateSampleTableSql(struct AdbcConnection* connection,
+                                      const std::string& table,
+                                      struct AdbcError* error) const {
+    for (const std::string& query :
+         {"CREATE TABLE " + table + " (int64s BIGINT, strings TEXT)",
+          "INSERT INTO " + table + " VALUES (42, 'foo'), (-42, NULL), (NULL, '')"}) {
+      Handle<struct AdbcStatement> statement;
+      RAISE_ADBC(AdbcStatementNew(connection, &statement.value, error));
+      RAISE_ADBC(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), error));
+      RAISE_ADBC(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, error));
+      RAISE_ADBC(AdbcStatementRelease(&statement.value, error));
+    }
+    return ADBC_STATUS_OK;
   }
 
   AdbcStatusCode DropTempTable(struct AdbcConnection* connection, const std::string& name,
@@ -238,6 +274,8 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   }
   std::string db_schema() const override { return "main"; }
 
+  // No COPY FROM STDIN yet (ECO-587).
+  bool supports_bulk_ingest(const char* mode) const override { return false; }
   // MotherDuck supports database.schema.table names.
   bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_db_schema() const override { return true; }
@@ -348,36 +386,37 @@ TEST_F(PostgresDatabaseTest, UseCopyOption) {
 
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, key, "false", &error),
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, key, "true", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   use_copy = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
 
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::ConnectionGetOption(&connection.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
 
   ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::StatementGetOption(&statement.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 
-  ASSERT_THAT(AdbcConnectionSetOption(&connection.value, key, "true", &error),
+  ASSERT_THAT(AdbcConnectionSetOption(&connection.value, key, "false", &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::ConnectionGetOption(&connection.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
 
   ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::StatementGetOption(&statement.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 }
 
+// The endpoint rejects binary COPY TO STDOUT, so the default is off (#11).
 TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   const char* key = "adbc.postgresql.use_copy";
   std::optional<std::string> use_copy;
@@ -390,18 +429,18 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   use_copy = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
 
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::ConnectionGetOption(&connection.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
 
   ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::StatementGetOption(&statement.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 }
 
@@ -420,7 +459,7 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
 TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
-  // A password in the URI takes precedence over PGPASSWORD.
+  // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
   std::string bad_uri = uri;
   bad_uri += std::strchr(uri, '?') ? "&password=invalid" : "?password=invalid";
 
@@ -430,6 +469,223 @@ TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
               IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error),
               IsStatus(ADBC_STATUS_IO, &error));
+}
+
+// A uniquely named file in the temp directory, removed when the object is.
+// A uniquely named file in the temp directory holding contents, readable only
+// by its owner from the moment it exists, and removed when the object is. The
+// path is empty if the file couldn't be created and written in full.
+class ScopedTempFile {
+ public:
+  ScopedTempFile(std::string_view prefix, std::string_view contents) {
+#ifdef _WIN32
+    // The temp directory is per user on Windows.
+    std::random_device random;
+    path_ = std::filesystem::temp_directory_path() /
+            (std::string(prefix) + "_" + std::to_string(random()));
+    std::ofstream out(path_, std::ios::binary);
+    out << contents;
+    out.close();
+    if (!out) path_.clear();
+#else
+    // mkstemp creates the file exclusively, with mode 0600.
+    std::string name =
+        (std::filesystem::temp_directory_path() / (std::string(prefix) + "_XXXXXX"))
+            .string();
+    int fd = mkstemp(name.data());
+    if (fd < 0) return;
+    path_ = name;
+    size_t written = 0;
+    while (written < contents.size()) {
+      ssize_t n = write(fd, contents.data() + written, contents.size() - written);
+      if (n <= 0) break;
+      written += static_cast<size_t>(n);
+    }
+    if (close(fd) != 0 || written < contents.size()) {
+      std::filesystem::remove(path_);
+      path_.clear();
+    }
+#endif
+  }
+  ~ScopedTempFile() {
+    std::error_code ec;
+    std::filesystem::remove(path_, ec);
+  }
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
+
+TEST_F(PostgresDatabaseTest, PasswordOption) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  const char* token = std::getenv("MOTHERDUCK_TOKEN");
+  ASSERT_NE(token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
+  std::string bad_uri = uri;
+  bad_uri += std::strchr(uri, '?') ? "&password=invalid" : "?password=invalid";
+
+  // The option takes precedence over a password in the URI.
+  {
+    adbc_validation::Handle<struct AdbcDatabase> database;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcDatabaseSetOption(&database.value, ADBC_OPTION_PASSWORD, token, &error),
+        IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  }
+  // And over MOTHERDUCK_TOKEN.
+  {
+    adbc_validation::Handle<struct AdbcDatabase> database;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcDatabaseSetOption(&database.value, ADBC_OPTION_PASSWORD, "invalid", &error),
+        IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error),
+                IsStatus(ADBC_STATUS_IO, &error));
+  }
+}
+
+TEST_F(PostgresDatabaseTest, IgnoresPostgresPasswords) {
+  const char* motherduck_token = std::getenv("MOTHERDUCK_TOKEN");
+  ASSERT_NE(motherduck_token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
+  const std::string token = motherduck_token;
+
+  // A valid token in PGPASSWORD or a password file doesn't rescue a bad one.
+  ScopedTempFile scoped_passfile("adbc_motherduck_pgpass", "*:*:*:*:" + token + "\n");
+  const std::filesystem::path& passfile = scoped_passfile.path();
+  ASSERT_FALSE(passfile.empty()) << "Couldn't create a password file";
+  {
+    ScopedEnv pgpassword("PGPASSWORD", token.c_str());
+    ScopedEnv pgpassfile("PGPASSFILE", passfile.string().c_str());
+    ScopedEnv bad_token("MOTHERDUCK_TOKEN", "invalid");
+    adbc_validation::Handle<struct AdbcDatabase> database;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
+    EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
+                IsStatus(ADBC_STATUS_IO, &error));
+  }
+}
+
+TEST_F(PostgresDatabaseTest, RegionOption) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  // Take the region from the test URI's host, then drop the host.
+  std::string hostless = uri;
+  size_t start = hostless.find('@');
+  ASSERT_NE(start, std::string::npos) << "Test URI must be postgresql://user@host...";
+  start++;
+  size_t end = hostless.find_first_of(":/?", start);
+  std::string host = hostless.substr(start, end - start);
+  constexpr std::string_view kPrefix = "pg.";
+  constexpr std::string_view kSuffix = "-aws.motherduck.com";
+  if (host.size() <= kPrefix.size() + kSuffix.size() || host.rfind(kPrefix, 0) != 0 ||
+      host.compare(host.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+    GTEST_SKIP() << "Test host " << host << " isn't a MotherDuck region host";
+  }
+  std::string region =
+      host.substr(kPrefix.size(), host.size() - kPrefix.size() - kSuffix.size());
+  hostless.erase(start, end - start);
+
+  // Only the region can supply the host and port.
+  ScopedEnv pghost("PGHOST", "localhost");
+  ScopedEnv pgport("PGPORT", "1");
+  ScopedEnv pghostaddr("PGHOSTADDR", nullptr);
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&database.value, hostless.c_str(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
+                                    region.c_str(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+              IsOkStatus(&error));
+}
+
+TEST_F(PostgresDatabaseTest, SessionNameOption) {
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME,
+                                    "adbc session", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+              IsOkStatus(&error));
+}
+
+// Each sslmode against MotherDuck's endpoint, which refuses plaintext: every
+// mode that connects must use TLS. The CA bundle comes from the test URI,
+// since some libpq builds can't read the system trust store.
+TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  char* parse_error = nullptr;
+  PQconninfoOption* conninfo = PQconninfoParse(uri, &parse_error);
+  ASSERT_NE(conninfo, nullptr) << (parse_error ? parse_error : "out of memory");
+  std::string base;
+  std::string rootcert;
+  for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
+    if (option->val == nullptr || *option->val == '\0') continue;
+    std::string_view keyword = option->keyword;
+    if (keyword == "sslrootcert") {
+      rootcert = option->val;
+    } else if (keyword == "host" || keyword == "port" || keyword == "dbname" ||
+               keyword == "user") {
+      base += std::string(keyword) + "='" + option->val + "' ";
+    }
+  }
+  PQconninfoFree(conninfo);
+  ASSERT_FALSE(rootcert.empty()) << "Test URI must set sslrootcert";
+
+  struct Case {
+    const char* sslmode;
+    std::string sslrootcert;
+    bool connects;
+  };
+  const Case kCases[] = {
+      // The endpoint refuses plaintext.
+      {"disable", "", false},
+      // allow and prefer retry with TLS after that refusal.
+      {"allow", "", true},
+      {"prefer", "", true},
+      {"require", "", true},
+      {"verify-ca", rootcert, true},
+      {"verify-full", rootcert, true},
+      // libpq refuses anything but verify-full with the system trust store.
+      {"require", "system", false},
+      {"verify-ca", "system", false},
+  };
+  ScopedEnv pgsslmode("PGSSLMODE", nullptr);
+  ScopedEnv pgsslrootcert("PGSSLROOTCERT", nullptr);
+  for (const Case& test_case : kCases) {
+    std::string conn_uri = base + "sslmode=" + test_case.sslmode;
+    if (!test_case.sslrootcert.empty()) {
+      conn_uri += " sslrootcert='" + test_case.sslrootcert + "'";
+    }
+    SCOPED_TRACE(std::string("sslmode=") + test_case.sslmode +
+                 " sslrootcert=" + test_case.sslrootcert);
+    adbcpq::MotherduckDatabase database;
+    ASSERT_THAT(database.SetOption("uri", conn_uri.c_str(), &error), IsOkStatus(&error));
+    PGconn* conn = nullptr;
+    AdbcStatusCode status = database.Connect(&conn, &error);
+    if (!test_case.connects) {
+      EXPECT_THAT(status, IsStatus(ADBC_STATUS_IO, &error));
+      if (error.release) error.release(&error);
+      continue;
+    }
+    ASSERT_THAT(status, IsOkStatus(&error));
+    EXPECT_EQ(PQsslInUse(conn), 1);
+    ASSERT_THAT(database.Disconnect(&conn, &error), IsOkStatus(&error));
+  }
 }
 
 TEST_F(PostgresDatabaseTest, TypeResolverModeOptionIgnored) {
@@ -455,8 +711,8 @@ TEST_F(PostgresDatabaseTest, TypeResolverModeOptionIgnored) {
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
 }
 
-// https://github.com/adbc-drivers/motherduck/issues/11: by default, results come
-// through binary COPY TO STDOUT.
+// https://github.com/adbc-drivers/motherduck/issues/11: a query returning rows
+// works with the default options.
 TEST_F(PostgresDatabaseTest, MotherDuckDefaultsSelect) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   adbc_validation::Handle<struct AdbcConnection> connection;
@@ -642,7 +898,7 @@ void ListCatalogs(struct AdbcDatabase* database, std::vector<std::string>* catal
 }
 }  // namespace
 
-// With the default attach_mode=single, other databases in the account aren't
+// With attach_mode=single (the default), other databases in the account aren't
 // catalogs; with workspace, they are.
 TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
   Handle<struct AdbcDatabase> workspace;
@@ -661,16 +917,43 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
                          "CREATE DATABASE " + quirks_.QuoteIdentifier(other), &error),
               IsOkStatus(&error));
 
+  // attach_mode in the URI overrides the default, and the option overrides the
+  // URI. This relies on MotherDuck keeping the last value of a repeated setting.
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  std::string workspace_uri = uri;
+  workspace_uri += std::strchr(uri, '?') ? "&" : "?";
+  workspace_uri += "options=--attach_mode%3Dworkspace";
+  Handle<struct AdbcDatabase> uri_workspace;
+  Handle<struct AdbcDatabase> option_single;
+  for (struct AdbcDatabase* db : {&uri_workspace.value, &option_single.value}) {
+    ASSERT_THAT(AdbcDatabaseNew(db, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupDatabase(db, workspace_uri.c_str(), &error),
+                IsOkStatus(&error));
+  }
+  ASSERT_THAT(AdbcDatabaseSetOption(&option_single.value,
+                                    ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, "single", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&uri_workspace.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&option_single.value, &error), IsOkStatus(&error));
+
   std::vector<std::string> workspace_catalogs;
   std::vector<std::string> single_catalogs;
+  std::vector<std::string> uri_workspace_catalogs;
+  std::vector<std::string> option_single_catalogs;
   ListCatalogs(&workspace.value, &workspace_catalogs);
   ListCatalogs(&database, &single_catalogs);
+  ListCatalogs(&uri_workspace.value, &uri_workspace_catalogs);
+  ListCatalogs(&option_single.value, &option_single_catalogs);
   EXPECT_THAT(ExecuteSql(&workspace.value, drop, &error), IsOkStatus(&error));
   if (HasFatalFailure()) return;
 
   EXPECT_THAT(workspace_catalogs, ::testing::IsSupersetOf({catalog, other}));
   EXPECT_THAT(single_catalogs, ::testing::Contains(catalog));
   EXPECT_THAT(single_catalogs, ::testing::Not(::testing::Contains(other)));
+  EXPECT_THAT(uri_workspace_catalogs, ::testing::IsSupersetOf({catalog, other}));
+  EXPECT_THAT(option_single_catalogs, ::testing::Contains(catalog));
+  EXPECT_THAT(option_single_catalogs, ::testing::Not(::testing::Contains(other)));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
@@ -1336,6 +1619,8 @@ class PostgresStatementTest : public ::testing::Test,
   void TestSqlPrepareErrorParamCountMismatch() { GTEST_SKIP() << "Not yet implemented"; }
 
   void TestSqlPrepareSelectParams() { GTEST_SKIP() << "Not yet implemented"; }
+  void TestSqlIngestColumnEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
+  void TestSqlIngestTableEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
 
   void TestConcurrentStatements() {
     // TODO: refactor driver so that we read all the data as soon as
@@ -1629,6 +1914,7 @@ TEST_F(PostgresStatementTest, IsolationLevels) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestSchema) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   const std::string schema_name = "testschema";
 
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -1994,6 +2280,7 @@ TEST_F(PostgresStatementTest, SqlIngestAppendIntegerBoundsIntoNumeric) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendFloatIntoNumericNotImplemented) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->DropTable(&connection, "numeric_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -2103,6 +2390,7 @@ TEST_F(PostgresStatementTest, SqlIngestTimestampOverflow) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestJson) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   std::string drop = "DROP TABLE IF EXISTS jsontable";
@@ -2175,6 +2463,7 @@ TEST_F(PostgresStatementTest, SqlIngestJson) {
 // Ensure the table is actually created with the JSON type by trying to ingest
 // invalid JSON
 TEST_F(PostgresStatementTest, SqlIngestJsonInvalid) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   std::string drop = "DROP TABLE IF EXISTS jsontable";
@@ -2863,6 +3152,7 @@ TEST_F(PostgresStatementTest, SqlExecuteCopyZeroRowOutputError) {
 }
 
 TEST_F(PostgresStatementTest, BatchSizeHint) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->EnsureSampleTable(&connection, "batch_size_hint_test", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -4141,6 +4431,7 @@ static const std::vector<DecimalFixtureGroup>& DecimalFixtureGroups() {
 class PostgresDecimalTestBase : public ::testing::Test {
  public:
   void SetUp() override {
+    SKIP_WITHOUT_COPY_FROM_STDIN();
     ASSERT_THAT(AdbcDatabaseNew(&database_, &error_), IsOkStatus(&error_));
     ASSERT_THAT(quirks_.SetupDatabase(&database_, &error_), IsOkStatus(&error_));
     ASSERT_THAT(AdbcDatabaseInit(&database_, &error_), IsOkStatus(&error_));

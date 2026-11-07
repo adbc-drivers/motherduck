@@ -71,6 +71,9 @@ class PostgresDatabase {
 
   Status InitVersions(PGconn* conn);
   std::string_view VendorName() { return "PostgreSQL"; }
+  // The name GetInfo reports for ADBC_INFO_VENDOR_NAME. Unlike VendorName(), which
+  // labels PostgreSQL wire types, this names the product the user connected to.
+  virtual std::string_view InfoVendorName() { return VendorName(); }
   virtual std::string_view DriverName() { return "ADBC PostgreSQL Driver"; }
   // TODO(lidavidm): fill in driver version
   virtual std::string_view DriverVersion() { return "unknown"; }

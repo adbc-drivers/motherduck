@@ -28,8 +28,6 @@ from adbc_drivers_validation import model, quirks
 
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
-    # Work around https://github.com/adbc-drivers/motherduck/issues/11
-    "adbc.postgresql.use_copy": "false",
 }
 
 
@@ -54,7 +52,8 @@ class PostgreSQLQuirks(model.DriverQuirks):
         get_objects_constraints_primary=False,
         get_objects_constraints_unique=False,
         metadata_type_name=True,
-        statement_bulk_ingest=True,
+        # Needs COPY FROM STDIN, which the endpoint lacks (ECO-587).
+        statement_bulk_ingest=False,
         statement_bulk_ingest_catalog=False,
         statement_bulk_ingest_schema=False,
         # MotherDuck has no temporary tables.
