@@ -22,5 +22,6 @@
 
 // part: metadata
 
-[tags]
-field-type-name = "timestamptz"
+# MotherDuck's TIMESTAMP WITH TIME ZONE takes no precision parameter
+# ("Type 'TIMESTAMP WITH TIME ZONE' does not take any type parameters").
+hide = true
