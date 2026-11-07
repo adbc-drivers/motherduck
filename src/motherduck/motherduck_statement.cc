@@ -33,15 +33,13 @@ namespace adbcpq {
 
 namespace {
 
-// The endpoint can't prepare a query whose result column types depend on
-// untyped parameters (e.g. SELECT $1), and ignores the parameter types given
-// with the prepare (#17).
+// The endpoint can't prepare a query like SELECT $1, whose result types depend
+// on its parameters, and ignores parameter types sent with the prepare (#17).
 bool IsAmbiguousParameterError(const Status& status) {
   return status.message().find("ambiguous result column types") != std::string::npos;
 }
 
-// The type to cast each bound parameter to, or an empty string to leave it
-// uncast.
+// The type to cast each bound parameter to, or "" for none.
 Status ParameterCastTypes(const PostgresTypeResolver& type_resolver,
                           const struct ArrowSchema& bind_schema,
                           std::vector<std::string>* types) {
@@ -60,8 +58,8 @@ Status ParameterCastTypes(const PostgresTypeResolver& type_resolver,
                      PostgresType::FromSchema(type_resolver, bind_schema.children[i],
                                               &type, &na_error));
     if (type.type_id() == PostgresTypeId::kNumeric) {
-      // A bare NUMERIC is DECIMAL(18,3) in DuckDB, so keep the decimal's own
-      // precision and scale, and leave any DuckDB can't hold uncast.
+      // A bare NUMERIC is DECIMAL(18,3) in DuckDB, so keep precision and scale;
+      // skip decimals DuckDB can't hold.
       if (view.decimal_precision < 1 || view.decimal_precision > 38 ||
           view.decimal_scale < 0 || view.decimal_scale > view.decimal_precision) {
         continue;
@@ -75,8 +73,7 @@ Status ParameterCastTypes(const PostgresTypeResolver& type_resolver,
   return Status::Ok();
 }
 
-// Prepare query with each parameter cast to the type of its bound value, which
-// fixes the types of any result columns that depend on it.
+// Prepare query with each parameter cast to its bound type.
 Status PrepareWithParamCasts(PGconn* conn, const std::string& query,
                              const std::vector<Oid>& param_oids,
                              const struct ArrowSchema& bind_schema,

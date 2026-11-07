@@ -173,9 +173,8 @@ class PostgresStatement {
       std::string query);
   // Whether a DDL command run by CreateBulkTable succeeded
   virtual bool IsCommandOk(PGresult* result);
-  // Prepare query as the unnamed statement with the given parameter types, or
-  // with none to let the server infer them. bind_schema describes the bound
-  // parameters, or is null if none are bound.
+  // Prepare query as the unnamed statement. Empty param_oids lets the server
+  // infer the types; bind_schema is the bound parameters' schema, or null.
   virtual Status PrepareQuery(PGconn* conn, const std::string& query,
                               const std::vector<Oid>& param_oids,
                               const struct ArrowSchema* bind_schema);

@@ -43,15 +43,14 @@ std::vector<std::string> SplitStatements(std::string_view query,
 // Whether a statement is a COPY, ignoring leading whitespace and comments.
 bool IsCopyStatement(std::string_view statement);
 
-// Replace each parameter $n outside string literals, quoted identifiers, dollar
-// quotes and comments with CAST($n AS <types[n - 1]>). Parameters with no type
-// (an empty string, or n past the end of types) are left as they are.
-// backslash_escapes is as for SplitStatements.
+// Rewrite each parameter $n outside quotes and comments to
+// CAST($n AS <types[n - 1]>), leaving it as is if that type is empty or
+// missing. backslash_escapes is as for SplitStatements.
 std::string CastParameters(std::string_view query, const std::vector<std::string>& types,
                            bool backslash_escapes = false);
 
-// Whether backslashes escape quotes in every string literal on this connection,
-// as they do when standard_conforming_strings is off, not just in E'' ones.
+// Whether every string literal on this connection takes backslash escapes
+// (standard_conforming_strings is off).
 bool BackslashEscapes(PGconn* conn);
 
 // Whether a statement that isn't a COPY succeeded. MotherDuck answers DDL with
