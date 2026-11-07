@@ -29,7 +29,9 @@ from adbc_drivers_validation import model, quirks
 
 # MotherDuck says `Table with name foo does not exist!`, or for a failed
 # `::regclass` cast, `relation "foo" does not exist`.
-_TABLE_NOT_FOUND = re.compile(r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist')
+_TABLE_NOT_FOUND = re.compile(
+    r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
+)
 
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
