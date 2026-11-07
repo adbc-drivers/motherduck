@@ -35,7 +35,7 @@ namespace {
 
 // The endpoint can't prepare a query whose result column types depend on
 // untyped parameters (e.g. SELECT $1), and ignores the parameter types given
-// with the prepare (ECO-1351).
+// with the prepare (#17).
 bool IsAmbiguousParameterError(const Status& status) {
   return status.message().find("ambiguous result column types") != std::string::npos;
 }

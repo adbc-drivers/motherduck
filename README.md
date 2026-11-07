@@ -166,7 +166,7 @@ to fail.
   read (#11), and a running query can't be cancelled (#48).
 - **Parameter types:** the endpoint can't prepare a query whose result
   column types depend on its parameters, as in `SELECT $1`, and ignores the
-  parameter types sent with the prepare (ECO-1351). When that happens with
+  parameter types sent with the prepare (#17). When that happens with
   parameters bound, the driver prepares the query again with each `$n` cast to
   its bound type, so such queries work once parameters are bound; without
   bound parameters, `GetParameterSchema` and `ExecuteSchema` return

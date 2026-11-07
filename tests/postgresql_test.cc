@@ -65,8 +65,8 @@ using adbc_validation::IsOkStatus;
 using adbc_validation::IsStatus;
 using std::string_literals::operator""s;
 
-// Bulk ingest needs COPY FROM STDIN, which the Postgres endpoint lacks (ECO-587).
-#define SKIP_WITHOUT_COPY_FROM_STDIN() GTEST_SKIP() << "Needs COPY FROM STDIN (ECO-587)"
+// Bulk ingest needs COPY FROM STDIN, which the Postgres endpoint lacks (#31).
+#define SKIP_WITHOUT_COPY_FROM_STDIN() GTEST_SKIP() << "Needs COPY FROM STDIN (#31)"
 
 class PostgresQuirks : public adbc_validation::DriverQuirks {
  public:
@@ -127,7 +127,7 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return AdbcStatementRelease(&statement.value, error);
   }
 
-  // Bulk ingest isn't available (ECO-587), so build the sample table with SQL.
+  // Bulk ingest isn't available (#31), so build the sample table with SQL.
   AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
                                    const std::string& name,
                                    struct AdbcError* error) const override {
@@ -274,7 +274,7 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   }
   std::string db_schema() const override { return "main"; }
 
-  // No COPY FROM STDIN yet (ECO-587).
+  // No COPY FROM STDIN yet (#31).
   bool supports_bulk_ingest(const char* mode) const override { return false; }
   // MotherDuck supports database.schema.table names.
   bool supports_bulk_ingest_catalog() const override { return true; }

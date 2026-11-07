@@ -59,7 +59,7 @@ class PostgreSQLQuirks(model.DriverQuirks):
         get_objects_constraints_primary=False,
         get_objects_constraints_unique=False,
         metadata_type_name=True,
-        # Needs COPY FROM STDIN, which the endpoint lacks (ECO-587).
+        # Needs COPY FROM STDIN, which the endpoint lacks (#31).
         statement_bulk_ingest=False,
         statement_bulk_ingest_catalog=False,
         statement_bulk_ingest_schema=False,
@@ -89,7 +89,7 @@ class PostgreSQLQuirks(model.DriverQuirks):
 
     def query_override(self, context: str, default: str) -> str:
         # With nothing bound, the endpoint can't infer the type of a parameter
-        # that decides a result column's type, as in SELECT 1 + $1 (ECO-1351),
+        # that decides a result column's type, as in SELECT 1 + $1 (#17),
         # and the driver reports the parameter schema as not implemented. Ask
         # about parameters it can type from the rest of the query instead.
         overrides = {
