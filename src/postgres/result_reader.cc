@@ -157,17 +157,7 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
         bind_stream_->bind_schema_fields.begin(), bind_stream_->bind_schema_fields.end(),
         [](const ArrowSchemaView& view) { return view.type == NANOARROW_TYPE_NA; });
     if (has_na_params) {
-      // Prepare WITHOUT parameter types to let PostgreSQL infer them. This is required
-      // to resolve Arrow NA (all-null) parameters to the expected PostgreSQL types.
-      UNWRAP_STATUS(helper_.Prepare());
-
-      // Get PostgreSQL's expected parameter types
-      UNWRAP_STATUS(helper_.DescribePrepared());
-      PostgresType expected_types;
-      UNWRAP_STATUS(helper_.ResolveParamTypes(*type_resolver_, &expected_types));
-
-      // Reconcile Arrow schema with expected types
-      UNWRAP_STATUS(bind_stream_->ReconcileWithExpectedTypes(expected_types));
+      UNWRAP_STATUS(ResolveNullParamTypes());
     }
 
     // Now set parameter types (will use reconciled types for NA fields)
@@ -228,6 +218,23 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
 
 Status PqResultArrayReader::PrepareWithParamTypes() {
   return helper_.Prepare(bind_stream_->param_types);
+}
+
+Status PqResultArrayReader::ResolveNullParamTypes() {
+  // Prepare WITHOUT parameter types to let PostgreSQL infer them. This is required
+  // to resolve Arrow NA (all-null) parameters to the expected PostgreSQL types.
+  UNWRAP_STATUS(helper_.Prepare());
+  return ReconcileWithPreparedParamTypes();
+}
+
+Status PqResultArrayReader::ReconcileWithPreparedParamTypes() {
+  // Get PostgreSQL's expected parameter types
+  UNWRAP_STATUS(helper_.DescribePrepared());
+  PostgresType expected_types;
+  UNWRAP_STATUS(helper_.ResolveParamTypes(*type_resolver_, &expected_types));
+
+  // Reconcile Arrow schema with expected types
+  return bind_stream_->ReconcileWithExpectedTypes(expected_types);
 }
 
 Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
@@ -292,13 +299,7 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
         bind_stream_->bind_schema_fields.begin(), bind_stream_->bind_schema_fields.end(),
         [](const ArrowSchemaView& view) { return view.type == NANOARROW_TYPE_NA; });
     if (has_na_params) {
-      // Prepare without parameter types so PostgreSQL can infer them. This is required
-      // to resolve Arrow NA (all-null) parameters to the expected PostgreSQL types.
-      UNWRAP_STATUS(helper_.Prepare());
-      UNWRAP_STATUS(helper_.DescribePrepared());
-      PostgresType expected_types;
-      UNWRAP_STATUS(helper_.ResolveParamTypes(*type_resolver_, &expected_types));
-      UNWRAP_STATUS(bind_stream_->ReconcileWithExpectedTypes(expected_types));
+      UNWRAP_STATUS(ResolveNullParamTypes());
     }
 
     UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));

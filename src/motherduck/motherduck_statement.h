@@ -41,6 +41,7 @@ class MotherduckResultReader : public PqResultArrayReader {
  protected:
   Status ExecuteAll(int64_t* affected_rows) override;
   Status PrepareWithParamTypes() override;
+  Status ResolveNullParamTypes() override;
 
  private:
   std::string query_;

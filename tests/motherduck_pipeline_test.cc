@@ -99,6 +99,9 @@ TEST(CastParametersTest, LeavesUntyped) {
             "SELECT $1, CAST($2 AS int4), $3");
   EXPECT_EQ(CastParameters("SELECT $0, $99999999999999999999999", {"int4"}),
             "SELECT $0, $99999999999999999999999");
+  // 2^64 + 3, which wraps to 3 if the parse overflows.
+  EXPECT_EQ(CastParameters("SELECT $18446744073709551619", {"int4", "int4", "int4"}),
+            "SELECT $18446744073709551619");
   EXPECT_EQ(CastParameters("SELECT 1", {"int4"}), "SELECT 1");
 }
 

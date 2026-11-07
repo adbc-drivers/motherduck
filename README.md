@@ -170,7 +170,8 @@ to fail.
   parameters bound, the driver prepares the query again with each `$n` cast to
   its bound type, so such queries work once parameters are bound; without
   bound parameters, `GetParameterSchema` and `ExecuteSchema` return
-  `NOT_IMPLEMENTED` for them.
+  `NOT_IMPLEMENTED` for them. An all-null parameter whose type the endpoint
+  can't infer is cast to `TEXT`, so `SELECT 1 + $1` with a null fails.
 - **Rows affected** is wrong for `DELETE` (#19), and is the row count rather
   than -1 for a `SELECT` on the non-COPY path (#50). `ExecuteQuery` on an
   `INSERT` also returns the endpoint's `Count` row as a batch (#49).

@@ -547,7 +547,7 @@ std::string CastParameters(std::string_view query, const std::vector<std::string
       size_t number = 0;
       while (end < query.size() && std::isdigit(static_cast<unsigned char>(query[end]))) {
         // Saturate rather than overflow; no query has that many parameters.
-        number = std::min<size_t>(number * 10 + (query[end] - '0'), SIZE_MAX / 10);
+        number = number > (SIZE_MAX - 9) / 10 ? SIZE_MAX : number * 10 + (query[end] - '0');
         end++;
       }
       if (number >= 1 && number <= types.size() && !types[number - 1].empty()) {
