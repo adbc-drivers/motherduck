@@ -48,16 +48,15 @@ bool EqualsNoCase(std::string_view a, std::string_view b) {
 }
 
 bool EndsWithNoCase(std::string_view a, std::string_view upper_suffix) {
-  return a.size() > upper_suffix.size() &&
+  return a.size() >= upper_suffix.size() &&
          EqualsNoCase(a.substr(a.size() - upper_suffix.size()), upper_suffix);
 }
 
 // Whether any '_' or '.' separated part of the name is a credential word, so that
-// s3_access_key_id counts but monkey and tokenizer don't. Run-together names such as
-// AccountKey, sslpassword and apikey count too, by their ending.
+// s3_access_key_id counts but monkey and tokenizer don't. For the common words the
+// ending is enough, so run-together names such as AccountKey, sslpassword and apikey
+// count too.
 bool IsCredentialName(std::string_view name) {
-  // md_create_flight(source_code => ..., config => ...) carry free-form payloads.
-  if (EqualsNoCase(name, "SOURCE_CODE") || EqualsNoCase(name, "CONFIG")) return true;
   for (size_t i = 0; i + 17 <= name.size(); i++) {
     if (EqualsNoCase(name.substr(i, 17), "CONNECTION_STRING")) return true;
   }
@@ -66,14 +65,13 @@ bool IsCredentialName(std::string_view name) {
     size_t end = name.find_first_of("_.$", start);
     if (end == std::string_view::npos) end = name.size();
     const std::string_view part = name.substr(start, end - start);
-    for (const char* word : {"SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE", "PWD",
-                             "PW", "KEY", "SIG", "SIGNATURE", "SAS", "AUTH",
-                             "AUTHORIZATION", "CREDENTIAL", "CREDENTIALS", "SLT"}) {
-      if (EqualsNoCase(part, word)) return true;
-    }
     for (const char* word :
          {"SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE", "KEY", "SIGNATURE"}) {
       if (EndsWithNoCase(part, word)) return true;
+    }
+    for (const char* word : {"PWD", "PW", "SIG", "SAS", "AUTH", "AUTHORIZATION",
+                             "CREDENTIAL", "CREDENTIALS", "SLT"}) {
+      if (EqualsNoCase(part, word)) return true;
     }
     start = end + 1;
   }
@@ -141,6 +139,43 @@ std::optional<Cut> TokenBeforeAt(std::string_view t, size_t i) {
   return std::nullopt;
 }
 
+// md_create_flight(source_code := ..., config => ...) carry free-form payloads. A config
+// column is left alone, so config needs the named-argument forms; source_code also takes
+// a plain '=', as a mistyped call would still echo the code in its error.
+std::optional<Cut> PayloadArgument(std::string_view t, std::string_view word, size_t i) {
+  const bool source_code = EqualsNoCase(word, "SOURCE_CODE");
+  if (!source_code && !EqualsNoCase(word, "CONFIG")) return std::nullopt;
+  const size_t k = SkipSpaceAndComments(t, i);
+  if (k + 1 < t.size() &&
+      ((t[k] == ':' && t[k + 1] == '=') || (t[k] == '=' && t[k + 1] == '>'))) {
+    return Cut{k + 2, " ..."};
+  }
+  if (source_code && k < t.size() && t[k] == '=') return Cut{k + 1, " ..."};
+  return std::nullopt;
+}
+
+// Postgres unique-violation detail: Key (col, ...)=(value, ...). Cut after the '=' if any
+// column looks like a credential. i is the index just past the word Key.
+std::optional<Cut> KeyDetail(std::string_view t, size_t i) {
+  const size_t open = SkipSpaceAndComments(t, i);
+  if (open >= t.size() || t[open] != '(') return std::nullopt;
+  const size_t close = t.find(')', open);
+  if (close == std::string_view::npos) return std::nullopt;
+  const size_t eq = SkipSpaceAndComments(t, close + 1);
+  if (eq >= t.size() || t[eq] != '=') return std::nullopt;
+  size_t j = open + 1;
+  while (j < close) {
+    if (!IsIdentChar(t[j])) {
+      j++;
+      continue;
+    }
+    const size_t start = j;
+    while (j < close && IsIdentChar(t[j])) j++;
+    if (IsCredentialName(t.substr(start, j - start))) return Cut{eq + 1, " ..."};
+  }
+  return std::nullopt;
+}
+
 // Find the first place that needs masking. Everything after it is dropped.
 std::optional<Cut> FindCut(std::string_view t) {
   bool create_or_alter_seen = false;
@@ -184,6 +219,10 @@ std::optional<Cut> FindCut(std::string_view t) {
         if (header_only) return Cut{paren + 1, "...)"};
       }
       return Cut{i, " ..."};
+    }
+    if (auto cut = PayloadArgument(t, word, i)) return cut;
+    if (EqualsNoCase(word, "KEY")) {
+      if (auto cut = KeyDetail(t, i)) return cut;
     }
     if (IsCredentialName(word)) {
       if (auto cut = ValueAfterName(t, word, i)) return cut;

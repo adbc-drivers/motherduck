@@ -114,6 +114,13 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
       "PRAGMA md_connect('token=ZZ9;host=h')",
       // MotherDuck Flights carry free-form payloads.
       "CALL md_create_flight(name := 'f', source_code := 'ZZ9')",
+      "CALL md_create_flight(name => 'f', source_code => 'ZZ9')",
+      "SELECT * FROM md_create_flight(name = 'f', source_code = 'x = \"ZZ9\"')",
+      "CALL md_run_flight(id => 'x', config => MAP {'A': 'ZZ9'})",
+      // Postgres-style unique violation detail echoes the column value.
+      "ERROR: duplicate key value violates unique constraint \"t_pkey\"\nDETAIL: Key "
+      "(token)=(ZZ9) already exists.",
+      "DETAIL: Key (id, api_key)=(1, ZZ9) already exists.",
       "CALL md_run_flight(id := 'x', config := MAP {'A': 'ZZ9'})",
       // HTTP headers.
       "SELECT http_get('https://x', headers = {'Authorization': 'Bearer ZZ9'})",
@@ -129,6 +136,9 @@ TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
       "SELECT 1",
       "SELECT keyboard, key FROM t ORDER BY id",
       "SELECT key::int FROM t",
+      "SELECT config, source_code FROM flights WHERE config IS NOT NULL",
+      "UPDATE settings SET config = 'x' WHERE id = 1",
+      "DETAIL: Key (id)=(1) already exists.",
       "ATTACH 'md:my_db' AS d (READ_ONLY)",
       "SELECT * FROM md_list_flights()",
       "CREATE TABLE t (id INT, PRIMARY KEY (id))",
@@ -186,9 +196,12 @@ TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
   ASSERT_EQ(PQstatus(conn), CONNECTION_OK) << PQerrorMessage(conn);
   PGresult* result = PQexec(conn, "SELECT FROM WHERE 'UNIQUEMARKER' +");
   ASSERT_EQ(PQresultStatus(result), PGRES_FATAL_ERROR);
-  ASSERT_NE(std::string(PQresultErrorMessage(result)).find("UNIQUEMARKER"),
-            std::string::npos)
-      << "server did not echo the statement; test is vacuous";
+  if (std::string(PQresultErrorMessage(result)).find("UNIQUEMARKER") ==
+      std::string::npos) {
+    PQclear(result);
+    PQfinish(conn);
+    GTEST_SKIP() << "server did not echo the statement; nothing to check";
+  }
   const std::string text = PqErrorText(result, conn);
   EXPECT_EQ(text.find("UNIQUEMARKER"), std::string::npos) << text;
   EXPECT_EQ(text.find("LINE"), std::string::npos) << text;

@@ -302,7 +302,7 @@ struct BindStream {
     if (pg_status != PGRES_COMMAND_OK && pg_status != PGRES_TUPLES_OK) {
       Status status =
           MakeStatus(result, "[libpq] Failed to execute prepared statement: {} {}",
-                     PQresStatus(pg_status), PQerrorMessage(pg_conn));
+                     PQresStatus(pg_status), PqErrorText(result, pg_conn));
       PQclear(result);
       return status;
     }
@@ -389,7 +389,7 @@ struct BindStream {
     if (pg_status != PGRES_COMMAND_OK) {
       Status status =
           MakeStatus(result, "[libpq] Failed to execute COPY statement: {} {}",
-                     PQresStatus(pg_status), PQerrorMessage(pg_conn));
+                     PQresStatus(pg_status), PqErrorText(result, pg_conn));
       PQclear(result);
       return status;
     }

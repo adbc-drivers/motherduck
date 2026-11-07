@@ -348,7 +348,7 @@ Status ExecuteBatch(PGconn* conn, const std::vector<std::string>& statements,
                               /*paramLengths=*/nullptr, /*paramFormats=*/nullptr,
                               static_cast<int>(PqResultHelper::Format::kText)) != 1) {
           return MakeStatus(nullptr, "[libpq] Failed to send query '{}': {}",
-                            RedactQuery(statements[next]), PQerrorMessage(conn));
+                            RedactQuery(statements[next]), PqErrorText(nullptr, conn));
         }
         next++;
         return Status::Ok();
