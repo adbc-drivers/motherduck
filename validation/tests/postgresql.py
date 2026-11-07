@@ -22,9 +22,14 @@
 
 import functools
 import os
+import re
 from pathlib import Path
 
 from adbc_drivers_validation import model, quirks
+
+# MotherDuck says `Table with name foo does not exist!`, or for a failed
+# `::regclass` cast, `relation "foo" does not exist`.
+_TABLE_NOT_FOUND = re.compile(r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist')
 
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
@@ -89,12 +94,11 @@ class PostgreSQLQuirks(model.DriverQuirks):
 
         With no table name, any table not found error matches.
         """
-        error_str = str(error).lower()
-        names_table = table_name is None or table_name.lower() in error_str
-        return names_table and (
-            ("relation" in error_str and "does not exist" in error_str)
-            or ("table" in error_str and "does not exist" in error_str)
-            or "undefined_table" in error_str
+        # Match the server's message, not the failed query the driver echoes
+        # into the error, which may mention "table" and the table's name.
+        match = _TABLE_NOT_FOUND.search(str(error).lower())
+        return match is not None and (
+            table_name is None or table_name.lower() in match.group(1)
         )
 
     def quote_one_identifier(self, identifier: str) -> str:
