@@ -22,9 +22,16 @@
 
 import functools
 import os
+import re
 from pathlib import Path
 
 from adbc_drivers_validation import model, quirks
+
+# MotherDuck says `Table with name foo does not exist!`, or for a failed
+# `::regclass` cast, `relation "foo" does not exist`.
+_TABLE_NOT_FOUND = re.compile(
+    r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
+)
 
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
@@ -97,21 +104,16 @@ class PostgreSQLQuirks(model.DriverQuirks):
         """PostgreSQL uses $1, $2, $3, etc. for parameter placeholders."""
         return f"${index}"
 
-    def is_table_not_found(self, table_name: str, error: Exception) -> bool:
-        """Check if the error indicates a table not found condition."""
-        error_str = str(error).lower()
-        return (
-            (
-                "relation" in error_str
-                and "does not exist" in error_str
-                and table_name.lower() in error_str
-            )
-            or (
-                "table" in error_str
-                and "does not exist" in error_str
-                and table_name.lower() in error_str
-            )
-            or ("undefined_table" in error_str and table_name.lower() in error_str)
+    def is_table_not_found(self, table_name: str | None, error: Exception) -> bool:
+        """Check if the error indicates a table not found condition.
+
+        With no table name, any table not found error matches.
+        """
+        # Match the server's message, not the failed query the driver echoes
+        # into the error, which may mention "table" and the table's name.
+        match = _TABLE_NOT_FOUND.search(str(error).lower())
+        return match is not None and (
+            table_name is None or table_name.lower() in match.group(1)
         )
 
     def quote_one_identifier(self, identifier: str) -> str:
