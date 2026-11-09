@@ -65,12 +65,12 @@ bool IsCredentialName(std::string_view name) {
     size_t end = name.find_first_of("_.$", start);
     if (end == std::string_view::npos) end = name.size();
     const std::string_view part = name.substr(start, end - start);
-    for (const char* word :
-         {"SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE", "KEY", "SIGNATURE"}) {
+    for (const char* word : {"SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE",
+                             "PASS", "KEY", "SIGNATURE", "BEARER", "JWT", "COOKIE"}) {
       if (EndsWithNoCase(part, word)) return true;
     }
     for (const char* word : {"PWD", "PW", "SIG", "SAS", "AUTH", "AUTHORIZATION",
-                             "CREDENTIAL", "CREDENTIALS", "SLT"}) {
+                             "CREDENTIAL", "CREDENTIALS", "SLT", "DSN"}) {
       if (EqualsNoCase(part, word)) return true;
     }
     start = end + 1;
@@ -99,13 +99,22 @@ size_t SkipSpaceAndComments(std::string_view t, size_t i) {
 
 bool IsQuote(char c) { return c == '\'' || c == '"'; }
 
+// Whether the quote just before the name starts a quoted identifier, as in "token". A
+// quote that follows a word or another quote ('u'PASSWORD) ends a literal instead.
+bool OpensQuotedName(std::string_view t, size_t start) {
+  if (start == 0 || !IsQuote(t[start - 1])) return false;
+  if (start == 1) return true;
+  const char before = t[start - 2];
+  return before == '.' || !(IsIdentChar(before) || IsQuote(before));
+}
+
 // After a credential name t[start, i): is a value about to follow (name = v, name TO v,
 // name: v, name 'v', name"v")? A quoted name ("token") has its closing quote right after
 // it; any other quote glued to the name is already the value.
 std::optional<Cut> ValueAfterName(std::string_view t, size_t start, size_t i) {
   const std::string_view name = t.substr(start, i - start);
   if (i < t.size() && IsQuote(t[i])) {
-    if (start == 0 || t[start - 1] != t[i]) return Cut{i, "..."};
+    if (!OpensQuotedName(t, start) || t[start - 1] != t[i]) return Cut{i, "..."};
     i++;
   }
   const size_t k = SkipSpaceAndComments(t, i);

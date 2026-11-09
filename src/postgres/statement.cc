@@ -91,7 +91,7 @@ int TupleReader::GetCopyData() {
   int get_copy_res = PQgetCopyData(conn_, &pgbuf_, /*async=*/0);
   if (get_copy_res == -2) {
     InternalAdbcSetError(&error_, "[libpq] PQgetCopyData() failed: %s",
-                         RedactMessage(PQerrorMessage(conn_)).c_str());
+                         PqErrorText(nullptr, conn_).c_str());
     status_ = ADBC_STATUS_IO;
     return InternalAdbcStatusCodeToErrno(status_);
   }
@@ -413,7 +413,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
       if (escaped == nullptr) {
         InternalAdbcSetError(
             error, "[libpq] Failed to escape target schema %s for ingestion: %s",
-            ingest_.db_schema.c_str(), PQerrorMessage(conn));
+            ingest_.db_schema.c_str(), PqErrorText(nullptr, conn).c_str());
         return ADBC_STATUS_INTERNAL;
       }
       *escaped_table += escaped;
@@ -438,7 +438,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
       if (escaped == nullptr) {
         InternalAdbcSetError(error,
                              "[libpq] Failed to escape target table %s for ingestion: %s",
-                             ingest_.target.c_str(), PQerrorMessage(conn));
+                             ingest_.target.c_str(), PqErrorText(nullptr, conn).c_str());
         return ADBC_STATUS_INTERNAL;
       }
       *escaped_table += escaped;
@@ -495,7 +495,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
     char* escaped = PQescapeIdentifier(conn, unescaped, std::strlen(unescaped));
     if (escaped == nullptr) {
       InternalAdbcSetError(error, "[libpq] Failed to escape column %s for ingestion: %s",
-                           unescaped, PQerrorMessage(conn));
+                           unescaped, PqErrorText(nullptr, conn).c_str());
       return ADBC_STATUS_INTERNAL;
     }
     create += escaped;

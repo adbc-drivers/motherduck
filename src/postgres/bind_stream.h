@@ -367,7 +367,8 @@ struct BindStream {
 
       // check if not ENODATA at exit
       if (write_result != ENODATA) {
-        return Status::IO("Error occurred writing COPY data: ", PQerrorMessage(pg_conn));
+        return Status::IO("Error occurred writing COPY data: ",
+                          PqErrorText(nullptr, pg_conn));
       }
 
       UNWRAP_STATUS(FlushCopyWriterToConn(pg_conn, writer));
@@ -381,7 +382,7 @@ struct BindStream {
 
     if (PQputCopyEnd(pg_conn, NULL) <= 0) {
       return Status::IO("Error message returned by PQputCopyEnd: ",
-                        PQerrorMessage(pg_conn));
+                        PqErrorText(nullptr, pg_conn));
     }
 
     PGresult* result = PQgetResult(pg_conn);
@@ -412,7 +413,8 @@ struct BindStream {
     while (remaining > 0) {
       int64_t to_write = std::min<int64_t>(remaining, kMaxCopyBufferSize);
       if (PQputCopyData(pg_conn, data, to_write) <= 0) {
-        return Status::IO("Error writing tuple field data: ", PQerrorMessage(pg_conn));
+        return Status::IO("Error writing tuple field data: ",
+                          PqErrorText(nullptr, pg_conn));
       }
       remaining -= to_write;
       data += to_write;

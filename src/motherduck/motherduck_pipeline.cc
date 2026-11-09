@@ -59,7 +59,7 @@ constexpr const char* kAbortCommand = "ADBC_ABORT_PIPELINE";
 Status WaitForSocket(PGconn* conn, bool write) {
   const int socket = PQsocket(conn);
   if (socket < 0) {
-    return Status::IO("[libpq] Connection has no socket: ", PQerrorMessage(conn));
+    return Status::IO("[libpq] Connection has no socket: ", PqErrorText(nullptr, conn));
   }
 #ifdef _WIN32
   WSAPOLLFD fd = {};
@@ -136,7 +136,7 @@ Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_n
                    size_t max_in_flight) {
   if (PQenterPipelineMode(conn) != 1) {
     return MakeStatus(nullptr, "[libpq] Failed to enter pipeline mode: {}",
-                      PQerrorMessage(conn));
+                      PqErrorText(nullptr, conn));
   }
   // Without blocking, we can read results while commands are still going out.
   // Blocking writes deadlock once the server stops reading because it's
@@ -145,7 +145,7 @@ Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_n
   if (PQsetnonblocking(conn, 1) != 0) {
     Status status =
         MakeStatus(nullptr, "[libpq] Failed to make connection nonblocking: {}",
-                   PQerrorMessage(conn));
+                   PqErrorText(nullptr, conn));
     PQexitPipelineMode(conn);
     return status;
   }
@@ -163,7 +163,7 @@ Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_n
     if (PQpipelineSync(conn) != 1) {
       if (status.ok()) {
         status = MakeStatus(nullptr, "[libpq] Failed to sync pipeline: {}",
-                            PQerrorMessage(conn));
+                            PqErrorText(nullptr, conn));
       }
       return false;
     }
@@ -175,7 +175,7 @@ Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_n
     const int flushed = PQflush(conn);
     if (flushed < 0) {
       status = MakeStatus(nullptr, "[libpq] Failed to send pipeline: {}",
-                          PQerrorMessage(conn));
+                          PqErrorText(nullptr, conn));
       break;
     }
 
@@ -213,7 +213,7 @@ Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_n
         // Without a sync, the server holds results back until asked.
         if (PQsendFlushRequest(conn) != 1) {
           status = MakeStatus(nullptr, "[libpq] Failed to send pipeline: {}",
-                              PQerrorMessage(conn));
+                              PqErrorText(nullptr, conn));
           break;
         }
         queued = true;
@@ -224,7 +224,7 @@ Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_n
     // the rest from being sent.
     if (PQconsumeInput(conn) != 1) {
       status = MakeStatus(nullptr, "[libpq] Failed to read pipeline results: {}",
-                          PQerrorMessage(conn));
+                          PqErrorText(nullptr, conn));
       break;
     }
     bool progressed = false;
@@ -286,14 +286,14 @@ Status RunPipeline(PGconn* conn, const std::function<Status(bool* sent)>& send_n
 
   if (PQsetnonblocking(conn, 0) != 0 && status.ok()) {
     status = MakeStatus(nullptr, "[libpq] Failed to restore blocking mode: {}",
-                        PQerrorMessage(conn));
+                        PqErrorText(nullptr, conn));
   }
   if (done && ended_copy_in) AbsorbStraySync(conn);
   // Exiting only fails if results are still pending, i.e. we gave up on the
   // connection above, in which case the earlier error is the useful one.
   if (PQexitPipelineMode(conn) != 1 && status.ok()) {
     status = MakeStatus(nullptr, "[libpq] Failed to exit pipeline mode: {}",
-                        PQerrorMessage(conn));
+                        PqErrorText(nullptr, conn));
   }
   if (was_nonblocking) PQsetnonblocking(conn, 1);
   return status;
@@ -389,7 +389,7 @@ Status SendCurrentRow(BindStream* stream, PGconn* conn, int result_format) {
                           stream->param_values.data(), stream->param_lengths.data(),
                           stream->param_formats.data(), result_format) != 1) {
     return MakeStatus(nullptr, "[libpq] Failed to send prepared statement: {}",
-                      PQerrorMessage(conn));
+                      PqErrorText(nullptr, conn));
   }
   return Status::Ok();
 }

@@ -496,7 +496,7 @@ AdbcStatusCode PostgresConnection::Commit(struct AdbcError* error) {
   PGresult* result = PQexec(conn_, "COMMIT");
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
     AdbcStatusCode code =
-        MakeStatus(result, "[libpq] Failed to commit: {}", PQerrorMessage(conn_))
+        MakeStatus(result, "[libpq] Failed to commit: {}", PqErrorText(nullptr, conn_))
             .ToAdbc(error);
     PQclear(result);
     return code;
@@ -521,8 +521,8 @@ AdbcStatusCode PostgresConnection::EnsureTransaction(struct AdbcError* error) {
 
   PGresult* result = PQexec(conn_, "BEGIN TRANSACTION");
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
-    InternalAdbcSetError(error, "%s%s",
-                         "[libpq] Failed to begin transaction: ", PQerrorMessage(conn_));
+    InternalAdbcSetError(error, "%s%s", "[libpq] Failed to begin transaction: ",
+                         PqErrorText(nullptr, conn_));
     PQclear(result);
     return ADBC_STATUS_IO;
   }
@@ -1187,7 +1187,7 @@ AdbcStatusCode PostgresConnection::Rollback(struct AdbcError* error) {
   PGresult* result = PQexec(conn_, "ROLLBACK");
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
     InternalAdbcSetError(error, "%s%s",
-                         "[libpq] Failed to rollback: ", PQerrorMessage(conn_));
+                         "[libpq] Failed to rollback: ", PqErrorText(nullptr, conn_));
     PQclear(result);
     return ADBC_STATUS_IO;
   }
@@ -1223,7 +1223,7 @@ AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
         PGresult* result = PQexec(conn_, "COMMIT");
         if (PQresultStatus(result) != PGRES_COMMAND_OK) {
           InternalAdbcSetError(error, "%s%s", "[libpq] Failed to update autocommit: ",
-                               PQerrorMessage(conn_));
+                               PqErrorText(nullptr, conn_).c_str());
           PQclear(result);
           return ADBC_STATUS_IO;
         }
@@ -1242,7 +1242,7 @@ AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
     char* value_esc = PQescapeIdentifier(conn_, value, strlen(value));
     if (!value_esc) {
       InternalAdbcSetError(error, "[libpq] Could not escape identifier: %s",
-                           PQerrorMessage(conn_));
+                           PqErrorText(nullptr, conn_).c_str());
       return ADBC_STATUS_INTERNAL;
     }
     std::string query = fmt::format("SET search_path TO {}", value_esc);
