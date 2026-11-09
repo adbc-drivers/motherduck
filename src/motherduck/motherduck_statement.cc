@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <nanoarrow/nanoarrow.h>
@@ -36,7 +37,12 @@ namespace {
 // The endpoint can't prepare a query like SELECT $1, whose result types depend
 // on its parameters, and ignores parameter types sent with the prepare (#17).
 bool IsAmbiguousParameterError(const Status& status) {
-  return status.message().find("ambiguous result column types") != std::string::npos;
+  // Only the first line, the server's error: later ones echo the query, which
+  // may contain the phrase itself.
+  const std::string message = status.message();
+  return std::string_view(message)
+             .substr(0, message.find('\n'))
+             .find("ambiguous result column types") != std::string_view::npos;
 }
 
 // The type to cast a parameter of this type and Arrow schema to, or "" for none.

@@ -1789,6 +1789,21 @@ TEST_F(PostgresStatementTest, MotherDuckTypesResolve) {
             "{'a': 1}");
 }
 
+// A query that quotes the typing error must still report its own error.
+TEST_F(PostgresStatementTest, MotherDuckPrepareErrorQuotingTypingError) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, "SELECT missing_col -- ambiguous result column types", &error),
+      IsOkStatus(&error));
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcStatementExecuteSchema(&statement, schema.get(), &error),
+              ::testing::Not(IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error)));
+  ASSERT_THAT(AdbcStatementGetParameterSchema(&statement, schema.get(), &error),
+              ::testing::Not(IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error)));
+}
+
 // The endpoint can't type a parameter that decides a result column's type, so
 // the driver casts it to the type of its bound value (#17). Check each type it
 // casts round-trips through SELECT $1.
