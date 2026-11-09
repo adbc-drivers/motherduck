@@ -23,14 +23,16 @@ namespace adbcpq {
 
 /// \brief Mask credentials in SQL text before it goes into an error message.
 ///
-/// A crude scan of the raw text, ignoring quoting and comments, so it also sees inside
-/// literals, comments and $$ bodies. At the first trigger everything after it is
-/// dropped:
-///  - CREATE/ALTER ... SECRET: from the first '(' on becomes "(...)".
-///  - A name with a secret, token, password or key part followed by '=', ':', TO or a
-///    string (name = v, name TO v, PASSWORD 'v'): the value and the rest are dropped.
-///  - user:password@ in a URL: the password and the rest are dropped.
-/// This favours masking too much over leaking. Other text is returned unchanged.
+/// A few regexes over the raw text, ignoring quoting and comments, so they also see
+/// inside literals, comments and $$ bodies. At the first match everything after the kept
+/// part is dropped and " ..." is appended:
+///  - CREATE/ALTER ... SECRET: kept up to SECRET.
+///  - A name containing secret, token, pass, key or similar, followed by '=', ':', TO, a
+///    quote, '(' or a comment opener: kept up to the name.
+///  - user:password@ in a URL, and md:<token>@db.
+///  - source_code and config arguments of md_create_flight.
+/// This favours masking too much over leaking (`WHERE key = 5` is masked). Other text is
+/// returned unchanged.
 std::string RedactSecretStatements(std::string_view query);
 
 /// \brief Install RedactSecretStatements as the driver's error-message query redactor.

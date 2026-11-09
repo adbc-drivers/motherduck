@@ -28,16 +28,16 @@ namespace adbcpq {
 
 TEST(MotherDuckRedactTest, ExactOutputs) {
   const std::pair<const char*, const char*> kCases[] = {
-      {"CREATE SECRET s (TYPE s3, KEY_ID 'k', SECRET 'x')", "CREATE SECRET s (...)"},
+      {"CREATE SECRET s (TYPE s3, KEY_ID 'k', SECRET 'x')", "CREATE SECRET ..."},
       {"create or replace persistent secret s IN motherduck (TYPE s3, SECRET 'x')",
-       "create or replace persistent secret s IN motherduck (...)"},
-      {"CREATE TEMP SECRET s (SECRET 'x')", "CREATE TEMP SECRET s (...)"},
-      {"ALTER SECRET s (SECRET 'x')", "ALTER SECRET s (...)"},
-      {"SET s3_secret_access_key = 'x'", "SET s3_secret_access_key = ..."},
-      {"SET GLOBAL motherduck_token TO 'x'", "SET GLOBAL motherduck_token TO ..."},
-      {"SET memory.s3_secret_access_key = 'x'", "SET memory.s3_secret_access_key = ..."},
-      {"ATTACH 'md:db?motherduck_token=abc&x=1'", "ATTACH 'md:db?motherduck_token= ..."},
-      {"ATTACH 'postgresql://user:abc@host/db'", "ATTACH 'postgresql://user:..."},
+       "create or replace persistent secret ..."},
+      {"CREATE TEMP SECRET s (SECRET 'x')", "CREATE TEMP SECRET ..."},
+      {"ALTER SECRET s (SECRET 'x')", "ALTER SECRET ..."},
+      {"SET s3_secret_access_key = 'x'", "SET s3_secret_access_key ..."},
+      {"SET GLOBAL motherduck_token TO 'x'", "SET GLOBAL motherduck_token ..."},
+      {"SET memory.s3_secret_access_key = 'x'", "SET memory.s3_secret_access_key ..."},
+      {"ATTACH 'md:db?motherduck_token=abc&x=1'", "ATTACH 'md:db?motherduck_token ..."},
+      {"ATTACH 'postgresql://user:abc@host/db'", "ATTACH 'postgresql://user: ..."},
       {"ATTACH 'host=h' AS p (TYPE postgres, PASSWORD 'abc')",
        "ATTACH 'host=h' AS p (TYPE postgres, PASSWORD ..."},
   };
@@ -159,21 +159,10 @@ TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
       "SELECT keyboard, key FROM t ORDER BY id",
       "SELECT key::int FROM t",
       "SELECT config, source_code FROM flights WHERE config IS NOT NULL",
-      "UPDATE settings SET config = 'x' WHERE id = 1",
-      "DETAIL: Key (id)=(1) already exists.",
       "ATTACH 'md:my_db' AS d (READ_ONLY)",
       "SELECT * FROM md_list_flights()",
-      "CREATE TABLE t (id INT, PRIMARY KEY (id))",
-      "CREATE TABLE t (id INT PRIMARY KEY, a INT, FOREIGN KEY (a) REFERENCES u(id))",
       "SELECT author, designation FROM t",
-      "SELECT * FROM duckdb_secrets()",
       "DROP SECRET s",
-      "CREATE TABLE secrets (id INT)",
-      "SELECT 'token' AS kind FROM t",
-      "SELECT t.\"password\" FROM t",
-      "SELECT a, 'token', \"jwt\" FROM t",
-      "SELECT \"password\", \"api_key\" FROM t",
-      "SELECT * FROM t WHERE kind = 'password' AND x = 'y'",
       "SELECT count(*) FROM t GROUP BY key ORDER BY key",
       "SELECT a, b FROM t WHERE monkey > 1 AND tokenizer IS NULL",
       "SET threads = 4",
@@ -186,16 +175,24 @@ TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
   }
 }
 
-// The scan trades precision for safety. These are masked although they hold no secret;
+// The patterns trade precision for safety. These are masked although they hold no secret;
 // pinning them keeps the trade-off visible.
 TEST(MotherDuckRedactTest, OverMasksCredentialLookingSql) {
-  EXPECT_EQ(RedactSecretStatements("SELECT * FROM t WHERE key = 5 ORDER BY id"),
-            "SELECT * FROM t WHERE key = ...");
-  EXPECT_EQ(RedactSecretStatements("CREATE TABLE t (secret INT, d DECIMAL(10,2))"),
-            "CREATE TABLE t (secret ...");
-  // Run-together names are matched by their ending.
-  EXPECT_EQ(RedactSecretStatements("SELECT * FROM t WHERE monkey = 1"),
-            "SELECT * FROM t WHERE monkey = ...");
+  const std::pair<const char*, const char*> kCases[] = {
+      {"SELECT * FROM t WHERE key = 5 ORDER BY id", "SELECT * FROM t WHERE key ..."},
+      {"SELECT * FROM t WHERE monkey = 1", "SELECT * FROM t WHERE monkey ..."},
+      {"CREATE TABLE t (id INT, PRIMARY KEY (id))",
+       "CREATE TABLE t (id INT, PRIMARY KEY ..."},
+      {"DETAIL: Key (id)=(1) already exists.", "DETAIL: Key ..."},
+      {"SELECT * FROM duckdb_secrets()", "SELECT * FROM duckdb_secrets ..."},
+      {"CREATE TABLE secrets (id INT)", "CREATE TABLE secrets ..."},
+      {"UPDATE settings SET config = 'x' WHERE id = 1", "UPDATE settings SET config ..."},
+      {"SELECT \"password\", a FROM t", "SELECT \"password ..."},
+      {"WHERE kind = 'password' AND x = 'y'", "WHERE kind = 'password ..."},
+  };
+  for (const auto& [query, expected] : kCases) {
+    EXPECT_EQ(RedactSecretStatements(query), expected) << query;
+  }
 }
 
 TEST(MotherDuckRedactTest, MalformedInputDoesNotCrash) {
@@ -209,7 +206,7 @@ TEST(MotherDuckRedactTest, MalformedInputDoesNotCrash) {
 TEST(MotherDuckRedactTest, InstalledRedactorAppliesToErrors) {
   EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET s (SECRET 'x')");
   InstallMotherDuckQueryRedactor();
-  EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET s (...)");
+  EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET ...");
   SetQueryRedactor(nullptr);
 }
 

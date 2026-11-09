@@ -16,9 +16,11 @@
 
 #include "motherduck_redact.h"
 
-#include <cctype>
-#include <optional>
+#include <algorithm>
+#include <regex>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "error.h"
 
@@ -26,236 +28,51 @@ namespace adbcpq {
 
 namespace {
 
-// Deliberately crude: the scan looks at raw text and ignores quoting, so it also sees
-// inside string literals, comments and $$ bodies. When it can't be sure, it masks more.
+// Deliberately crude: each pattern looks at raw text, ignoring quoting and comments, and
+// the first match anywhere cuts the text there. Group 1 is the part kept. Over-masking is
+// fine; leaking is not. Loops are bounded because the input is already truncated and
+// libstdc++'s matcher recurses once per iteration.
 
-struct Cut {
-  size_t at;  // keep text[0, at)
-  const char* suffix;
-};
-
-bool IsIdentChar(char c) {
-  return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.' ||
-         c == '$' || static_cast<unsigned char>(c) >= 0x80;
-}
-
-bool EqualsNoCase(std::string_view a, std::string_view b) {
-  if (a.size() != b.size()) return false;
-  for (size_t i = 0; i < a.size(); i++) {
-    if (std::toupper(static_cast<unsigned char>(a[i])) != b[i]) return false;
-  }
-  return true;  // b is upper case
-}
-
-bool EndsWithNoCase(std::string_view a, std::string_view upper_suffix) {
-  return a.size() >= upper_suffix.size() &&
-         EqualsNoCase(a.substr(a.size() - upper_suffix.size()), upper_suffix);
-}
-
-// Whether any '_' or '.' separated part of the name is a credential word, so that
-// s3_access_key_id counts but monkey and tokenizer don't. For the common words the
-// ending is enough, so run-together names such as AccountKey, sslpassword and apikey
-// count too.
-bool IsCredentialName(std::string_view name) {
-  for (size_t i = 0; i + 17 <= name.size(); i++) {
-    if (EqualsNoCase(name.substr(i, 17), "CONNECTION_STRING")) return true;
-  }
-  size_t start = 0;
-  while (start <= name.size()) {
-    size_t end = name.find_first_of("_.$", start);
-    if (end == std::string_view::npos) end = name.size();
-    const std::string_view part = name.substr(start, end - start);
-    for (const char* word : {"SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE",
-                             "PASS", "KEY", "SIGNATURE", "BEARER", "JWT", "COOKIE"}) {
-      if (EndsWithNoCase(part, word)) return true;
-    }
-    for (const char* word : {"PWD", "PW", "SIG", "SAS", "AUTH", "AUTHORIZATION",
-                             "CREDENTIAL", "CREDENTIALS", "SLT", "DSN"}) {
-      if (EqualsNoCase(part, word)) return true;
-    }
-    start = end + 1;
-  }
-  return false;
-}
-
-// An unclosed comment doesn't hide the rest of the text: skip only its opener, so what
-// follows is still scanned as if the comment weren't there.
-size_t SkipSpaceAndComments(std::string_view t, size_t i) {
-  while (i < t.size()) {
-    if (std::isspace(static_cast<unsigned char>(t[i]))) {
-      i++;
-    } else if (t.compare(i, 2, "/*") == 0) {
-      const size_t end = t.find("*/", i + 2);
-      i = end == std::string_view::npos ? i + 2 : end + 2;
-    } else if (t.compare(i, 2, "--") == 0) {
-      const size_t end = t.find('\n', i);
-      i = end == std::string_view::npos ? i + 2 : end + 1;
-    } else {
-      break;
-    }
-  }
-  return i;
-}
-
-bool IsQuote(char c) { return c == '\'' || c == '"'; }
-
-// Whether the quote just before the name starts a quoted identifier, as in "token". A
-// quote that follows a word or another quote ('u'PASSWORD) ends a literal instead.
-bool OpensQuotedName(std::string_view t, size_t start) {
-  if (start == 0 || !IsQuote(t[start - 1])) return false;
-  if (start == 1) return true;
-  const char before = t[start - 2];
-  return before == '.' || !(IsIdentChar(before) || IsQuote(before));
-}
-
-// After a credential name t[start, i): is a value about to follow (name = v, name TO v,
-// name: v, name 'v', name"v")? A quoted name ("token") has its closing quote right after
-// it; any other quote glued to the name is already the value.
-std::optional<Cut> ValueAfterName(std::string_view t, size_t start, size_t i) {
-  const std::string_view name = t.substr(start, i - start);
-  if (i < t.size() && IsQuote(t[i])) {
-    if (!OpensQuotedName(t, start) || t[start - 1] != t[i]) return Cut{i, "..."};
-    i++;
-  }
-  const size_t k = SkipSpaceAndComments(t, i);
-  if (k >= t.size()) return std::nullopt;
-  const char c = t[k];
-  if (c == '=') return Cut{k + 1, " ..."};
-  if (c == ':' && !(k + 1 < t.size() && t[k + 1] == ':')) return Cut{k + 1, " ..."};
-  if (IsQuote(c)) return Cut{k, "..."};
-  // add_parquet_key('name', 'key'). Not for a bare KEY, as in PRIMARY KEY (id).
-  if (c == '(' && !EqualsNoCase(name, "KEY")) return Cut{k + 1, "...)"};
-  if ((c == 't' || c == 'T') && k + 1 < t.size() &&
-      (t[k + 1] == 'o' || t[k + 1] == 'O') &&
-      !(k + 2 < t.size() && IsIdentChar(t[k + 2]))) {
-    return Cut{k + 2, " ..."};
-  }
-  return std::nullopt;
-}
-
-// scheme://user:password@host: cut after the colon.
-std::optional<Cut> UserinfoPassword(std::string_view t, size_t i) {
-  size_t colon = std::string_view::npos;
-  for (size_t j = i + 3; j < t.size(); j++) {
-    if (std::string_view("/?#'\" \t\r\n").find(t[j]) != std::string_view::npos) break;
-    if (t[j] == ':' && colon == std::string_view::npos) colon = j;
-    if (t[j] == '@') {
-      if (colon != std::string_view::npos) return Cut{colon + 1, "..."};
-      break;
-    }
-  }
-  return std::nullopt;
-}
-
-// md:<token>@database (also motherduck:<token>@database, with optional space after the
-// colon): cut after the scheme. i is the index of the ':'.
-std::optional<Cut> TokenBeforeAt(std::string_view t, size_t i) {
-  for (size_t j = SkipSpaceAndComments(t, i + 1); j < t.size(); j++) {
-    if (std::string_view("/?'\" \t\r\n;").find(t[j]) != std::string_view::npos) break;
-    if (t[j] == '@') return Cut{i + 1, "..."};
-  }
-  return std::nullopt;
-}
-
-// md_create_flight(source_code := ..., config => ...) carry free-form payloads. A config
-// column is left alone, so config needs the named-argument forms; source_code also takes
-// a plain '=', as a mistyped call would still echo the code in its error.
-std::optional<Cut> PayloadArgument(std::string_view t, std::string_view word, size_t i) {
-  const bool source_code = EqualsNoCase(word, "SOURCE_CODE");
-  if (!source_code && !EqualsNoCase(word, "CONFIG")) return std::nullopt;
-  const size_t k = SkipSpaceAndComments(t, i);
-  if (k + 1 < t.size() &&
-      ((t[k] == ':' && t[k + 1] == '=') || (t[k] == '=' && t[k + 1] == '>'))) {
-    return Cut{k + 2, " ..."};
-  }
-  if (source_code && k < t.size() && t[k] == '=') return Cut{k + 1, " ..."};
-  return std::nullopt;
-}
-
-// Postgres unique-violation detail: Key (col, ...)=(value, ...). Cut after the '=' if any
-// column looks like a credential. i is the index just past the word Key.
-std::optional<Cut> KeyDetail(std::string_view t, size_t i) {
-  const size_t open = SkipSpaceAndComments(t, i);
-  if (open >= t.size() || t[open] != '(') return std::nullopt;
-  const size_t close = t.find(')', open);
-  if (close == std::string_view::npos) return std::nullopt;
-  const size_t eq = SkipSpaceAndComments(t, close + 1);
-  if (eq >= t.size() || t[eq] != '=') return std::nullopt;
-  size_t j = open + 1;
-  while (j < close) {
-    if (!IsIdentChar(t[j])) {
-      j++;
-      continue;
-    }
-    const size_t start = j;
-    while (j < close && IsIdentChar(t[j])) j++;
-    if (IsCredentialName(t.substr(start, j - start))) return Cut{eq + 1, " ..."};
-  }
-  return std::nullopt;
-}
-
-// Find the first place that needs masking. Everything after it is dropped.
-std::optional<Cut> FindCut(std::string_view t) {
-  bool create_or_alter_seen = false;
-  std::string_view last_word;
-  size_t i = 0;
-  while (i < t.size()) {
-    if (!IsIdentChar(t[i])) {
-      if (t.compare(i, 3, "://") == 0) {
-        if (auto cut = UserinfoPassword(t, i)) return cut;
-      } else if (t[i] == ':' && (EqualsNoCase(last_word, "MD") ||
-                                 EqualsNoCase(last_word, "MOTHERDUCK"))) {
-        if (auto cut = TokenBeforeAt(t, i)) return cut;
-      }
-      last_word = {};
-      i++;
-      continue;
-    }
-    const size_t start = i;
-    while (i < t.size() && IsIdentChar(t[i])) i++;
-    const std::string_view word = t.substr(start, i - start);
-    last_word = word;
-
-    if (EqualsNoCase(word, "CREATE") || EqualsNoCase(word, "ALTER")) {
-      create_or_alter_seen = true;
-    } else if (create_or_alter_seen && EqualsNoCase(word, "SECRET")) {
-      // CREATE [OR REPLACE] [PERSISTENT|TEMPORARY] SECRET name (options)
-      // Keep the header up to '(' only if it is just a name and IN <storage>. Anything
-      // else there (a string, a comment, ';') means the options aren't where we expect
-      // them.
-      const size_t paren = t.find('(', i);
-      if (paren != std::string_view::npos) {
-        bool header_only = true;
-        for (size_t j = i; j < paren; j++) {
-          const char c = t[j];
-          if (!IsIdentChar(c) && c != '"' &&
-              !std::isspace(static_cast<unsigned char>(c))) {
-            header_only = false;
-            break;
-          }
-        }
-        if (header_only) return Cut{paren + 1, "...)"};
-      }
-      return Cut{i, " ..."};
-    }
-    if (auto cut = PayloadArgument(t, word, i)) return cut;
-    if (EqualsNoCase(word, "KEY")) {
-      if (auto cut = KeyDetail(t, i)) return cut;
-    }
-    if (IsCredentialName(word)) {
-      if (auto cut = ValueAfterName(t, start, i)) return cut;
-    }
-  }
-  return std::nullopt;
+const std::vector<std::regex>& Patterns() {
+  static const std::vector<std::regex> patterns = [] {
+    constexpr auto kFlags = std::regex::ECMAScript | std::regex::icase;
+    // A word that marks a name as a credential, as part of the name (api_key, monkey).
+    // The short words must be a whole part, so author and design don't count.
+    const std::string credential =
+        "(?:(?:secret|token|pass|key|signature|bearer|jwt|cookie|connection_string)"
+        "|(?:^|[^a-z])(?:pwd|pw|sig|sas|auth|authorization|credentials?|slt|dsn)(?![a-z])"
+        ")";
+    return std::vector<std::regex>{
+        // CREATE [OR REPLACE] [PERSISTENT] SECRET <name> (options): drop the name too.
+        std::regex(R"((\b(?:create|alter)\b[\s\S]{0,200}?\bsecret\b))", kFlags),
+        // name = v, name TO v, name: v, PASSWORD 'v', name(v), or a comment hiding one.
+        std::regex(
+            "(" + credential + R"([\w.$]{0,64})\s*(?:=|:(?!:)|\bto\b|["'(]|/\*|--))",
+            kFlags),
+        // scheme://user:password@host
+        std::regex(R"((://[^\s'"@/]{0,128}:)[^\s'"@]{0,256}@)", kFlags),
+        // md:<token>@database, motherduck:<token>@database
+        std::regex(R"((\b(?:md|motherduck):)[^'"@]{0,512}@)", kFlags),
+        // md_create_flight(source_code := ..., config => ...): free-form payloads.
+        std::regex(R"((\b(?:source_code|config))\s*(?::=|=>?|/\*|--))", kFlags),
+    };
+  }();
+  return patterns;
 }
 
 }  // namespace
 
 std::string RedactSecretStatements(std::string_view query) {
-  if (auto cut = FindCut(query)) {
-    return std::string(query.substr(0, cut->at)) + cut->suffix;
+  const std::string text(query);
+  size_t cut = text.size();
+  bool found = false;
+  for (const std::regex& pattern : Patterns()) {
+    std::smatch match;
+    if (!std::regex_search(text, match, pattern)) continue;
+    cut = std::min(cut, static_cast<size_t>(match.position(1) + match.length(1)));
+    found = true;
   }
-  return std::string(query);
+  return found ? text.substr(0, cut) + " ..." : text;
 }
 
 void InstallMotherDuckQueryRedactor() { SetQueryRedactor(&RedactSecretStatements); }
