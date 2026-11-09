@@ -31,8 +31,8 @@ class TestConnection(adbc_drivers_validation.tests.connection.TestConnection):
     @pytest.fixture(scope="class")
     @classmethod
     def get_objects_table(cls, driver, conn):
-        # It ingests, which needs COPY FROM STDIN (ECO-587).
-        pytest.skip("Needs COPY FROM STDIN (ECO-587)")
+        # It ingests, which needs COPY FROM STDIN (#31).
+        pytest.skip("Needs COPY FROM STDIN (#31)")
 
 
 def pytest_generate_tests(metafunc) -> None:
