@@ -22,5 +22,14 @@
 
 // part: metadata
 
+# MotherDuck's TIME takes no precision parameter ("Type 'TIME' does not
+# take any type parameters"), so the table uses plain TIME.
 [tags]
 sql-type-name = "time"
+
+// part: setup_query
+
+CREATE TABLE test_time (
+    idx INT,
+    res TIME
+);
