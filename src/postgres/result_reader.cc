@@ -194,7 +194,7 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
     UNWRAP_ERRNO(Internal,
                  type_resolver_->FindWithDefault(helper_.FieldType(i), &child_type));
 
-    child_type = child_type.WithFieldName(helper_.FieldName(i))
+    child_type = child_type.WithFieldName(ResultColumnName(helper_.FieldName(i)))
                      .WithTypeModifier(helper_.FieldTypeModifier(i));
     UNWRAP_ERRNO(Internal, child_type.SetSchema(schema_->children[i], vendor_name_));
 

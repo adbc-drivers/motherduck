@@ -118,6 +118,26 @@ TEST(CastParametersTest, SkipsNonParameters) {
             R"(SELECT 'a\', $1)");
 }
 
+TEST(UncastParametersTest, Uncasts) {
+  const std::vector<std::string> types = {"int4", "", "numeric(10, 5)"};
+  EXPECT_EQ(UncastParameters("CAST($1 AS INTEGER)", types), "$1");
+  EXPECT_EQ(UncastParameters("(CAST($1 AS INTEGER) + 1)", types), "($1 + 1)");
+  EXPECT_EQ(UncastParameters("CAST($3 AS DECIMAL(10,5))", types), "$3");
+  EXPECT_EQ(
+      UncastParameters("f(CAST($1 AS INTEGER[]), CAST($3 AS DECIMAL(10,5)))", types),
+      "f($1, $3)");
+}
+
+TEST(UncastParametersTest, LeavesOthers) {
+  const std::vector<std::string> types = {"int4", ""};
+  // Parameters that weren't cast, or past the bound ones
+  EXPECT_EQ(UncastParameters("CAST($2 AS INTEGER)", types), "CAST($2 AS INTEGER)");
+  EXPECT_EQ(UncastParameters("CAST($3 AS INTEGER)", types), "CAST($3 AS INTEGER)");
+  EXPECT_EQ(UncastParameters("CAST(x AS INTEGER)", types), "CAST(x AS INTEGER)");
+  EXPECT_EQ(UncastParameters("CAST($1 AS INTEGER", types), "CAST($1 AS INTEGER");
+  EXPECT_EQ(UncastParameters("v", types), "v");
+}
+
 TEST(IsCopyStatementTest, Copy) {
   EXPECT_TRUE(IsCopyStatement("COPY t FROM STDIN"));
   EXPECT_TRUE(IsCopyStatement("copy (SELECT 1) TO STDOUT"));

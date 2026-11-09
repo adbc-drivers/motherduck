@@ -724,6 +724,12 @@ AdbcStatusCode PostgresStatement::ExecuteSchema(struct ArrowSchema* schema,
   CHECK_NA(INTERNAL,
            output_type.SetSchema(tmp.get(), std::string(connection_->VendorName())),
            error);
+  for (int64_t i = 0; i < tmp->n_children; i++) {
+    CHECK_NA(INTERNAL,
+             ArrowSchemaSetName(tmp->children[i],
+                                ResultColumnName(tmp->children[i]->name).c_str()),
+             error);
+  }
 
   tmp.move(schema);
   return ADBC_STATUS_OK;

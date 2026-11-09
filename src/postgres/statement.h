@@ -178,6 +178,8 @@ class PostgresStatement {
   virtual Status PrepareQuery(PGconn* conn, const std::string& query,
                               const std::vector<Oid>& param_oids,
                               const struct ArrowSchema* bind_schema);
+  // The name ExecuteSchema gives a result column the server named name
+  virtual std::string ResultColumnName(std::string name) const { return name; }
   const PostgresTypeResolver& type_resolver() const { return *type_resolver_; }
 
  private:

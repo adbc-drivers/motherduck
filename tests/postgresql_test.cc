@@ -1804,6 +1804,170 @@ TEST_F(PostgresStatementTest, MotherDuckPrepareErrorQuotingTypingError) {
               ::testing::Not(IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error)));
 }
 
+// The cast retry depends on the endpoint's wording for this error. If this
+// fails, update IsAmbiguousParameterError in motherduck_statement.cc.
+TEST_F(PostgresStatementTest, MotherDuckAmbiguousParameterErrorWording) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
+              IsOkStatus(&error));
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcStatementExecuteSchema(&statement, schema.get(), &error),
+              IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
+}
+
+// Bind one row of an int32 and a string to query and return the result.
+void ExecuteCastQuery(struct AdbcConnection* connection, struct AdbcStatement* statement,
+                      const char* query, const char* string_value,
+                      adbc_validation::StreamReader* reader,
+                      nanoarrow::UniqueSchema* schema, struct AdbcError* error) {
+  nanoarrow::UniqueSchema bind_schema;
+  nanoarrow::UniqueArray bind;
+  struct ArrowError na_error;
+  ASSERT_THAT(
+      adbc_validation::MakeSchema(
+          bind_schema.get(), {{"a", NANOARROW_TYPE_INT32}, {"b", NANOARROW_TYPE_STRING}}),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT((adbc_validation::MakeBatch<int32_t, std::string>(
+                  bind_schema.get(), bind.get(), &na_error, {1}, {string_value})),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementNew(connection, statement, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(statement, query, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementBind(statement, bind.get(), bind_schema.get(), error),
+              IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementExecuteSchema(statement, schema->get(), error),
+              IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(statement, &reader->stream.value,
+                                        &reader->rows_affected, error),
+              IsOkStatus(error));
+  ASSERT_NO_FATAL_FAILURE(reader->GetSchema());
+}
+
+// Result columns are named as if the parameters weren't cast.
+TEST_F(PostgresStatementTest, MotherDuckCastParameterColumnNames) {
+  adbc_validation::StreamReader reader;
+  nanoarrow::UniqueSchema schema;
+  ASSERT_NO_FATAL_FAILURE(ExecuteCastQuery(
+      &connection, &statement, "SELECT $1, $1 + 1, $2", "x", &reader, &schema, &error));
+  for (const ArrowSchema* result : {schema.get(), &reader.schema.value}) {
+    ASSERT_EQ(result->n_children, 3);
+    EXPECT_STREQ(result->children[0]->name, "$1");
+    EXPECT_STREQ(result->children[1]->name, "($1 + 1)");
+    EXPECT_STREQ(result->children[2]->name, "$2");
+  }
+}
+
+// A string is cast only if the endpoint can't type the query otherwise, since
+// DuckDB won't mix a VARCHAR with, say, a DATE.
+TEST_F(PostgresStatementTest, MotherDuckCastsStringParametersLast) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement,
+          "CREATE OR REPLACE TABLE adbc_cast_test AS SELECT DATE '2020-01-01' AS d",
+          &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementRelease(&statement, &error), IsOkStatus(&error));
+
+  adbc_validation::StreamReader reader;
+  nanoarrow::UniqueSchema schema;
+  ASSERT_NO_FATAL_FAILURE(ExecuteCastQuery(
+      &connection, &statement,
+      "SELECT $1 AS v FROM adbc_cast_test WHERE greatest(d, $2) = DATE '2020-01-05'",
+      "2020-01-05", &reader, &schema, &error));
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->length, 1);
+
+  ASSERT_THAT(quirks()->DropTable(&connection, "adbc_cast_test", &error),
+              IsOkStatus(&error));
+}
+
+// If the cast query fails too, the error quotes the query as written.
+TEST_F(PostgresStatementTest, MotherDuckCastRetryErrorQuotesQuery) {
+  nanoarrow::UniqueSchema bind_schema;
+  nanoarrow::UniqueArray bind;
+  struct ArrowError na_error;
+  ASSERT_THAT(
+      adbc_validation::MakeSchema(
+          bind_schema.get(), {{"a", NANOARROW_TYPE_INT32}, {"b", NANOARROW_TYPE_INT64}}),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT((adbc_validation::MakeBatch<int32_t, int64_t>(bind_schema.get(), bind.get(),
+                                                            &na_error, {1}, {3})),
+              adbc_validation::IsOkErrno());
+
+  // A table function's arguments can't be parameters, cast or not.
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(&statement, "SELECT $1 AS v FROM range($2)", &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), bind_schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              ::testing::Not(IsOkStatus(&error)));
+  ASSERT_NE(error.message, nullptr);
+  EXPECT_THAT(error.message,
+              ::testing::HasSubstr("Query was: SELECT $1 AS v FROM range($2)"));
+  EXPECT_THAT(error.message,
+              ::testing::Not(::testing::HasSubstr("Query was: SELECT CAST(")));
+}
+
+// ExecuteUpdate resolves all-null parameters through the cast retry too.
+TEST_F(PostgresStatementTest, MotherDuckCastsNullParametersOnUpdate) {
+  nanoarrow::UniqueSchema bind_schema;
+  ArrowSchemaInit(bind_schema.get());
+  ASSERT_THAT(ArrowSchemaSetTypeStruct(bind_schema.get(), 2),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetType(bind_schema->children[0], NANOARROW_TYPE_INT32),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(bind_schema->children[0], "a"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetType(bind_schema->children[1], NANOARROW_TYPE_NA),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(bind_schema->children[1], "b"),
+              adbc_validation::IsOkErrno());
+
+  nanoarrow::UniqueArray bind;
+  ASSERT_THAT(ArrowArrayInitFromSchema(bind.get(), bind_schema.get(), nullptr),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowArrayStartAppending(bind.get()), adbc_validation::IsOkErrno());
+  for (int i = 0; i < 2; i++) {
+    ASSERT_THAT(ArrowArrayAppendInt(bind->children[0], i), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayAppendNull(bind->children[1], 1), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayFinishElement(bind.get()), adbc_validation::IsOkErrno());
+  }
+  ASSERT_THAT(ArrowArrayFinishBuildingDefault(bind.get(), nullptr),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1, $2", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), bind_schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+}
+
+// Parameters must be bound as a struct, as for ExecuteSchema.
+TEST_F(PostgresStatementTest, MotherDuckGetParameterSchemaRejectsNonStruct) {
+  nanoarrow::UniqueSchema bind_schema;
+  ArrowSchemaInit(bind_schema.get());
+  ASSERT_THAT(ArrowSchemaSetType(bind_schema.get(), NANOARROW_TYPE_INT32),
+              adbc_validation::IsOkErrno());
+  nanoarrow::UniqueArrayStream bind;
+  nanoarrow::EmptyArrayStream(bind_schema.get()).ToArrayStream(bind.get());
+
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBindStream(&statement, bind.get(), &error),
+              IsOkStatus(&error));
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcStatementGetParameterSchema(&statement, schema.get(), &error),
+              IsStatus(ADBC_STATUS_INVALID_STATE, &error));
+}
+
 // The endpoint can't type a parameter that decides a result column's type, so
 // the driver casts it to the type of its bound value (#17). Check each type it
 // casts round-trips through SELECT $1.

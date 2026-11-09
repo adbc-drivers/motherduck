@@ -49,6 +49,12 @@ bool IsCopyStatement(std::string_view statement);
 std::string CastParameters(std::string_view query, const std::vector<std::string>& types,
                            bool backslash_escapes = false);
 
+// Undo CastParameters in a result column name the server derived from the
+// cast query: each CAST($n AS ...) for a parameter types gives a type to
+// becomes $n again.
+std::string UncastParameters(std::string_view name,
+                             const std::vector<std::string>& types);
+
 // Whether every string literal on this connection takes backslash escapes
 // (standard_conforming_strings is off).
 bool BackslashEscapes(PGconn* conn);

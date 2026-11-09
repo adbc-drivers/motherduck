@@ -50,11 +50,14 @@ class MotherduckResultReader : public PqResultArrayReader {
   Status ExecuteAll(int64_t* affected_rows) override;
   Status PrepareWithParamTypes() override;
   Status ResolveNullParamTypes() override;
+  std::string ResultColumnName(std::string name) const override;
 
  private:
   std::string query_;
   // Whether the query only prepares with its parameters cast
   bool needs_param_casts_ = false;
+  // The casts the query was prepared with, if any
+  std::vector<std::string> param_casts_;
 };
 
 class MotherduckStatement : public PostgresStatement {
@@ -66,6 +69,11 @@ class MotherduckStatement : public PostgresStatement {
   Status PrepareQuery(PGconn* conn, const std::string& query,
                       const std::vector<Oid>& param_oids,
                       const struct ArrowSchema* bind_schema) override;
+  std::string ResultColumnName(std::string name) const override;
+
+ private:
+  // The casts the last query was prepared with, if any
+  std::vector<std::string> param_casts_;
 };
 
 }  // namespace adbcpq

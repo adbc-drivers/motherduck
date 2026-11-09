@@ -110,29 +110,89 @@ Status ParameterCastTypes(const PostgresTypeResolver& type_resolver,
 
 namespace {
 
-// Prepare query with each parameter cast to its bound type.
+// Prepare query with its parameters cast to types, reporting any error
+// against query rather than the cast query, which the user never wrote.
+Status PrepareCast(PGconn* conn, const std::string& query,
+                   const std::vector<std::string>& types,
+                   const std::vector<Oid>& param_oids) {
+  const std::string cast_query = CastParameters(query, types, BackslashEscapes(conn));
+  PGresult* result = PQprepare(conn, /*stmtName=*/"", cast_query.c_str(),
+                               static_cast<int>(param_oids.size()), param_oids.data());
+  Status status;
+  if (PQresultStatus(result) != PGRES_COMMAND_OK) {
+    status = MakeStatus(result,
+                        "Failed to prepare query with its parameters cast to their "
+                        "bound types: {}\nQuery was: {}",
+                        PQerrorMessage(conn), query.c_str());
+  }
+  PQclear(result);
+  return status;
+}
+
+bool IsTextCast(const std::string& type) {
+  return type == "text" || type.rfind("text[", 0) == 0;
+}
+
+// Prepare query with each parameter cast to its bound type, and set
+// *cast_types to the casts it was prepared with.
 Status PrepareWithParamCasts(PGconn* conn, const std::string& query,
                              const std::vector<Oid>& param_oids,
                              const struct ArrowSchema& bind_schema,
                              const PostgresTypeResolver& type_resolver,
-                             const std::vector<Oid>& null_param_oids) {
+                             const std::vector<Oid>& null_param_oids,
+                             std::vector<std::string>* cast_types) {
   std::vector<std::string> types;
   UNWRAP_STATUS(ParameterCastTypes(type_resolver, bind_schema, null_param_oids, &types));
-  return PqResultHelper(conn, CastParameters(query, types, BackslashEscapes(conn)))
-      .Prepare(param_oids);
+
+  // Leave strings uncast if that's enough: DuckDB won't compare a VARCHAR
+  // expression with a DATE or UUID column, say, which an uncast string can be
+  // inferred as.
+  std::vector<std::string> non_text = types;
+  bool any_text = false;
+  bool any_non_text = false;
+  for (std::string& type : non_text) {
+    if (IsTextCast(type)) {
+      type.clear();
+      any_text = true;
+    } else if (!type.empty()) {
+      any_non_text = true;
+    }
+  }
+  if (any_text && any_non_text) {
+    Status status = PrepareCast(conn, query, non_text, param_oids);
+    if (!IsAmbiguousParameterError(status)) {
+      *cast_types = std::move(non_text);
+      return status;
+    }
+  }
+  *cast_types = types;
+  return PrepareCast(conn, query, types, param_oids);
+}
+
+bool HasNullParams(const struct ArrowSchema& bind_schema) {
+  for (int64_t i = 0; i < bind_schema.n_children; i++) {
+    if (std::string_view(bind_schema.children[i]->format) == "n") return true;
+  }
+  return false;
 }
 
 }  // namespace
 
 Status MotherduckResultReader::PrepareWithParamTypes() {
   // Skip the uncast prepare if resolving all-null parameters showed it fails.
+  param_casts_.clear();
   if (!needs_param_casts_) {
     Status status = PqResultArrayReader::PrepareWithParamTypes();
     if (status.ok() || !IsAmbiguousParameterError(status)) return status;
   }
   return PrepareWithParamCasts(conn_, query_, bind_stream_->param_types,
                                bind_stream_->bind_schema.value, *type_resolver_,
-                               /*null_param_oids=*/bind_stream_->param_types);
+                               /*null_param_oids=*/bind_stream_->param_types,
+                               &param_casts_);
+}
+
+std::string MotherduckResultReader::ResultColumnName(std::string name) const {
+  return param_casts_.empty() ? name : UncastParameters(name, param_casts_);
 }
 
 Status MotherduckResultReader::ResolveNullParamTypes() {
@@ -140,9 +200,10 @@ Status MotherduckResultReader::ResolveNullParamTypes() {
   if (status.ok() || !IsAmbiguousParameterError(status)) return status;
   needs_param_casts_ = true;
   // Cast the parameters that have types, so the server can infer the rest.
+  std::vector<std::string> cast_types;
   status = PrepareWithParamCasts(conn_, query_, /*param_oids=*/{},
                                  bind_stream_->bind_schema.value, *type_resolver_,
-                                 /*null_param_oids=*/{});
+                                 /*null_param_oids=*/{}, &cast_types);
   // If it still can't, the all-null parameters are bound with their Arrow types.
   if (IsAmbiguousParameterError(status)) return Status::Ok();
   UNWRAP_STATUS(status);
@@ -227,6 +288,7 @@ std::unique_ptr<PqResultArrayReader> MotherduckStatement::MakeResultReader(
 Status MotherduckStatement::PrepareQuery(PGconn* conn, const std::string& query,
                                          const std::vector<Oid>& param_oids,
                                          const struct ArrowSchema* bind_schema) {
+  param_casts_.clear();
   Status status = PostgresStatement::PrepareQuery(conn, query, param_oids, bind_schema);
   if (status.ok() || !IsAmbiguousParameterError(status)) return status;
   if (bind_schema == nullptr) {
@@ -236,13 +298,19 @@ Status MotherduckStatement::PrepareQuery(PGconn* conn, const std::string& query,
         status.message());
   }
   status = PrepareWithParamCasts(conn, query, param_oids, *bind_schema, type_resolver(),
-                                 /*null_param_oids=*/{});
-  if (!IsAmbiguousParameterError(status)) return status;
+                                 /*null_param_oids=*/{}, &param_casts_);
+  if (!IsAmbiguousParameterError(status) || !HasNullParams(*bind_schema)) {
+    return status;
+  }
   // As when executing, cast all-null parameters the endpoint can't infer to text.
   const std::vector<Oid> text_oids(bind_schema->n_children,
                                    type_resolver().GetOID(PostgresTypeId::kText));
   return PrepareWithParamCasts(conn, query, param_oids, *bind_schema, type_resolver(),
-                               text_oids);
+                               text_oids, &param_casts_);
+}
+
+std::string MotherduckStatement::ResultColumnName(std::string name) const {
+  return param_casts_.empty() ? name : UncastParameters(name, param_casts_);
 }
 
 // MotherDuck answers DDL with an empty result set instead of a command tag.

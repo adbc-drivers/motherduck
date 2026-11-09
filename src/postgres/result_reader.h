@@ -107,6 +107,8 @@ class PqResultArrayReader {
   virtual Status ResolveNullParamTypes();
   // Reconcile the bind stream with the prepared statement's parameter types
   Status ReconcileWithPreparedParamTypes();
+  // The name to give a result column the server named name
+  virtual std::string ResultColumnName(std::string name) const { return name; }
 
   void ResetErrors() {
     ArrowErrorInit(&na_error_);

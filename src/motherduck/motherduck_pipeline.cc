@@ -547,7 +547,8 @@ std::string CastParameters(std::string_view query, const std::vector<std::string
       size_t number = 0;
       while (end < query.size() && std::isdigit(static_cast<unsigned char>(query[end]))) {
         // Saturate rather than overflow; no query has that many parameters.
-        number = number > (SIZE_MAX - 9) / 10 ? SIZE_MAX : number * 10 + (query[end] - '0');
+        number =
+            number > (SIZE_MAX - 9) / 10 ? SIZE_MAX : number * 10 + (query[end] - '0');
         end++;
       }
       if (number >= 1 && number <= types.size() && !types[number - 1].empty()) {
@@ -565,6 +566,42 @@ std::string CastParameters(std::string_view query, const std::vector<std::string
     }
   }
   out.append(query.substr(copied));
+  return out;
+}
+
+std::string UncastParameters(std::string_view name,
+                             const std::vector<std::string>& types) {
+  static constexpr std::string_view kCast = "CAST($";
+  static constexpr std::string_view kAs = " AS ";
+  std::string out;
+  size_t copied = 0;  // name[copied, i) has yet to be copied to out
+  size_t i = 0;
+  while ((i = name.find(kCast, i)) != std::string_view::npos) {
+    const size_t param = i + kCast.size() - 1;  // the $
+    size_t end = param + 1;
+    size_t number = 0;
+    while (end < name.size() && std::isdigit(static_cast<unsigned char>(name[end]))) {
+      number = number > (SIZE_MAX - 9) / 10 ? SIZE_MAX : number * 10 + (name[end] - '0');
+      end++;
+    }
+    if (end == param + 1 || number < 1 || number > types.size() ||
+        types[number - 1].empty() || name.substr(end, kAs.size()) != kAs) {
+      i++;
+      continue;
+    }
+    // Find the cast's closing parenthesis; the type may have its own.
+    int depth = 1;
+    size_t close = end + kAs.size();
+    for (; close < name.size() && depth > 0; close++) {
+      if (name[close] == '(') depth++;
+      if (name[close] == ')') depth--;
+    }
+    if (depth != 0) break;
+    out.append(name.substr(copied, i - copied));
+    out.append(name.substr(param, end - param));
+    copied = i = close;
+  }
+  out.append(name.substr(copied));
   return out;
 }
 
