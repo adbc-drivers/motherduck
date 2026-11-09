@@ -1012,6 +1012,12 @@ TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
       *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str());
   ASSERT_NE(schema, nullptr) << "schema " << quirks()->db_schema() << " not found";
 
+  // MotherDuck doesn't mark md_information_schema internal, but it isn't a
+  // user database.
+  EXPECT_EQ(InternalAdbcGetObjectsDataGetCatalogByName(*get_objects_data,
+                                                       "md_information_schema"),
+            nullptr);
+
   // DuckDB marks main internal in every database, so GetObjects filters on the
   // database. The system schemas live only in the internal system database.
   for (const char* system_schema : {"pg_catalog", "information_schema"}) {
@@ -1633,7 +1639,8 @@ TEST_F(PostgresConnectionTest, GetObjectsFiltersIgnoreCase) {
   }
 }
 
-// GetObjects reports UNIQUE and CHECK constraints along with keys.
+// GetObjects reports UNIQUE and CHECK constraints along with keys, including a
+// CHECK on no column.
 TEST_F(PostgresConnectionTest, GetObjectsFindsUniqueAndCheck) {
   ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
@@ -1641,7 +1648,8 @@ TEST_F(PostgresConnectionTest, GetObjectsFindsUniqueAndCheck) {
               IsOkStatus(&error));
   ASSERT_THAT(ExecuteSql(&database,
                          "CREATE TABLE adbc_unique_check_test (a INT UNIQUE, "
-                         "b INT CHECK (b > 0), c INT, UNIQUE (c, a))",
+                         "b INT CHECK (b > 0), c INT, UNIQUE (c, a), "
+                         "CHECK (random() >= 0))",
                          &error),
               IsOkStatus(&error));
 
@@ -1676,9 +1684,9 @@ TEST_F(PostgresConnectionTest, GetObjectsFindsUniqueAndCheck) {
   }
   using Constraint = std::pair<std::string, std::vector<std::string>>;
   EXPECT_THAT(constraints,
-              ::testing::UnorderedElementsAre(Constraint{"UNIQUE", {"a"}},
-                                              Constraint{"UNIQUE", {"c", "a"}},
-                                              Constraint{"CHECK", {"b"}}));
+              ::testing::UnorderedElementsAre(
+                  Constraint{"UNIQUE", {"a"}}, Constraint{"UNIQUE", {"c", "a"}},
+                  Constraint{"CHECK", {"b"}}, Constraint{"CHECK", {}}));
 }
 
 // GetObjects lists a view's columns, and GetTableSchema describes a view.

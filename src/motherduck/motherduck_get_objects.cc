@@ -41,14 +41,18 @@ using adbc::driver::GetObjectsHelper;
 using adbc::driver::Result;
 using adbc::driver::Status;
 
-// Rows from user databases only, not system, temp or other internal ones.
+// Rows from user databases only: not system, temp or other internal ones, nor
+// MotherDuck's md_information_schema, which isn't marked internal.
+#define MOTHERDUCK_USER_DATABASE "NOT d.internal AND d.type <> 'motherduck_info'"
+
 constexpr char kCatalogsQuery[] =
-    "SELECT database_name FROM duckdb_databases() WHERE NOT internal";
+    "SELECT d.database_name FROM duckdb_databases() AS d "
+    "WHERE " MOTHERDUCK_USER_DATABASE;
 
 constexpr char kSchemasQuery[] =
     "SELECT s.database_name, s.schema_name FROM duckdb_schemas() AS s "
     "JOIN duckdb_databases() AS d ON d.database_name = s.database_name "
-    "WHERE NOT d.internal";
+    "WHERE " MOTHERDUCK_USER_DATABASE;
 
 constexpr char kTablesQuery[] =
     "SELECT t.database_name, t.schema_name, t.table_name, t.table_type FROM ("
@@ -57,25 +61,29 @@ constexpr char kTablesQuery[] =
     "UNION ALL SELECT database_name, schema_name, view_name, 'view' "
     "FROM duckdb_views() WHERE NOT internal) AS t "
     "JOIN duckdb_databases() AS d ON d.database_name = t.database_name "
-    "WHERE NOT d.internal";
+    "WHERE " MOTHERDUCK_USER_DATABASE;
 
 constexpr char kColumnsQuery[] =
     "SELECT c.database_name, c.schema_name, c.table_name, c.column_name, "
     "c.column_index, c.comment, c.data_type FROM duckdb_columns() AS c "
     "JOIN duckdb_databases() AS d ON d.database_name = c.database_name "
-    "WHERE NOT d.internal AND NOT c.internal";
+    "WHERE " MOTHERDUCK_USER_DATABASE " AND NOT c.internal";
 
-// One row per constraint column, in order, so no array text needs parsing.
-// referenced_column_names is empty except for foreign keys, so ref is NULL.
+// One row per constraint column, in order, so no array text needs parsing. A
+// constraint on no column, such as CHECK (random() > 0), gets one row with a
+// NULL column. referenced_column_names is empty except for foreign keys, so
+// ref is NULL.
 constexpr char kConstraintsQuery[] =
     "SELECT k.database_name, k.schema_name, k.table_name, k.constraint_index, "
     "k.constraint_name, k.constraint_type, k.constraint_column_names[k.i], "
     "k.referenced_table, k.referenced_column_names[k.i] FROM ("
-    "SELECT *, unnest(range(1, len(constraint_column_names) + 1)) AS i "
+    "SELECT *, unnest(range(1, greatest(len(constraint_column_names), 1) + 1)) AS i "
     "FROM duckdb_constraints() "
     "WHERE constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY', 'UNIQUE', 'CHECK')) AS k "
     "JOIN duckdb_databases() AS d ON d.database_name = k.database_name "
-    "WHERE NOT d.internal";
+    "WHERE " MOTHERDUCK_USER_DATABASE;
+
+#undef MOTHERDUCK_USER_DATABASE
 
 // A query plus the filters added to it as parameters.
 class Query {
@@ -186,7 +194,7 @@ class MotherduckGetObjectsHelper : public GetObjectsHelper {
               std::optional<std::string_view> column_filter,
               const std::vector<std::string_view>& table_types) override {
     UNWRAP_STATUS(Query(kCatalogsQuery)
-                      .Like("database_name", catalog_filter)
+                      .Like("d.database_name", catalog_filter)
                       .Run(conn_, "1", [&](const PqResultRow& row) {
                         catalogs_.push_back(Text(row[0]));
                         return Status::Ok();
@@ -247,7 +255,9 @@ class MotherduckGetObjectsHelper : public GetObjectsHelper {
                                        NullableText(row[7]).value_or(""),
                                        {}});
               }
-              constraints.back().column_names.push_back(Text(row[6]));
+              if (!row[6].is_null) {
+                constraints.back().column_names.push_back(Text(row[6]));
+              }
               if (!row[8].is_null) {
                 constraints.back().referenced_column_names.push_back(Text(row[8]));
               }
