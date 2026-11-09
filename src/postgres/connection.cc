@@ -92,8 +92,8 @@ static const char* kTablesQueryAll =
     "WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' END "
     "AS reltype FROM pg_catalog.pg_class c "
     "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-    "WHERE n.nspname = $1 AND c.relkind = "
-    "ANY($2)";
+    "WHERE n.nspname = $1 AND c.relkind::text = "
+    "ANY($2::text[])";
 
 // Parameterized on schema_name, table_name
 static const char* kColumnsQueryAll =
