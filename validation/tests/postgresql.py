@@ -118,8 +118,10 @@ class PostgreSQLQuirks(model.DriverQuirks):
             "CREATE TABLE constraint_primary_multi (a INT, b INT, PRIMARY KEY (b, a))",
             "CREATE TABLE constraint_primary_multi2 (a INT, b INT, PRIMARY KEY (a, b))",
             "CREATE TABLE constraint_foreign (a INT, b INT REFERENCES constraint_primary (a))",
-            "CREATE TABLE constraint_foreign_multi (a INT, b INT, c INT,"
-            " FOREIGN KEY (c, b) REFERENCES constraint_primary_multi2 (a, b))",
+            (
+                "CREATE TABLE constraint_foreign_multi (a INT, b INT, c INT,"
+                " FOREIGN KEY (c, b) REFERENCES constraint_primary_multi2 (a, b))"
+            ),
         ]
 
     def split_statement(self, statement: str) -> list[str]:
