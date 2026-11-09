@@ -27,6 +27,14 @@
 
 namespace adbcpq {
 
+// The type to cast each bound parameter to, or "" for none. An all-null
+// parameter has no type of its own, so it takes the type in null_param_oids, or
+// none if that's empty.
+Status ParameterCastTypes(const PostgresTypeResolver& type_resolver,
+                          const struct ArrowSchema& bind_schema,
+                          const std::vector<Oid>& null_param_oids,
+                          std::vector<std::string>* types);
+
 // Runs queries without a result through a libpq pipeline: bound rows are sent
 // without waiting on each in turn, and multi-statement queries run as
 // separate commands.
@@ -45,6 +53,8 @@ class MotherduckResultReader : public PqResultArrayReader {
 
  private:
   std::string query_;
+  // Whether the query only prepares with its parameters cast
+  bool needs_param_casts_ = false;
 };
 
 class MotherduckStatement : public PostgresStatement {

@@ -47,10 +47,11 @@ std::string CastTypeName(const PostgresType& type, const struct ArrowSchema* sch
     return CastTypeName(type, schema->dictionary);
   }
   // An all-null value has no precision or element type to keep.
-  if (view.type == NANOARROW_TYPE_NA) return type.sql_type_name();
+  const bool all_null = view.type == NANOARROW_TYPE_NA;
 
   switch (type.type_id()) {
     case PostgresTypeId::kNumeric:
+      if (all_null) return type.sql_type_name();
       // A bare NUMERIC is DECIMAL(18,3) in DuckDB, so keep precision and scale;
       // skip decimals DuckDB can't hold.
       if (view.decimal_precision < 1 || view.decimal_precision > 38 ||
@@ -60,8 +61,9 @@ std::string CastTypeName(const PostgresType& type, const struct ArrowSchema* sch
       return "NUMERIC(" + std::to_string(view.decimal_precision) + ", " +
              std::to_string(view.decimal_scale) + ")";
     case PostgresTypeId::kArray: {
-      if (schema->n_children != 1) return "";
-      std::string element = CastTypeName(type.child(0), schema->children[0]);
+      if (type.n_children() != 1 || (!all_null && schema->n_children != 1)) return "";
+      std::string element =
+          CastTypeName(type.child(0), all_null ? schema : schema->children[0]);
       return element.empty() ? "" : element + "[]";
     }
     default:
@@ -69,34 +71,38 @@ std::string CastTypeName(const PostgresType& type, const struct ArrowSchema* sch
   }
 }
 
-// The type to cast each bound parameter to, or "" for none. An all-null
-// parameter has no type of its own, so it takes the type in null_param_oids, or
-// none if that's empty.
+}  // namespace
+
 Status ParameterCastTypes(const PostgresTypeResolver& type_resolver,
                           const struct ArrowSchema& bind_schema,
                           const std::vector<Oid>& null_param_oids,
                           std::vector<std::string>* types) {
-  struct ArrowError na_error;
-  ArrowErrorInit(&na_error);
   types->assign(bind_schema.n_children, "");
   for (int64_t i = 0; i < bind_schema.n_children; i++) {
     struct ArrowSchemaView view;
-    UNWRAP_NANOARROW(na_error, Internal,
-                     ArrowSchemaViewInit(&view, bind_schema.children[i], &na_error));
+    if (ArrowSchemaViewInit(&view, bind_schema.children[i], /*error=*/nullptr) !=
+        NANOARROW_OK) {
+      continue;
+    }
+    // Leave a parameter uncast if its type can't be mapped, so the prepare
+    // fails with the server's error rather than the driver's.
     PostgresType type;
     if (view.type == NANOARROW_TYPE_NA) {
-      if (static_cast<size_t>(i) >= null_param_oids.size()) continue;
-      UNWRAP_NANOARROW(na_error, Internal,
-                       type_resolver.Find(null_param_oids[i], &type, &na_error));
-    } else {
-      UNWRAP_NANOARROW(na_error, Internal,
-                       PostgresType::FromSchema(type_resolver, bind_schema.children[i],
-                                                &type, &na_error));
+      if (static_cast<size_t>(i) >= null_param_oids.size() ||
+          type_resolver.Find(null_param_oids[i], &type, /*error=*/nullptr) !=
+              NANOARROW_OK) {
+        continue;
+      }
+    } else if (PostgresType::FromSchema(type_resolver, bind_schema.children[i], &type,
+                                        /*error=*/nullptr) != NANOARROW_OK) {
+      continue;
     }
     (*types)[i] = CastTypeName(type, bind_schema.children[i]);
   }
   return Status::Ok();
 }
+
+namespace {
 
 // Prepare query with each parameter cast to its bound type.
 Status PrepareWithParamCasts(PGconn* conn, const std::string& query,
@@ -113,8 +119,11 @@ Status PrepareWithParamCasts(PGconn* conn, const std::string& query,
 }  // namespace
 
 Status MotherduckResultReader::PrepareWithParamTypes() {
-  Status status = PqResultArrayReader::PrepareWithParamTypes();
-  if (status.ok() || !IsAmbiguousParameterError(status)) return status;
+  // Skip the uncast prepare if resolving all-null parameters showed it fails.
+  if (!needs_param_casts_) {
+    Status status = PqResultArrayReader::PrepareWithParamTypes();
+    if (status.ok() || !IsAmbiguousParameterError(status)) return status;
+  }
   return PrepareWithParamCasts(conn_, query_, bind_stream_->param_types,
                                bind_stream_->bind_schema.value, *type_resolver_,
                                /*null_param_oids=*/bind_stream_->param_types);
@@ -123,6 +132,7 @@ Status MotherduckResultReader::PrepareWithParamTypes() {
 Status MotherduckResultReader::ResolveNullParamTypes() {
   Status status = PqResultArrayReader::ResolveNullParamTypes();
   if (status.ok() || !IsAmbiguousParameterError(status)) return status;
+  needs_param_casts_ = true;
   // Cast the parameters that have types, so the server can infer the rest.
   status = PrepareWithParamCasts(conn_, query_, /*param_oids=*/{},
                                  bind_stream_->bind_schema.value, *type_resolver_,
@@ -139,12 +149,7 @@ Status MotherduckResultReader::ExecuteAll(int64_t* affected_rows) {
   if (bind_stream_) {
     UNWRAP_STATUS(bind_stream_->Begin([] { return Status::Ok(); }));
 
-    const bool has_na_params = std::any_of(
-        bind_stream_->bind_schema_fields.begin(), bind_stream_->bind_schema_fields.end(),
-        [](const ArrowSchemaView& view) { return view.type == NANOARROW_TYPE_NA; });
-    if (has_na_params) {
-      UNWRAP_STATUS(ResolveNullParamTypes());
-    }
+    UNWRAP_STATUS(ResolveNullParamTypes());
 
     UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
     UNWRAP_STATUS(PrepareWithParamTypes());
@@ -224,8 +229,14 @@ Status MotherduckStatement::PrepareQuery(PGconn* conn, const std::string& query,
         "parameters first, or cast them in the query (e.g. $1::INTEGER): ",
         status.message());
   }
+  status = PrepareWithParamCasts(conn, query, param_oids, *bind_schema, type_resolver(),
+                                 /*null_param_oids=*/{});
+  if (!IsAmbiguousParameterError(status)) return status;
+  // As when executing, cast all-null parameters the endpoint can't infer to text.
+  const std::vector<Oid> text_oids(bind_schema->n_children,
+                                   type_resolver().GetOID(PostgresTypeId::kText));
   return PrepareWithParamCasts(conn, query, param_oids, *bind_schema, type_resolver(),
-                               /*null_param_oids=*/{});
+                               text_oids);
 }
 
 // MotherDuck answers DDL with an empty result set instead of a command tag.

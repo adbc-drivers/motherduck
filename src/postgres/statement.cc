@@ -881,6 +881,10 @@ AdbcStatusCode PostgresStatement::GetParameterSchema(struct ArrowSchema* schema,
     CHECK_NA_DETAIL(INTERNAL,
                     ArrowArrayStreamGetSchema(&bind_, bind_schema.get(), &na_error),
                     &na_error, error);
+    if (std::string(bind_schema->format) != "+s") {
+      InternalAdbcSetError(error, "%s", "[libpq] Bind parameters must have type STRUCT");
+      return ADBC_STATUS_INVALID_STATE;
+    }
   }
 
   PqResultHelper helper(connection_->conn(), query_);

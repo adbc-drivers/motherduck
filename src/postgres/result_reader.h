@@ -102,7 +102,7 @@ class PqResultArrayReader {
   virtual Status ExecuteAll(int64_t* affected_rows);
   // Prepare the query with the bind stream's parameter types
   virtual Status PrepareWithParamTypes();
-  // Resolve the types of all-null (Arrow NA) parameters from the types the
+  // Resolve the types of any all-null (Arrow NA) parameters from the types the
   // server expects
   virtual Status ResolveNullParamTypes();
   // Reconcile the bind stream with the prepared statement's parameter types
