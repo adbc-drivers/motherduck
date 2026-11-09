@@ -27,6 +27,7 @@
 
 #include "result_reader.h"
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 
@@ -157,28 +158,13 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
   if (bind_stream_) {
     UNWRAP_STATUS(bind_stream_->Begin([] { return Status::Ok(); }));
 
-    const bool has_na_params = std::any_of(
-        bind_stream_->bind_schema_fields.begin(), bind_stream_->bind_schema_fields.end(),
-        [](const ArrowSchemaView& view) { return view.type == NANOARROW_TYPE_NA; });
-    if (has_na_params) {
-      // Prepare WITHOUT parameter types to let PostgreSQL infer them. This is required
-      // to resolve Arrow NA (all-null) parameters to the expected PostgreSQL types.
-      UNWRAP_STATUS(helper_.Prepare());
-
-      // Get PostgreSQL's expected parameter types
-      UNWRAP_STATUS(helper_.DescribePrepared());
-      PostgresType expected_types;
-      UNWRAP_STATUS(helper_.ResolveParamTypes(*type_resolver_, &expected_types));
-
-      // Reconcile Arrow schema with expected types
-      UNWRAP_STATUS(bind_stream_->ReconcileWithExpectedTypes(expected_types));
-    }
+    UNWRAP_STATUS(ResolveNullParamTypes());
 
     // Now set parameter types (will use reconciled types for NA fields)
     UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
 
     // Re-prepare with the actual parameter types
-    UNWRAP_STATUS(helper_.Prepare(bind_stream_->param_types));
+    UNWRAP_STATUS(PrepareWithParamTypes());
 
     UNWRAP_STATUS(BindNextAndExecute(nullptr));
 
@@ -224,7 +210,7 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
     UNWRAP_ERRNO(Internal,
                  type_resolver_->FindWithDefault(helper_.FieldType(i), &child_type));
 
-    child_type = child_type.WithFieldName(helper_.FieldName(i))
+    child_type = child_type.WithFieldName(ResultColumnName(helper_.FieldName(i)))
                      .WithTypeModifier(helper_.FieldTypeModifier(i));
     UNWRAP_ERRNO(Internal, child_type.SetSchema(schema_->children[i], vendor_name_));
 
@@ -258,6 +244,32 @@ int64_t RowBytes(PqResultRow row, int columns) {
 }
 
 }  // namespace
+
+Status PqResultArrayReader::PrepareWithParamTypes() {
+  return helper_.Prepare(bind_stream_->param_types);
+}
+
+Status PqResultArrayReader::ResolveNullParamTypes() {
+  const bool has_na_params = std::any_of(
+      bind_stream_->bind_schema_fields.begin(), bind_stream_->bind_schema_fields.end(),
+      [](const ArrowSchemaView& view) { return view.type == NANOARROW_TYPE_NA; });
+  if (!has_na_params) return Status::Ok();
+
+  // Prepare WITHOUT parameter types to let PostgreSQL infer them. This is required
+  // to resolve Arrow NA (all-null) parameters to the expected PostgreSQL types.
+  UNWRAP_STATUS(helper_.Prepare());
+  return ReconcileWithPreparedParamTypes();
+}
+
+Status PqResultArrayReader::ReconcileWithPreparedParamTypes() {
+  // Get PostgreSQL's expected parameter types
+  UNWRAP_STATUS(helper_.DescribePrepared());
+  PostgresType expected_types;
+  UNWRAP_STATUS(helper_.ResolveParamTypes(*type_resolver_, &expected_types));
+
+  // Reconcile Arrow schema with expected types
+  return bind_stream_->ReconcileWithExpectedTypes(expected_types);
+}
 
 Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
                                           struct ArrowArrayStream* out) {
@@ -321,21 +333,10 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
   if (bind_stream_) {
     UNWRAP_STATUS(bind_stream_->Begin([] { return Status::Ok(); }));
 
-    const bool has_na_params = std::any_of(
-        bind_stream_->bind_schema_fields.begin(), bind_stream_->bind_schema_fields.end(),
-        [](const ArrowSchemaView& view) { return view.type == NANOARROW_TYPE_NA; });
-    if (has_na_params) {
-      // Prepare without parameter types so PostgreSQL can infer them. This is required
-      // to resolve Arrow NA (all-null) parameters to the expected PostgreSQL types.
-      UNWRAP_STATUS(helper_.Prepare());
-      UNWRAP_STATUS(helper_.DescribePrepared());
-      PostgresType expected_types;
-      UNWRAP_STATUS(helper_.ResolveParamTypes(*type_resolver_, &expected_types));
-      UNWRAP_STATUS(bind_stream_->ReconcileWithExpectedTypes(expected_types));
-    }
+    UNWRAP_STATUS(ResolveNullParamTypes());
 
     UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
-    UNWRAP_STATUS(helper_.Prepare(bind_stream_->param_types));
+    UNWRAP_STATUS(PrepareWithParamTypes());
 
     // Reset affected rows to zero before binding and executing any
     if (affected_rows) {
