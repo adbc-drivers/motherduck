@@ -211,6 +211,9 @@ class PostgresStatement {
   } ingest_;
 
   std::shared_ptr<TupleReader> reader_;
+  // The result currently being read, if any. Cleared before the next query so
+  // the connection is not left in the middle of the previous one.
+  std::shared_ptr<PqResultArrayReader> result_reader_;
   int64_t batch_size_hint_bytes_;
 };
 }  // namespace adbcpq

@@ -39,7 +39,7 @@
 
 namespace adbcpq {
 
-class PqResultArrayReader {
+class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayReader> {
  public:
   PqResultArrayReader(PGconn* conn, std::shared_ptr<PostgresTypeResolver> type_resolver,
                       std::string query)
@@ -92,6 +92,8 @@ class PqResultArrayReader {
   int64_t batch_size_hint_bytes_ = 16777216;
   int next_row_ = 0;
   bool streaming_rows_ = false;
+  int64_t streamed_rows_ = 0;
+  int64_t* rows_affected_out_ = nullptr;
   AdbcStatusCode status_ = ADBC_STATUS_OK;
   struct AdbcError error_;
   struct ArrowError na_error_;
@@ -106,6 +108,8 @@ class PqResultArrayReader {
         batch_size_hint_bytes_(other->batch_size_hint_bytes_),
         next_row_(other->next_row_),
         streaming_rows_(other->streaming_rows_),
+        streamed_rows_(other->streamed_rows_),
+        rows_affected_out_(other->rows_affected_out_),
         status_(other->status_) {
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
@@ -113,14 +117,12 @@ class PqResultArrayReader {
 
   Status BindNextAndExecute(int64_t* affected_rows);
   virtual Status ExecuteAll(int64_t* affected_rows);
+  // Run every statement but the last, then start streaming the last one.
+  Status OpenRowStream();
   int GetNextStream(struct ArrowArray* out);
   int Fail(const Status& status);
-
-  static int GetSchemaTrampoline(struct ArrowArrayStream* stream,
-                                 struct ArrowSchema* out);
-  static int GetNextTrampoline(struct ArrowArrayStream* stream, struct ArrowArray* out);
-  static const char* GetLastErrorTrampoline(struct ArrowArrayStream* stream);
-  static void ReleaseTrampoline(struct ArrowArrayStream* stream);
+  int FailArrow(int code);
+  void PublishRowCount();
 
   // Prepare the query with the bind stream's parameter types
   virtual Status PrepareWithParamTypes();

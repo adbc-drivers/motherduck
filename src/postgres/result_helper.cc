@@ -68,8 +68,10 @@ bool IsRowPacket(ExecStatusType status) {
 
 }  // namespace
 
-Status PqResultHelper::BeginRowStream(int chunk_rows) {
+Status PqResultHelper::BeginRowStream() {
   ClearResult();
+  // One statement. PQsendQuery (simple protocol) is what accepts several
+  // statements; the caller runs those before this.
   if (PQsendQueryParams(conn_, query_.c_str(), /*nParams=*/0, /*paramTypes=*/nullptr,
                         /*paramValues=*/nullptr, /*paramLengths=*/nullptr,
                         /*paramFormats=*/nullptr,
@@ -78,12 +80,11 @@ Status PqResultHelper::BeginRowStream(int chunk_rows) {
                       PQerrorMessage(conn_));
   }
 
+  // One row per packet, so the Arrow batch can stop on the byte hint exactly.
   int armed;
 #ifdef LIBPQ_HAS_CHUNK_MODE
-  if (chunk_rows < 1) chunk_rows = 1;
-  armed = PQsetChunkedRowsMode(conn_, chunk_rows);
+  armed = PQsetChunkedRowsMode(conn_, 1);
 #else
-  (void)chunk_rows;
   armed = PQsetSingleRowMode(conn_);
 #endif
   if (armed != 1) {

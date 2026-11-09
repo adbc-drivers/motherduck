@@ -148,7 +148,9 @@ class PqResultHelper {
                  PostgresType* param_types = nullptr);
   // Send the query and have libpq return rows as they arrive, instead of
   // buffering the whole result the way Execute() does.
-  Status BeginRowStream(int chunk_rows);
+  Status BeginRowStream();
+  const std::string& query() const { return query_; }
+  void set_query(std::string query) { query_ = std::move(query); }
   // Replace result_ with the next chunk. A finished query leaves no result.
   Status NextPacket();
   bool streaming() const { return streaming_; }
