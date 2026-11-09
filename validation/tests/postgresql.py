@@ -59,7 +59,7 @@ class PostgreSQLQuirks(model.DriverQuirks):
         get_objects_constraints_primary=False,
         get_objects_constraints_unique=False,
         metadata_type_name=True,
-        # Needs COPY FROM STDIN, which the endpoint lacks (ECO-587).
+        # Needs COPY FROM STDIN, which the endpoint lacks (#31).
         statement_bulk_ingest=False,
         statement_bulk_ingest_catalog=False,
         statement_bulk_ingest_schema=False,
@@ -86,6 +86,17 @@ class PostgreSQLQuirks(model.DriverQuirks):
     @property
     def queries_paths(self) -> tuple[Path, ...]:
         return (Path(__file__).parent.parent / "queries",)
+
+    def query_override(self, context: str, default: str) -> str:
+        # Unbound, the endpoint can't type a parameter that decides a result
+        # column's type, as in SELECT 1 + $1 (#17). Use ones it can type.
+        overrides = {
+            "TestStatement.test_parameter_schema::1": "SELECT 1 WHERE 1 = $1",
+            "TestStatement.test_parameter_schema::2": (
+                "SELECT 1 WHERE 1 = $1 AND 2 = $2"
+            ),
+        }
+        return overrides.get(context, default)
 
     def bind_parameter(self, index: int) -> str:
         """PostgreSQL uses $1, $2, $3, etc. for parameter placeholders."""

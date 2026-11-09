@@ -29,6 +29,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
 #include <optional>
@@ -65,8 +66,8 @@ using adbc_validation::IsOkStatus;
 using adbc_validation::IsStatus;
 using std::string_literals::operator""s;
 
-// Bulk ingest needs COPY FROM STDIN, which the Postgres endpoint lacks (ECO-587).
-#define SKIP_WITHOUT_COPY_FROM_STDIN() GTEST_SKIP() << "Needs COPY FROM STDIN (ECO-587)"
+// Bulk ingest needs COPY FROM STDIN, which the Postgres endpoint lacks (#31).
+#define SKIP_WITHOUT_COPY_FROM_STDIN() GTEST_SKIP() << "Needs COPY FROM STDIN (#31)"
 
 class PostgresQuirks : public adbc_validation::DriverQuirks {
  public:
@@ -127,7 +128,7 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return AdbcStatementRelease(&statement.value, error);
   }
 
-  // Bulk ingest isn't available (ECO-587), so build the sample table with SQL.
+  // Bulk ingest isn't available (#31), so build the sample table with SQL.
   AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
                                    const std::string& name,
                                    struct AdbcError* error) const override {
@@ -274,7 +275,7 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   }
   std::string db_schema() const override { return "main"; }
 
-  // No COPY FROM STDIN yet (ECO-587).
+  // No COPY FROM STDIN yet (#31).
   bool supports_bulk_ingest(const char* mode) const override { return false; }
   // MotherDuck supports database.schema.table names.
   bool supports_bulk_ingest_catalog() const override { return true; }
@@ -1788,6 +1789,348 @@ TEST_F(PostgresStatementTest, MotherDuckTypesResolve) {
             "{'a': 1}");
 }
 
+// A query that quotes the typing error must still report its own error.
+TEST_F(PostgresStatementTest, MotherDuckPrepareErrorQuotingTypingError) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, "SELECT missing_col -- ambiguous result column types", &error),
+      IsOkStatus(&error));
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcStatementExecuteSchema(&statement, schema.get(), &error),
+              ::testing::Not(IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error)));
+  ASSERT_THAT(AdbcStatementGetParameterSchema(&statement, schema.get(), &error),
+              ::testing::Not(IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error)));
+}
+
+// The cast retry depends on the endpoint's wording for this error. If this
+// fails, update IsAmbiguousParameterError in motherduck_statement.cc.
+TEST_F(PostgresStatementTest, MotherDuckAmbiguousParameterErrorWording) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
+              IsOkStatus(&error));
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcStatementExecuteSchema(&statement, schema.get(), &error),
+              IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
+}
+
+// Bind one row of an int32 and a string to query and return the result.
+void ExecuteCastQuery(struct AdbcConnection* connection, struct AdbcStatement* statement,
+                      const char* query, const char* string_value,
+                      adbc_validation::StreamReader* reader,
+                      nanoarrow::UniqueSchema* schema, struct AdbcError* error) {
+  nanoarrow::UniqueSchema bind_schema;
+  nanoarrow::UniqueArray bind;
+  struct ArrowError na_error;
+  ASSERT_THAT(
+      adbc_validation::MakeSchema(
+          bind_schema.get(), {{"a", NANOARROW_TYPE_INT32}, {"b", NANOARROW_TYPE_STRING}}),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT((adbc_validation::MakeBatch<int32_t, std::string>(
+                  bind_schema.get(), bind.get(), &na_error, {1}, {string_value})),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementNew(connection, statement, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(statement, query, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementBind(statement, bind.get(), bind_schema.get(), error),
+              IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementExecuteSchema(statement, schema->get(), error),
+              IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(statement, &reader->stream.value,
+                                        &reader->rows_affected, error),
+              IsOkStatus(error));
+  ASSERT_NO_FATAL_FAILURE(reader->GetSchema());
+}
+
+// Result columns are named as if the parameters weren't cast.
+TEST_F(PostgresStatementTest, MotherDuckCastParameterColumnNames) {
+  adbc_validation::StreamReader reader;
+  nanoarrow::UniqueSchema schema;
+  ASSERT_NO_FATAL_FAILURE(ExecuteCastQuery(
+      &connection, &statement, "SELECT $1, $1 + 1, $2", "x", &reader, &schema, &error));
+  for (const ArrowSchema* result : {schema.get(), &reader.schema.value}) {
+    ASSERT_EQ(result->n_children, 3);
+    EXPECT_STREQ(result->children[0]->name, "$1");
+    EXPECT_STREQ(result->children[1]->name, "($1 + 1)");
+    EXPECT_STREQ(result->children[2]->name, "$2");
+  }
+}
+
+// A string is cast only if the endpoint can't type the query otherwise, since
+// DuckDB won't mix a VARCHAR with, say, a DATE.
+TEST_F(PostgresStatementTest, MotherDuckCastsStringParametersLast) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement,
+          "CREATE OR REPLACE TABLE adbc_cast_test AS SELECT DATE '2020-01-01' AS d",
+          &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementRelease(&statement, &error), IsOkStatus(&error));
+
+  adbc_validation::StreamReader reader;
+  nanoarrow::UniqueSchema schema;
+  ASSERT_NO_FATAL_FAILURE(ExecuteCastQuery(
+      &connection, &statement,
+      "SELECT $1 AS v FROM adbc_cast_test WHERE greatest(d, $2) = DATE '2020-01-05'",
+      "2020-01-05", &reader, &schema, &error));
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->length, 1);
+
+  ASSERT_THAT(quirks()->DropTable(&connection, "adbc_cast_test", &error),
+              IsOkStatus(&error));
+}
+
+// If the cast query fails too, the error quotes the query as written.
+TEST_F(PostgresStatementTest, MotherDuckCastRetryErrorQuotesQuery) {
+  nanoarrow::UniqueSchema bind_schema;
+  nanoarrow::UniqueArray bind;
+  struct ArrowError na_error;
+  ASSERT_THAT(
+      adbc_validation::MakeSchema(
+          bind_schema.get(), {{"a", NANOARROW_TYPE_INT32}, {"b", NANOARROW_TYPE_INT64}}),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT((adbc_validation::MakeBatch<int32_t, int64_t>(bind_schema.get(), bind.get(),
+                                                            &na_error, {1}, {3})),
+              adbc_validation::IsOkErrno());
+
+  // A table function's arguments can't be parameters, cast or not.
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(&statement, "SELECT $1 AS v FROM range($2)", &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), bind_schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              ::testing::Not(IsOkStatus(&error)));
+  ASSERT_NE(error.message, nullptr);
+  EXPECT_THAT(error.message,
+              ::testing::HasSubstr("Query was: SELECT $1 AS v FROM range($2)"));
+  EXPECT_THAT(error.message,
+              ::testing::Not(::testing::HasSubstr("Query was: SELECT CAST(")));
+}
+
+// ExecuteUpdate resolves all-null parameters through the cast retry too.
+TEST_F(PostgresStatementTest, MotherDuckCastsNullParametersOnUpdate) {
+  nanoarrow::UniqueSchema bind_schema;
+  ArrowSchemaInit(bind_schema.get());
+  ASSERT_THAT(ArrowSchemaSetTypeStruct(bind_schema.get(), 2),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetType(bind_schema->children[0], NANOARROW_TYPE_INT32),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(bind_schema->children[0], "a"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetType(bind_schema->children[1], NANOARROW_TYPE_NA),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(bind_schema->children[1], "b"),
+              adbc_validation::IsOkErrno());
+
+  nanoarrow::UniqueArray bind;
+  ASSERT_THAT(ArrowArrayInitFromSchema(bind.get(), bind_schema.get(), nullptr),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowArrayStartAppending(bind.get()), adbc_validation::IsOkErrno());
+  for (int i = 0; i < 2; i++) {
+    ASSERT_THAT(ArrowArrayAppendInt(bind->children[0], i), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayAppendNull(bind->children[1], 1), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayFinishElement(bind.get()), adbc_validation::IsOkErrno());
+  }
+  ASSERT_THAT(ArrowArrayFinishBuildingDefault(bind.get(), nullptr),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1, $2", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), bind_schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+}
+
+// Parameters must be bound as a struct, as for ExecuteSchema.
+TEST_F(PostgresStatementTest, MotherDuckGetParameterSchemaRejectsNonStruct) {
+  nanoarrow::UniqueSchema bind_schema;
+  ArrowSchemaInit(bind_schema.get());
+  ASSERT_THAT(ArrowSchemaSetType(bind_schema.get(), NANOARROW_TYPE_INT32),
+              adbc_validation::IsOkErrno());
+  nanoarrow::UniqueArrayStream bind;
+  nanoarrow::EmptyArrayStream(bind_schema.get()).ToArrayStream(bind.get());
+
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBindStream(&statement, bind.get(), &error),
+              IsOkStatus(&error));
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcStatementGetParameterSchema(&statement, schema.get(), &error),
+              IsStatus(ADBC_STATUS_INVALID_STATE, &error));
+}
+
+// The endpoint can't type a parameter that decides a result column's type, so
+// the driver casts it to the type of its bound value (#17). Check each type it
+// casts round-trips through SELECT $1.
+TEST_F(PostgresStatementTest, MotherDuckCastsParameters) {
+  struct Case {
+    std::string name;
+    std::function<ArrowErrorCode(ArrowSchema*)> set_type;
+    std::function<ArrowErrorCode(ArrowArray*)> append;
+    // What the bound value should equal
+    std::string expected;
+  };
+  auto type = [](ArrowType t) {
+    return [t](ArrowSchema* s) { return ArrowSchemaSetType(s, t); };
+  };
+  auto integer = [](int64_t v) {
+    return [v](ArrowArray* a) { return ArrowArrayAppendInt(a, v); };
+  };
+  auto real = [](double v) {
+    return [v](ArrowArray* a) { return ArrowArrayAppendDouble(a, v); };
+  };
+  auto string = [](std::string v) {
+    return [v](ArrowArray* a) {
+      return ArrowArrayAppendString(a, ArrowCharView(v.c_str()));
+    };
+  };
+  auto timestamp = [](const char* timezone) {
+    return [timezone](ArrowSchema* s) {
+      return ArrowSchemaSetTypeDateTime(s, NANOARROW_TYPE_TIMESTAMP,
+                                        NANOARROW_TIME_UNIT_MICRO, timezone);
+    };
+  };
+  auto list_of = [](ArrowType t) {
+    return [t](ArrowSchema* s) {
+      NANOARROW_RETURN_NOT_OK(ArrowSchemaSetType(s, NANOARROW_TYPE_LIST));
+      return ArrowSchemaSetType(s->children[0], t);
+    };
+  };
+
+  const std::vector<Case> cases = {
+      {"int16", type(NANOARROW_TYPE_INT16), integer(7), "7::SMALLINT"},
+      {"int32", type(NANOARROW_TYPE_INT32), integer(-7), "-7::INTEGER"},
+      {"int64", type(NANOARROW_TYPE_INT64), integer(1LL << 40), "1099511627776::BIGINT"},
+      {"uint32", type(NANOARROW_TYPE_UINT32), integer(4000000000), "4000000000"},
+      {"float32", type(NANOARROW_TYPE_FLOAT), real(1.5), "1.5::FLOAT"},
+      {"float64", type(NANOARROW_TYPE_DOUBLE), real(-2.25), "-2.25::DOUBLE"},
+      {"bool", type(NANOARROW_TYPE_BOOL), integer(1), "true"},
+      {"string", type(NANOARROW_TYPE_STRING), string("h\xc3\xa9llo"), "'h\xc3\xa9llo'"},
+      {"large_string", type(NANOARROW_TYPE_LARGE_STRING), string("x"), "'x'"},
+      {"binary", type(NANOARROW_TYPE_BINARY),
+       [](ArrowArray* a) {
+         const uint8_t bytes[] = {0x01, 0xff};
+         return ArrowArrayAppendBytes(a, {{bytes}, 2});
+       },
+       "'\\x01\\xFF'::BLOB"},
+      {"date32", type(NANOARROW_TYPE_DATE32), integer(18262), "DATE '2020-01-01'"},
+      {"time64",
+       [](ArrowSchema* s) {
+         return ArrowSchemaSetTypeDateTime(s, NANOARROW_TYPE_TIME64,
+                                           NANOARROW_TIME_UNIT_MICRO, nullptr);
+       },
+       integer(45296789000), "TIME '12:34:56.789'"},
+      {"timestamp", timestamp(nullptr), integer(1577836800123456),
+       "TIMESTAMP '2020-01-01 00:00:00.123456'"},
+      {"timestamptz", timestamp("UTC"), integer(1577836800123456),
+       "TIMESTAMPTZ '2020-01-01 00:00:00.123456+00'"},
+      {"interval", type(NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO),
+       [](ArrowArray* a) {
+         ArrowInterval interval;
+         ArrowIntervalInit(&interval, NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO);
+         interval.months = 1;
+         interval.days = 2;
+         interval.ns = 3000000000;
+         return ArrowArrayAppendInterval(a, &interval);
+       },
+       "INTERVAL '1 month 2 days 3 seconds'"},
+      {"decimal128",
+       [](ArrowSchema* s) {
+         return ArrowSchemaSetTypeDecimal(s, NANOARROW_TYPE_DECIMAL128, 10, 5);
+       },
+       [](ArrowArray* a) {
+         ArrowDecimal decimal;
+         ArrowDecimalInit(&decimal, 128, 10, 5);
+         ArrowDecimalSetInt(&decimal, 123456);
+         return ArrowArrayAppendDecimal(a, &decimal);
+       },
+       "1.23456::DECIMAL(10, 5)"},
+      {"list<int32>", list_of(NANOARROW_TYPE_INT32),
+       [](ArrowArray* a) {
+         NANOARROW_RETURN_NOT_OK(ArrowArrayAppendInt(a->children[0], 1));
+         NANOARROW_RETURN_NOT_OK(ArrowArrayAppendInt(a->children[0], 2));
+         return ArrowArrayFinishElement(a);
+       },
+       "[1, 2]"},
+      {"list<string>", list_of(NANOARROW_TYPE_STRING),
+       [](ArrowArray* a) {
+         NANOARROW_RETURN_NOT_OK(
+             ArrowArrayAppendString(a->children[0], ArrowCharView("a")));
+         NANOARROW_RETURN_NOT_OK(
+             ArrowArrayAppendString(a->children[0], ArrowCharView("b")));
+         return ArrowArrayFinishElement(a);
+       },
+       "['a', 'b']"},
+      // No type of its own, so it's bound as text.
+      {"null", type(NANOARROW_TYPE_NA),
+       [](ArrowArray* a) { return ArrowArrayAppendNull(a, 1); }, "NULL"},
+  };
+
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    nanoarrow::UniqueSchema schema_bind;
+    ArrowSchemaInit(schema_bind.get());
+    ASSERT_THAT(ArrowSchemaSetTypeStruct(schema_bind.get(), 1),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT(test_case.set_type(schema_bind->children[0]),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowSchemaSetName(schema_bind->children[0], "p"),
+                adbc_validation::IsOkErrno());
+
+    nanoarrow::UniqueArray bind;
+    ASSERT_THAT(ArrowArrayInitFromSchema(bind.get(), schema_bind.get(), nullptr),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayStartAppending(bind.get()), adbc_validation::IsOkErrno());
+    ASSERT_THAT(test_case.append(bind->children[0]), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayFinishElement(bind.get()), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayFinishBuildingDefault(bind.get(), nullptr),
+                adbc_validation::IsOkErrno());
+
+    ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+    const std::string query =
+        "SELECT $1 AS v, $1 IS NOT DISTINCT FROM " + test_case.expected + " AS eq";
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query.c_str(), &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), schema_bind.get(), &error),
+                IsOkStatus(&error));
+
+    nanoarrow::UniqueSchema result_schema;
+    ASSERT_THAT(AdbcStatementExecuteSchema(&statement, result_schema.get(), &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(result_schema->n_children, 2);
+
+    nanoarrow::UniqueSchema param_schema;
+    ASSERT_THAT(AdbcStatementGetParameterSchema(&statement, param_schema.get(), &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(param_schema->n_children, 1);
+
+    {
+      adbc_validation::StreamReader reader;
+      ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                            &reader.rows_affected, &error),
+                  IsOkStatus(&error));
+      ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+      ASSERT_EQ(reader.schema->n_children, 2);
+      EXPECT_STREQ(reader.schema->children[0]->format,
+                   result_schema->children[0]->format);
+      ASSERT_NO_FATAL_FAILURE(reader.Next());
+      ASSERT_EQ(reader.array->length, 1);
+      ASSERT_FALSE(ArrowArrayViewIsNull(reader.array_view->children[1], 0));
+      EXPECT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[1], 0), 1);
+    }
+    ASSERT_THAT(AdbcStatementRelease(&statement, &error), IsOkStatus(&error));
+  }
+}
+
 TEST_F(PostgresStatementTest, TransactionStatus) {
   using adbc_validation::ConnectionGetOption;
   const char* txn_status = "adbc.postgresql.transaction_status";
@@ -2692,7 +3035,7 @@ TEST_F(PostgresStatementTest, ExecuteSchemaParameterizedQuery) {
   nanoarrow::EmptyArrayStream(schema_bind.get()).ToArrayStream(bind.get());
 
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT CAST($1 AS VARCHAR)", &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementBindStream(&statement, bind.get(), &error), IsOkStatus());
 
@@ -2783,7 +3126,7 @@ TEST_F(PostgresStatementTest, ExecuteParameterizedQueryWithResult) {
               adbc_validation::IsOkErrno());
 
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT CAST($1 AS INTEGER)", &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), schema_bind.get(), &error),
               IsOkStatus());

@@ -33,6 +33,7 @@
 
 #include "copy/reader.h"
 #include "driver/common/utils.h"
+#include "driver/framework/status.h"
 #include "postgres_type.h"
 
 #define ADBC_POSTGRESQL_OPTION_BATCH_SIZE_HINT_BYTES \
@@ -43,6 +44,9 @@
   "adbc.postgresql.disable_decimal_fast_path"
 
 namespace adbcpq {
+
+using adbc::driver::Status;
+
 class PostgresConnection;
 class PostgresStatement;
 class PqResultArrayReader;
@@ -131,8 +135,7 @@ class PostgresStatement {
                                 struct AdbcError* error);
   AdbcStatusCode GetOptionDouble(const char* key, double* value, struct AdbcError* error);
   AdbcStatusCode GetOptionInt(const char* key, int64_t* value, struct AdbcError* error);
-  virtual AdbcStatusCode GetParameterSchema(struct ArrowSchema* schema,
-                                            struct AdbcError* error);
+  AdbcStatusCode GetParameterSchema(struct ArrowSchema* schema, struct AdbcError* error);
   AdbcStatusCode New(struct AdbcConnection* connection, struct AdbcError* error);
   AdbcStatusCode Prepare(struct AdbcError* error);
   AdbcStatusCode Release(struct AdbcError* error);
@@ -170,6 +173,14 @@ class PostgresStatement {
       std::string query);
   // Whether a DDL command run by CreateBulkTable succeeded
   virtual bool IsCommandOk(PGresult* result);
+  // Prepare query as the unnamed statement. Empty param_oids lets the server
+  // infer the types; bind_schema is the bound parameters' schema, or null.
+  virtual Status PrepareQuery(PGconn* conn, const std::string& query,
+                              const std::vector<Oid>& param_oids,
+                              const struct ArrowSchema* bind_schema);
+  // The name ExecuteSchema gives a result column the server named name
+  virtual std::string ResultColumnName(std::string name) const { return name; }
+  const PostgresTypeResolver& type_resolver() const { return *type_resolver_; }
 
  private:
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
