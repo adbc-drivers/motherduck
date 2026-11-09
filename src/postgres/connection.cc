@@ -522,7 +522,7 @@ AdbcStatusCode PostgresConnection::EnsureTransaction(struct AdbcError* error) {
   PGresult* result = PQexec(conn_, "BEGIN TRANSACTION");
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
     InternalAdbcSetError(error, "%s%s", "[libpq] Failed to begin transaction: ",
-                         PqErrorText(nullptr, conn_));
+                         PqErrorText(nullptr, conn_).c_str());
     PQclear(result);
     return ADBC_STATUS_IO;
   }
@@ -1186,8 +1186,8 @@ AdbcStatusCode PostgresConnection::Rollback(struct AdbcError* error) {
 
   PGresult* result = PQexec(conn_, "ROLLBACK");
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
-    InternalAdbcSetError(error, "%s%s",
-                         "[libpq] Failed to rollback: ", PqErrorText(nullptr, conn_));
+    InternalAdbcSetError(error, "%s%s", "[libpq] Failed to rollback: ",
+                         PqErrorText(nullptr, conn_).c_str());
     PQclear(result);
     return ADBC_STATUS_IO;
   }
