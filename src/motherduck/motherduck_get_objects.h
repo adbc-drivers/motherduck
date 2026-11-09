@@ -26,10 +26,12 @@ namespace adbcpq {
 /// (duckdb_databases(), duckdb_schemas(), duckdb_tables(), duckdb_views(),
 /// duckdb_columns() and duckdb_constraints()).
 ///
-/// It lists every attached database, not only the current one. It loads each
-/// level with one query up front rather than one per table. Every filter is an
-/// ILIKE pattern, since DuckDB identifiers ignore case. A column filter keeps
-/// the constraints on a matching column.
+/// It lists every attached database, not only the current one, and temp,
+/// which holds temporary objects. It loads each level with one query up front
+/// rather than one per table, skipping rows the depth or table types exclude.
+/// Every name filter is an ILIKE pattern, since DuckDB identifiers ignore case;
+/// table types ignore case too, and "BASE TABLE" means a table. A column filter
+/// keeps the constraints on a matching column and those on no column.
 std::unique_ptr<adbc::driver::GetObjectsHelper> MakeMotherduckGetObjectsHelper(
     PGconn* conn);
 

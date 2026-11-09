@@ -49,8 +49,9 @@ class MotherduckConnection : public PostgresConnection {
   /// Describes SELECT * FROM the table, so the name resolves as in a query:
   /// ignoring case, through the search path, and in the given catalog. A
   /// catalog without a schema means the current schema in the current
-  /// database and main in any other. A missing table fails with
-  /// ADBC_STATUS_NOT_FOUND.
+  /// database, named as itself or as the current catalog option reports it
+  /// (md: when connected to md:), and main in any other. A missing table fails
+  /// with ADBC_STATUS_NOT_FOUND.
   AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
                                 const char* table_name, struct ArrowSchema* schema,
                                 struct AdbcError* error) override;

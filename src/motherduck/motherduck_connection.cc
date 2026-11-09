@@ -49,6 +49,8 @@ constexpr uint32_t kMotherduckInfoCodes[] = {
     ADBC_INFO_DRIVER_ADBC_VERSION,
 };
 
+std::string Text(const PqRecord& record) { return std::string(record.data, record.len); }
+
 constexpr char kNoStatistics[] =
     "[motherduck] %s is not supported by the MotherDuck driver: MotherDuck has no "
     "pg_stats to read statistics from";
@@ -100,19 +102,28 @@ AdbcStatusCode MotherduckConnection::GetTableSchema(const char* catalog,
     return ADBC_STATUS_INVALID_ARGUMENT;
   }
   // A catalog without a schema means the session's schema in the current
-  // database, as an unqualified name does, and main in any other.
+  // database, as an unqualified name does, and main in any other. The current
+  // database may be named as itself or as the connection's current catalog,
+  // which is md: when connected to md: (#14).
+  std::string resolved_catalog;
   std::string default_schema;
   if (catalog != nullptr && db_schema == nullptr) {
+    const char* current_catalog = PQdb(conn());
     PqResultHelper helper(
         conn(),
-        "SELECT CASE WHEN lower(current_database()) = lower($1::VARCHAR) "
-        "THEN current_schema() ELSE 'main' END");
-    RAISE_STATUS(error, helper.Execute({catalog}));
+        "SELECT CASE WHEN current THEN current_database() ELSE $1::VARCHAR END, "
+        "CASE WHEN current THEN coalesce(current_schema(), 'main') ELSE 'main' END "
+        "FROM (SELECT lower(current_database()) = lower($1::VARCHAR) "
+        "OR $1::VARCHAR = $2::VARCHAR AS current)");
+    RAISE_STATUS(error,
+                 helper.Execute({catalog, current_catalog ? current_catalog : ""}));
     if (helper.NumRows() != 1) {
       InternalAdbcSetError(error, "[motherduck] Failed to look up the default schema");
       return ADBC_STATUS_INTERNAL;
     }
-    default_schema = helper.Row(0)[0].data;
+    resolved_catalog = Text(helper.Row(0)[0]);
+    default_schema = Text(helper.Row(0)[1]);
+    catalog = resolved_catalog.c_str();
     db_schema = default_schema.c_str();
   }
 

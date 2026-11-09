@@ -19,6 +19,7 @@
 
 #include "motherduck_get_objects.h"
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -41,9 +42,12 @@ using adbc::driver::GetObjectsHelper;
 using adbc::driver::Result;
 using adbc::driver::Status;
 
-// Rows from user databases only: not system, temp or other internal ones, nor
-// MotherDuck's md_information_schema, which isn't marked internal.
-#define MOTHERDUCK_USER_DATABASE "NOT d.internal AND d.type <> 'motherduck_info'"
+// Rows from user databases and temp, which holds the session's temporary
+// objects: not system or other internal ones, nor MotherDuck's
+// md_information_schema, which isn't marked internal.
+#define MOTHERDUCK_USER_DATABASE                      \
+  "(NOT d.internal OR d.database_name = 'temp') AND " \
+  "d.type <> 'motherduck_info'"
 
 constexpr char kCatalogsQuery[] =
     "SELECT d.database_name FROM duckdb_databases() AS d "
@@ -98,15 +102,10 @@ class Query {
     return *this;
   }
 
-  // Adds `column IN (values)`, if there are values.
-  Query& In(const char* column, const std::vector<std::string_view>& values) {
-    if (values.empty()) return *this;
-    sql_ += std::string(" AND ") + column + " IN (";
-    for (size_t i = 0; i < values.size(); i++) {
-      if (i > 0) sql_ += ", ";
-      sql_ += Param(values[i]);
-    }
-    sql_ += ")";
+  // Adds a condition with no parameters.
+  Query& Where(std::string_view condition) {
+    sql_ += " AND ";
+    sql_ += condition;
     return *this;
   }
 
@@ -133,6 +132,48 @@ class Query {
 };
 
 std::string Text(const PqRecord& record) { return std::string(record.data, record.len); }
+
+std::string Lower(std::string_view text) {
+  std::string lower(text);
+  for (char& c : lower)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return lower;
+}
+
+// The table types a table_types filter asks for. It ignores case, like the
+// other filters, and takes SQL's "BASE TABLE" for a table. With no filter,
+// both.
+struct TableTypes {
+  bool tables = false;
+  bool views = false;
+
+  explicit TableTypes(const std::vector<std::string_view>& filter) {
+    if (filter.empty()) {
+      tables = views = true;
+      return;
+    }
+    for (std::string_view type : filter) {
+      std::string lower = Lower(type);
+      if (lower == "table" || lower == "base table") tables = true;
+      if (lower == "view") views = true;
+    }
+  }
+
+  // A condition on column `table_type` ('table' or 'view').
+  std::string Condition(const char* column) const {
+    if (tables && views) return "TRUE";
+    return std::string(column) + (tables ? " = 'table'" : " = 'view'");
+  }
+};
+
+// Whether the relation named by alias's database_name, schema_name and
+// table_name is in duckdb_tables() (a table) or duckdb_views() (a view).
+std::string IsRelation(const char* function, const char* name_column, const char* alias) {
+  std::string a(alias);
+  return std::string("EXISTS (SELECT 1 FROM ") + function + " AS r WHERE " +
+         "r.database_name = " + a + ".database_name AND r.schema_name = " + a +
+         ".schema_name AND r." + name_column + " = " + a + ".table_name)";
+}
 
 std::optional<std::string> NullableText(const PqRecord& record) {
   if (record.is_null) return std::nullopt;
@@ -210,11 +251,15 @@ class MotherduckGetObjectsHelper : public GetObjectsHelper {
                       }));
     if (depth == GetObjectsDepth::kSchemas) return Status::Ok();
 
+    // Rows for tables the table_types filter excludes aren't loaded at all.
+    const TableTypes types(table_types);
+    if (!types.tables && !types.views) return Status::Ok();
+
     UNWRAP_STATUS(Query(kTablesQuery)
                       .Like("t.database_name", catalog_filter)
                       .Like("t.schema_name", schema_filter)
                       .Like("t.table_name", table_filter)
-                      .In("t.table_type", table_types)
+                      .Where(types.Condition("t.table_type"))
                       .Run(conn_, "1, 2, 3", [&](const PqResultRow& row) {
                         tables_[{Text(row[0]), Text(row[1])}].push_back(
                             {Text(row[2]), Text(row[3])});
@@ -222,11 +267,15 @@ class MotherduckGetObjectsHelper : public GetObjectsHelper {
                       }));
     if (depth == GetObjectsDepth::kTables) return Status::Ok();
 
+    std::string columns_of_type = "TRUE";
+    if (!types.views) columns_of_type = IsRelation("duckdb_tables()", "table_name", "c");
+    if (!types.tables) columns_of_type = IsRelation("duckdb_views()", "view_name", "c");
     UNWRAP_STATUS(Query(kColumnsQuery)
                       .Like("c.database_name", catalog_filter)
                       .Like("c.schema_name", schema_filter)
                       .Like("c.table_name", table_filter)
                       .Like("c.column_name", column_filter)
+                      .Where(columns_of_type)
                       .Run(conn_, "1, 2, 3, 5", [&](const PqResultRow& row) -> Status {
                         int64_t ordinal_position;
                         UNWRAP_RESULT(ordinal_position, row[4].ParseInteger());
@@ -236,6 +285,8 @@ class MotherduckGetObjectsHelper : public GetObjectsHelper {
                         return Status::Ok();
                       }));
 
+    // Only tables have constraints.
+    if (!types.tables) return Status::Ok();
     UNWRAP_STATUS(
         Query(kConstraintsQuery)
             .Like("k.database_name", catalog_filter)
@@ -344,7 +395,8 @@ class MotherduckGetObjectsHelper : public GetObjectsHelper {
   }
 
  private:
-  // With a column filter, keeps only the constraints on a column it matched.
+  // With a column filter, keeps only the constraints on a column it matched,
+  // and those on no column (a table-level CHECK), which apply to the table.
   void KeepConstraintsOnListedColumns() {
     for (auto& [table, constraints] : constraints_) {
       std::set<std::string_view> listed;
@@ -354,6 +406,10 @@ class MotherduckGetObjectsHelper : public GetObjectsHelper {
       }
       std::vector<ConstraintRow> kept;
       for (ConstraintRow& constraint : constraints) {
+        if (constraint.column_names.empty()) {
+          kept.push_back(std::move(constraint));
+          continue;
+        }
         for (const std::string& column : constraint.column_names) {
           if (listed.count(column) > 0) {
             kept.push_back(std::move(constraint));

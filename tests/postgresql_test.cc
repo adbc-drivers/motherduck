@@ -1654,40 +1654,212 @@ TEST_F(PostgresConnectionTest, GetObjectsFindsUniqueAndCheck) {
                          &error),
               IsOkStatus(&error));
 
+  using Constraint = std::pair<std::string, std::vector<std::string>>;
+  const Constraint unique_a{"UNIQUE", {"a"}};
+  const Constraint unique_ca{"UNIQUE", {"c", "a"}};
+  const Constraint check_b{"CHECK", {"b"}};
+  // A CHECK on no column applies to the table, so every column filter keeps it.
+  const Constraint check_table{"CHECK", {}};
+  struct Case {
+    const char* column_filter;
+    std::vector<Constraint> expected;
+  };
+  for (const Case& test_case :
+       {Case{nullptr, {unique_a, unique_ca, check_b, check_table}},
+        Case{"%", {unique_a, unique_ca, check_b, check_table}},
+        Case{"B", {check_b, check_table}}, Case{"c", {unique_ca, check_table}}}) {
+    SCOPED_TRACE(test_case.column_filter ? test_case.column_filter : "(none)");
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr, nullptr,
+                                 "adbc_unique_check_test", nullptr,
+                                 test_case.column_filter, &reader.stream.value, &error),
+        IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_NE(nullptr, reader.array->release);
+
+    auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+    ASSERT_NE(*get_objects_data, nullptr)
+        << "could not initialize the AdbcGetObjectsData object";
+    struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_unique_check_test");
+    ASSERT_NE(table, nullptr) << "could not find adbc_unique_check_test table";
+
+    std::vector<Constraint> constraints;
+    for (int i = 0; i < table->n_table_constraints; i++) {
+      const struct AdbcGetObjectsConstraint* constraint = table->table_constraints[i];
+      std::vector<std::string> columns;
+      for (int j = 0; j < constraint->n_column_names; j++) {
+        columns.emplace_back(constraint->constraint_column_names[j].data,
+                             constraint->constraint_column_names[j].size_bytes);
+      }
+      constraints.emplace_back(std::string(constraint->constraint_type.data,
+                                           constraint->constraint_type.size_bytes),
+                               std::move(columns));
+    }
+    EXPECT_THAT(constraints, ::testing::UnorderedElementsAreArray(test_case.expected));
+  }
+}
+
+// The table types filter ignores case, takes "BASE TABLE" for a table, and
+// excludes the other type's tables and columns.
+TEST_F(PostgresConnectionTest, GetObjectsTableTypesIgnoreCase) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropView(&connection, "adbc_types_case_v", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "adbc_types_case_t", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database,
+                         "CREATE TABLE adbc_types_case_t (id INT PRIMARY KEY); "
+                         "CREATE VIEW adbc_types_case_v AS SELECT 1 AS x",
+                         &error),
+              IsOkStatus(&error));
+
+  struct Case {
+    std::vector<const char*> types;
+    bool table;
+    bool view;
+  };
+  for (Case test_case : {Case{{"TABLE"}, true, false}, Case{{"BASE TABLE"}, true, false},
+                         Case{{"View"}, false, true}, Case{{"VIEW", "Table"}, true, true},
+                         Case{{"nosuchtype"}, false, false}}) {
+    std::string trace;
+    for (const char* type : test_case.types) trace += std::string(type) + ";";
+    SCOPED_TRACE(trace);
+    test_case.types.push_back(nullptr);
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr, nullptr,
+                                 "adbc_types_case_%", test_case.types.data(), nullptr,
+                                 &reader.stream.value, &error),
+        IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_NE(nullptr, reader.array->release);
+
+    auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+    ASSERT_NE(*get_objects_data, nullptr)
+        << "could not initialize the AdbcGetObjectsData object";
+    struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_types_case_t");
+    struct AdbcGetObjectsTable* view = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_types_case_v");
+    EXPECT_EQ(table != nullptr, test_case.table);
+    EXPECT_EQ(view != nullptr, test_case.view);
+    if (table) {
+      EXPECT_EQ(table->n_table_columns, 1);
+      EXPECT_EQ(table->n_table_constraints, 1);
+    }
+    if (view) EXPECT_EQ(view->n_table_columns, 1);
+  }
+}
+
+// GetObjects lists the session's temporary objects under the temp catalog,
+// and GetTableSchema finds them there.
+TEST_F(PostgresConnectionTest, GetObjectsListsTempObjects) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  {
+    // Temporary objects belong to the connection that creates them.
+    adbc_validation::Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcStatementNew(&connection, &statement.value, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcStatementSetSqlQuery(
+            &statement.value,
+            "CREATE OR REPLACE TEMP VIEW adbc_temp_view_test AS SELECT 1 AS x", &error),
+        IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
+
   adbc_validation::StreamReader reader;
   ASSERT_THAT(AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr,
-                                       nullptr, "adbc_unique_check_test", nullptr,
-                                       nullptr, &reader.stream.value, &error),
+                                       nullptr, "adbc_temp_view_test", nullptr, nullptr,
+                                       &reader.stream.value, &error),
               IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_NE(nullptr, reader.array->release);
-
   auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
   ASSERT_NE(*get_objects_data, nullptr)
       << "could not initialize the AdbcGetObjectsData object";
-  struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
-      *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
-      "adbc_unique_check_test");
-  ASSERT_NE(table, nullptr) << "could not find adbc_unique_check_test table";
+  struct AdbcGetObjectsTable* view = InternalAdbcGetObjectsDataGetTableByName(
+      *get_objects_data, "temp", "main", "adbc_temp_view_test");
+  ASSERT_NE(view, nullptr) << "could not find temp.main.adbc_temp_view_test";
+  EXPECT_EQ(std::string(view->table_type.data, view->table_type.size_bytes), "view");
+  EXPECT_EQ(view->n_table_columns, 1);
 
-  std::vector<std::pair<std::string, std::vector<std::string>>> constraints;
-  for (int i = 0; i < table->n_table_constraints; i++) {
-    const struct AdbcGetObjectsConstraint* constraint = table->table_constraints[i];
-    std::vector<std::string> columns;
-    for (int j = 0; j < constraint->n_column_names; j++) {
-      columns.emplace_back(constraint->constraint_column_names[j].data,
-                           constraint->constraint_column_names[j].size_bytes);
-    }
-    constraints.emplace_back(std::string(constraint->constraint_type.data,
-                                         constraint->constraint_type.size_bytes),
-                             std::move(columns));
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, "temp", nullptr,
+                                           "adbc_temp_view_test", schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(schema->n_children, 1);
+}
+
+// Connected to md:, the current catalog option reports md:. Passed back to
+// GetTableSchema without a schema, it means the current database and schema.
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaMdCatalog) {
+  ASSERT_THAT(
+      ExecuteSql(&database, "CREATE OR REPLACE TABLE adbc_md_catalog_test (ints INT)",
+                 &error),
+      IsOkStatus(&error));
+
+  // The test URI with md: as its database.
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  std::string md_uri = uri;
+  const size_t path = md_uri.find('/', md_uri.find("://") + 3);
+  ASSERT_NE(path, std::string::npos) << "test URI has no database";
+  const size_t query = md_uri.find('?', path);
+  md_uri.replace(
+      path + 1, (query == std::string::npos ? md_uri.size() : query) - path - 1, "md%3A");
+
+  Handle<struct AdbcDatabase> md;
+  ASSERT_THAT(AdbcDatabaseNew(&md.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&md.value, md_uri.c_str(), &error),
+              IsOkStatus(&error));
+  // Single attach mode can't connect to md:.
+  ASSERT_THAT(AdbcDatabaseSetOption(&md.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                    "workspace", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&md.value, &error), IsOkStatus(&error));
+  Handle<struct AdbcConnection> md_connection;
+  ASSERT_THAT(AdbcConnectionNew(&md_connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&md_connection.value, &md.value, &error),
+              IsOkStatus(&error));
+  {
+    adbc_validation::Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcStatementNew(&md_connection.value, &statement.value, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcStatementSetSqlQuery(
+            &statement.value,
+            ("USE " + quirks_.QuoteIdentifier(quirks()->catalog())).c_str(), &error),
+        IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
+                IsOkStatus(&error));
   }
-  using Constraint = std::pair<std::string, std::vector<std::string>>;
-  EXPECT_THAT(constraints,
-              ::testing::UnorderedElementsAre(
-                  Constraint{"UNIQUE", {"a"}}, Constraint{"UNIQUE", {"c", "a"}},
-                  Constraint{"CHECK", {"b"}}, Constraint{"CHECK", {}}));
+
+  char current_catalog[256];
+  size_t length = sizeof(current_catalog);
+  ASSERT_THAT(AdbcConnectionGetOption(&md_connection.value,
+                                      ADBC_CONNECTION_OPTION_CURRENT_CATALOG,
+                                      current_catalog, &length, &error),
+              IsOkStatus(&error));
+  ASSERT_STREQ(current_catalog, "md:");
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcConnectionGetTableSchema(&md_connection.value, current_catalog, nullptr,
+                                           "adbc_md_catalog_test", schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(schema->n_children, 1);
+  EXPECT_STREQ(schema->children[0]->name, "ints");
 }
 
 // GetObjects lists a view's columns, and GetTableSchema describes a view.
