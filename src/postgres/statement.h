@@ -25,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <arrow-adbc/adbc.h>
@@ -180,6 +181,12 @@ class PostgresStatement {
                               const struct ArrowSchema* bind_schema);
   // The name ExecuteSchema gives a result column the server named name
   virtual std::string ResultColumnName(std::string name) const { return name; }
+  // Whether ingest's source column names the target table's column. Checked
+  // after an exact match fails, so servers that fold case can match that way.
+  virtual bool SameColumnName(std::string_view table_column,
+                              std::string_view source_column) const {
+    return table_column == source_column;
+  }
   const PostgresTypeResolver& type_resolver() const { return *type_resolver_; }
 
  private:

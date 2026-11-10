@@ -313,6 +313,18 @@ std::string MotherduckStatement::ResultColumnName(std::string name) const {
   return param_casts_.empty() ? name : UncastParameters(name, param_casts_);
 }
 
+// DuckDB column names ignore case. Fold ASCII only: std::tolower follows the C
+// locale, which a host application may change.
+bool MotherduckStatement::SameColumnName(std::string_view table_column,
+                                         std::string_view source_column) const {
+  auto fold = [](char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+  };
+  return std::equal(table_column.begin(), table_column.end(), source_column.begin(),
+                    source_column.end(),
+                    [&](char a, char b) { return fold(a) == fold(b); });
+}
+
 // MotherDuck answers DDL with an empty result set instead of a command tag.
 bool MotherduckStatement::IsCommandOk(PGresult* result) { return IsResultOk(result); }
 

@@ -3053,7 +3053,8 @@ TEST_F(PostgresStatementTest, SqlIngestAppendTargetLookupErrors) {
                 IsOkStatus(&error));
   }
 
-  auto append = [&](const char* target, const char* column) -> AdbcStatusCode {
+  auto append = [&](const char* db_schema, const char* target,
+                    const char* column) -> AdbcStatusCode {
     adbc_validation::Handle<struct ArrowSchema> schema;
     adbc_validation::Handle<struct ArrowArray> batch;
     ArrowSchemaInit(&schema.value);
@@ -3072,6 +3073,11 @@ TEST_F(PostgresStatementTest, SqlIngestAppendTargetLookupErrors) {
     EXPECT_THAT(AdbcStatementSetOption(&stmt.value, ADBC_INGEST_OPTION_TARGET_TABLE,
                                        target, &error),
                 IsOkStatus(&error));
+    if (db_schema != nullptr) {
+      EXPECT_THAT(AdbcStatementSetOption(&stmt.value, ADBC_INGEST_OPTION_TARGET_DB_SCHEMA,
+                                         db_schema, &error),
+                  IsOkStatus(&error));
+    }
     EXPECT_THAT(AdbcStatementSetOption(&stmt.value, ADBC_INGEST_OPTION_MODE,
                                        ADBC_INGEST_OPTION_MODE_APPEND, &error),
                 IsOkStatus(&error));
@@ -3080,10 +3086,20 @@ TEST_F(PostgresStatementTest, SqlIngestAppendTargetLookupErrors) {
     return AdbcStatementExecuteQuery(&stmt.value, nullptr, nullptr, &error);
   };
 
-  ASSERT_THAT(append("no_such_ingest_table", "amount"),
+  ASSERT_THAT(append(nullptr, "no_such_ingest_table", "amount"),
               IsStatus(ADBC_STATUS_NOT_FOUND, &error));
-  ASSERT_THAT(append("ingest_lookup", "not_a_column"),
+  ASSERT_THAT(append("no_such_ingest_schema", "ingest_lookup", "amount"),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  ASSERT_THAT(append(nullptr, "ingest_lookup", "not_a_column"),
               IsStatus(ADBC_STATUS_ALREADY_EXISTS, &error));
+
+  // DuckDB column names ignore case, so a differently cased column passes the
+  // lookup; the append then stops at COPY FROM STDIN (#31).
+  AdbcStatusCode status = append(nullptr, "INGEST_LOOKUP", "AMOUNT");
+  const char* message = error.message ? error.message : "";
+  EXPECT_NE(status, ADBC_STATUS_NOT_FOUND) << message;
+  EXPECT_NE(status, ADBC_STATUS_ALREADY_EXISTS) << message;
+  if (error.release) error.release(&error);
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendIntegerIntoNumeric) {

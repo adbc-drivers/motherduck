@@ -33,7 +33,6 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <cstring>
@@ -574,13 +573,8 @@ AdbcStatusCode PostgresStatement::ResolveCopyTargetTypes(
     auto it = std::find_if(table_fields.begin(), table_fields.end(),
                            [&](const auto& item) { return item.first == field_name; });
     if (it == table_fields.end()) {
-      // DuckDB column names ignore case, so fall back to that.
       it = std::find_if(table_fields.begin(), table_fields.end(), [&](const auto& item) {
-        return std::equal(item.first.begin(), item.first.end(), field_name.begin(),
-                          field_name.end(), [](char a, char b) {
-                            return std::tolower(static_cast<unsigned char>(a)) ==
-                                   std::tolower(static_cast<unsigned char>(b));
-                          });
+        return SameColumnName(item.first, field_name);
       });
     }
     if (it == table_fields.end()) {
