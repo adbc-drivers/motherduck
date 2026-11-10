@@ -34,7 +34,7 @@
 #include "copy/reader.h"
 #include "driver/common/utils.h"
 #include "driver/framework/status.h"
-#include "motherduck_pipeline.h"
+#include "statement_split.h"
 
 namespace adbcpq {
 
@@ -48,12 +48,27 @@ void PqResultArrayReader::Close() {
   closed_ = true;
   const bool user_cancel = cancel_requested_.load(std::memory_order_acquire);
   // Cancel only a statement that has no transaction to preserve. Cancelling
-  // inside the caller's transaction aborts it. An owned script is drained
-  // instead: the MotherDuck endpoint rejects SAVEPOINT, so there is no way to
-  // cancel the last statement and still commit the earlier ones. Closing
-  // INSERT ...; SELECT <huge> therefore reads the rest of that SELECT.
-  const bool cancel_if_blocked = user_cancel || (autocommit_ && !own_txn_);
+  // inside the caller's transaction aborts it. A script whose last statement
+  // sits in a savepoint can cancel that statement and still commit the rest.
+  // A reader that cannot use a savepoint drains the last statement instead.
+  const bool fast_close = savepoint_ && !user_cancel && helper_.streaming();
+  const bool cancel_if_blocked = user_cancel || fast_close || (autocommit_ && !own_txn_);
   const bool failed = helper_.Finish(cancel_if_blocked);
+  if (fast_close && !failed &&
+      (helper_.CancelSent() || PQtransactionStatus(conn_) == PQTRANS_INERROR)) {
+    PGresult* result = PQexec(conn_, "ROLLBACK TO SAVEPOINT adbc_stream");
+    const bool rolled_back = result != nullptr && CommandSucceeded(result);
+    PQclear(result);
+    savepoint_ = false;
+    if (!rolled_back) {
+      EndOwnedTransaction(false);
+      return;
+    }
+  }
+  if (fast_close && !failed) {
+    EndOwnedTransaction(true);
+    return;
+  }
   EndOwnedTransaction(!(failed || user_cancel));
 }
 
@@ -228,8 +243,8 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
     if (helper_.streaming()) {
       Status status = helper_.NextPacket();
       if (!status.ok()) {
-        // MotherDuck keeps the transaction open after a catalog error, so
-        // this has to roll back. The destructor would otherwise commit it.
+        // The statement failed. Roll the owned script back; the server may
+        // still report the transaction as in progress.
         EndOwnedTransaction(false);
         return status;
       }
@@ -367,6 +382,10 @@ Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
   return Status::Ok();
 }
 
+bool PqResultArrayReader::CommandSucceeded(const PGresult* result) const {
+  return PQresultStatus(result) == PGRES_COMMAND_OK;
+}
+
 Status PqResultArrayReader::EndOwnedTransaction(bool commit) {
   if (!own_txn_) return Status::Ok();
   own_txn_ = false;
@@ -374,7 +393,7 @@ Status PqResultArrayReader::EndOwnedTransaction(bool commit) {
   if (commit && PQtransactionStatus(conn_) == PQTRANS_INERROR) commit = false;
   const char* sql = commit ? "COMMIT" : "ROLLBACK";
   PGresult* result = PQexec(conn_, sql);
-  if (result == nullptr || !IsResultOk(result)) {
+  if (result == nullptr || !CommandSucceeded(result)) {
     Status status = MakeStatus(result, "[libpq] Failed to execute query '{}': {}", sql,
                                PQerrorMessage(conn_));
     PQclear(result);
@@ -411,6 +430,14 @@ Status PqResultArrayReader::OpenRowStream() {
   }
 
   helper_.set_query(std::move(statements.back()));
+  if (own_txn_ && ReleaseCanUseSavepoint()) {
+    Status savepoint = helper_.ExecuteCancellable("SAVEPOINT adbc_stream");
+    if (!savepoint.ok()) {
+      EndOwnedTransaction(false);
+      return savepoint;
+    }
+    savepoint_ = true;
+  }
   Status status = helper_.BeginRowStream();
   if (!status.ok()) EndOwnedTransaction(false);
   return status;

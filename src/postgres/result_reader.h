@@ -115,6 +115,8 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   // Set when this reader issued BEGIN so a multi-statement query stays one
   // transaction. Cleared once that transaction is committed or rolled back.
   bool own_txn_ = false;
+  // The streamed statement of an owned script is inside SAVEPOINT adbc_stream.
+  bool savepoint_ = false;
   AdbcStatusCode status_ = ADBC_STATUS_OK;
   struct AdbcError error_;
   struct ArrowError na_error_;
@@ -133,9 +135,11 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
         closed_(other->closed_),
         cancel_requested_(other->cancel_requested_.load()),
         own_txn_(other->own_txn_),
+        savepoint_(other->savepoint_),
         status_(other->status_) {
     other->cancel_requested_.store(false);
     other->own_txn_ = false;
+    other->savepoint_ = false;
     helper_.SetCancelFlag(&cancel_requested_);
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
@@ -144,6 +148,12 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   Status BindNextAndExecute(int64_t* affected_rows);
   virtual Status ExecuteAll(int64_t* affected_rows);
   Status OpenRowStream();
+  // A command tag is success. A subclass may also accept a tuples result.
+  virtual bool CommandSucceeded(const PGresult* result) const;
+  // When true, the last statement of an owned script is wrapped in a savepoint
+  // so closing the stream can cancel it. A server that rejects SAVEPOINT
+  // returns false and the close drains that statement instead.
+  virtual bool ReleaseCanUseSavepoint() const { return true; }
   // End the transaction this reader opened. commit is ignored when the server
   // has already aborted it. Does nothing when this reader did not begin one.
   Status EndOwnedTransaction(bool commit);

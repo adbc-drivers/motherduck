@@ -48,6 +48,8 @@ class MotherduckResultReader : public PqResultArrayReader {
         query_(std::move(query)) {}
 
  protected:
+  bool CommandSucceeded(const PGresult* result) const override;
+  bool ReleaseCanUseSavepoint() const override { return false; }
   Status ExecuteAll(int64_t* affected_rows) override;
   Status PrepareWithParamTypes() override;
   Status ResolveNullParamTypes() override;

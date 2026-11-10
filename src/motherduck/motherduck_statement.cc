@@ -279,6 +279,10 @@ Status MotherduckResultReader::ExecuteAll(int64_t* affected_rows) {
   return Status::Ok();
 }
 
+bool MotherduckResultReader::CommandSucceeded(const PGresult* result) const {
+  return IsResultOk(result);
+}
+
 std::unique_ptr<PqResultArrayReader> MotherduckStatement::MakeResultReader(
     PGconn* conn, std::shared_ptr<PostgresTypeResolver> type_resolver,
     std::string query) {
