@@ -82,6 +82,16 @@ TEST(PostgresErrorTest, PqErrorTextKeepsClientSideMessages) {
   PQfinish(conn);
 }
 
+// MakeStatus only takes redacted text and numbers (a static_assert in error.h rejects
+// anything else), and formats them as ordinary text.
+TEST(PostgresErrorTest, MakeStatusFormatsRedactedText) {
+  const std::string message =
+      MakeStatus(nullptr, "failed '{}' [{}] {}", RedactQuery("SELECT 1"),
+                 PqStatusName(PGRES_FATAL_ERROR), 7)
+          .message();
+  EXPECT_EQ(message, "failed 'SELECT 1' [PGRES_FATAL_ERROR] 7");
+}
+
 TEST(PostgresErrorTest, ClassifySqlState) {
   struct Case {
     const char* sqlstate;

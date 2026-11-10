@@ -27,6 +27,8 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <arrow-adbc/adbc.h>
@@ -78,6 +80,32 @@ constexpr size_t kMaxQueryBytes = 2048;
 /// Longest server-authored text (messages and diagnostic fields) kept in an error.
 constexpr size_t kMaxMessageBytes = 8192;
 
+/// \brief Text that is safe to put in an error message.
+///
+/// RedactQuery, RedactMessage and PqErrorText return this, and MakeStatus accepts
+/// nothing else as a message argument, so a raw query or PQerrorMessage can't slip into an
+/// error by accident. It is a std::string in every other way. Wrapping text that is
+/// already safe, such as a status name, is an explicit choice.
+class RedactedText : public std::string {
+ public:
+  RedactedText() = default;
+  explicit RedactedText(std::string text) : std::string(std::move(text)) {}
+  explicit RedactedText(const char* text) : std::string(text) {}
+};
+
+}  // namespace adbcpq
+
+// fmt matches the exact type, so a type derived from std::string needs its own formatter.
+template <>
+struct fmt::formatter<adbcpq::RedactedText> : fmt::formatter<std::string_view> {
+  template <typename FormatContext>
+  auto format(const adbcpq::RedactedText& text, FormatContext& ctx) const {
+    return fmt::formatter<std::string_view>::format(std::string_view(text), ctx);
+  }
+};
+
+namespace adbcpq {
+
 /// \brief Install the redactor used by RedactQuery. Passing nullptr restores the default,
 /// which returns the query unchanged. Call once at driver initialization.
 void SetQueryRedactor(QueryRedactor redactor);
@@ -86,10 +114,10 @@ void SetQueryRedactor(QueryRedactor redactor);
 ///
 /// Truncation comes first, so the redactor sees every statement header in the kept
 /// prefix and nothing else.
-std::string RedactQuery(std::string_view query);
+RedactedText RedactQuery(std::string_view query);
 
 /// \brief As RedactQuery, for text the server wrote (kMaxMessageBytes).
-std::string RedactMessage(std::string_view message);
+RedactedText RedactMessage(std::string_view message);
 
 /// \brief The server's error text without the echoed statement.
 ///
@@ -97,7 +125,7 @@ std::string RedactMessage(std::string_view message);
 /// error position and, for internal queries, a "QUERY:" line. Both can contain
 /// credentials, so use the terse form for errors on user-supplied SQL. Falls back to
 /// the connection's error message when there is no result, or the result has no fields.
-inline std::string PqErrorText(PGresult* result, PGconn* conn) {
+inline RedactedText PqErrorText(PGresult* result, PGconn* conn) {
   if (result != nullptr) {
     // A result libpq made itself (connection lost, out of memory) or one that isn't an
     // error has no diagnostic fields, so the verbose form would only say "missing error
@@ -105,18 +133,23 @@ inline std::string PqErrorText(PGresult* result, PGconn* conn) {
     if (PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY) == nullptr) {
       std::string_view own = PQresultErrorMessage(result);
       if (!own.empty()) return RedactMessage(own);
-      return conn != nullptr ? RedactMessage(PQerrorMessage(conn)) : "";
+      return conn != nullptr ? RedactMessage(PQerrorMessage(conn)) : RedactedText();
     }
     char* text =
         PQresultVerboseErrorMessage(result, PQERRORS_TERSE, PQSHOW_CONTEXT_NEVER);
     // Never fall back to the default message, which echoes the statement.
-    if (text == nullptr) return "(server error text unavailable)";
+    if (text == nullptr) return RedactedText("(server error text unavailable)");
     std::string out(text);
     PQfreemem(text);
     // The server's own message can quote the statement as well.
     return RedactMessage(out);
   }
-  return conn != nullptr ? RedactMessage(PQerrorMessage(conn)) : "";
+  return conn != nullptr ? RedactMessage(PQerrorMessage(conn)) : RedactedText();
+}
+
+/// \brief libpq's name for a result status, e.g. "PGRES_FATAL_ERROR".
+inline RedactedText PqStatusName(ExecStatusType status) {
+  return RedactedText(PQresStatus(status));
 }
 
 /// \brief The status for a server error, from its SQLSTATE and primary message.
@@ -127,6 +160,11 @@ AdbcStatusCode ClassifyServerError(const char* sqlstate, const char* primary_mes
 
 template <typename... Args>
 Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
+  static_assert(
+      (... && (std::is_arithmetic_v<std::decay_t<Args>> ||
+               std::is_same_v<std::decay_t<Args>, RedactedText>)),
+      "MakeStatus arguments must be numbers or RedactedText: pass SQL through "
+      "RedactQuery and libpq errors through PqErrorText");
   auto message = ::fmt::vformat(format_string, ::fmt::make_format_args(args...));
 
   AdbcStatusCode code = ADBC_STATUS_IO;

@@ -248,7 +248,7 @@ Status MotherduckResultReader::ExecuteAll(int64_t* affected_rows) {
           } else if (result_status != PGRES_PIPELINE_ABORTED && status.ok()) {
             status =
                 MakeStatus(result, "[libpq] Failed to execute prepared statement: {} {}",
-                           PQresStatus(result_status), PqErrorText(result, conn_));
+                           PqStatusName(result_status), PqErrorText(result, conn_));
             PQclear(result);
           } else {
             PQclear(result);

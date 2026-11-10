@@ -41,7 +41,7 @@ void SetQueryRedactor(QueryRedactor redactor) { query_redactor.store(redactor); 
 namespace {
 
 // Cut text to at most max_bytes, redact the prefix, and mark the cut.
-std::string TruncateAndRedact(std::string_view text, size_t max_bytes) {
+RedactedText TruncateAndRedact(std::string_view text, size_t max_bytes) {
   bool truncated = false;
   if (text.size() > max_bytes) {
     size_t cut = max_bytes;
@@ -57,16 +57,16 @@ std::string TruncateAndRedact(std::string_view text, size_t max_bytes) {
     out = std::string(text);
   }
   if (truncated) out += "... [truncated]";
-  return out;
+  return RedactedText(std::move(out));
 }
 
 }  // namespace
 
-std::string RedactQuery(std::string_view query) {
+RedactedText RedactQuery(std::string_view query) {
   return TruncateAndRedact(query, kMaxQueryBytes);
 }
 
-std::string RedactMessage(std::string_view message) {
+RedactedText RedactMessage(std::string_view message) {
   return TruncateAndRedact(message, kMaxMessageBytes);
 }
 
