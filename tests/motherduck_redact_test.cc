@@ -244,8 +244,15 @@ TEST(MotherDuckRedactTest, SecretNearTheTruncationPointIsNotLogged) {
 TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   if (!uri) GTEST_SKIP() << "ADBC_POSTGRESQL_TEST_URI not set";
-  PGconn* conn = PQconnectdb(uri);
-  ASSERT_EQ(PQstatus(conn), CONNECTION_OK) << PQerrorMessage(conn);
+  // The driver adds the token to the URI; do the same here.
+  const char* token = std::getenv("MOTHERDUCK_TOKEN");
+  const char* keywords[] = {"dbname", "password", nullptr};
+  const char* values[] = {uri, token != nullptr ? token : "", nullptr};
+  PGconn* conn = PQconnectdbParams(keywords, values, /*expand_dbname=*/1);
+  if (PQstatus(conn) != CONNECTION_OK) {
+    PQfinish(conn);
+    GTEST_SKIP() << "cannot connect with libpq directly";
+  }
   PGresult* result = PQexec(conn, "SELECT FROM WHERE 'UNIQUEMARKER' +");
   ASSERT_EQ(PQresultStatus(result), PGRES_FATAL_ERROR);
   if (std::string(PQresultErrorMessage(result)).find("UNIQUEMARKER") ==

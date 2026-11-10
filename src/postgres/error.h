@@ -83,8 +83,8 @@ constexpr size_t kMaxMessageBytes = 8192;
 /// \brief Text that is safe to put in an error message.
 ///
 /// RedactQuery, RedactMessage and PqErrorText return this, and MakeStatus accepts
-/// nothing else as a message argument, so a raw query or PQerrorMessage can't slip into an
-/// error by accident. It is a std::string in every other way. Wrapping text that is
+/// nothing else as a message argument, so a raw query or PQerrorMessage can't slip into
+/// an error by accident. It is a std::string in every other way. Wrapping text that is
 /// already safe, such as a status name, is an explicit choice.
 class RedactedText : public std::string {
  public:
@@ -160,11 +160,10 @@ AdbcStatusCode ClassifyServerError(const char* sqlstate, const char* primary_mes
 
 template <typename... Args>
 Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
-  static_assert(
-      (... && (std::is_arithmetic_v<std::decay_t<Args>> ||
-               std::is_same_v<std::decay_t<Args>, RedactedText>)),
-      "MakeStatus arguments must be numbers or RedactedText: pass SQL through "
-      "RedactQuery and libpq errors through PqErrorText");
+  static_assert((... && (std::is_arithmetic_v<std::decay_t<Args>> ||
+                         std::is_same_v<std::decay_t<Args>, RedactedText>)),
+                "MakeStatus arguments must be numbers or RedactedText: pass SQL through "
+                "RedactQuery and libpq errors through PqErrorText");
   auto message = ::fmt::vformat(format_string, ::fmt::make_format_args(args...));
 
   AdbcStatusCode code = ADBC_STATUS_IO;
