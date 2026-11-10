@@ -38,17 +38,55 @@
 namespace adbcpq {
 
 PqResultHelper::~PqResultHelper() {
+  PQclear(pending_);
+  pending_ = nullptr;
   ClearResult();
   if (streaming_) AbandonStream();
 }
 
+namespace {
+
+// Wait until the server has accepted the cancel. A bare PQcancel returns
+// before the server applies it, so it can abort the next query instead.
+bool SendCancel(PGconn* conn) {
+#ifdef LIBPQ_HAS_ASYNC_CANCEL
+  PGcancelConn* cancel = PQcancelCreate(conn);
+  if (cancel == nullptr) return false;
+  const int rc = PQcancelBlocking(cancel);
+  PQcancelFinish(cancel);
+  return rc == 1;
+#else
+  char errbuf[256];
+  PGcancel* cancel = PQgetCancel(conn);
+  if (cancel == nullptr) return false;
+  const int rc = PQcancel(cancel, errbuf, sizeof(errbuf));
+  PQfreeCancel(cancel);
+  return rc == 1;
+#endif
+}
+
+}  // namespace
+
 void PqResultHelper::AbandonStream() {
-  // Drain only. A cancel request is asynchronous and can arrive after this
-  // query has finished, which would abort the next query on the connection.
+  if (!streaming_ && pending_ == nullptr) return;
   streaming_ = false;
+  PQclear(pending_);
+  pending_ = nullptr;
+  // Cancel only when the next read would block. If the rest is already
+  // buffered, a cancel has nothing to interrupt and can hit the next query.
+  bool sent_cancel = false;
+  if (PQconsumeInput(conn_) == 1 && PQisBusy(conn_) == 1) {
+    sent_cancel = SendCancel(conn_);
+  }
   PGresult* result;
   while ((result = PQgetResult(conn_)) != nullptr) {
     PQclear(result);
+  }
+  // If the cancel missed this query, spend it on a dummy command.
+  if (sent_cancel && PQstatus(conn_) == CONNECTION_OK &&
+      PQtransactionStatus(conn_) != PQTRANS_INERROR) {
+    PGresult* probe = PQexec(conn_, "SELECT 1");
+    PQclear(probe);
   }
 }
 
@@ -76,11 +114,11 @@ Status PqResultHelper::BeginRowStream() {
                       PQerrorMessage(conn_));
   }
 
-  // One row is not a batch. Ask libpq for up to this many rows per packet;
-  // the Arrow batch still stops on the byte hint.
-  constexpr int kStreamChunkRows = 1024;
+  // libpq-fe.h defines LIBPQ_HAS_CHUNK_MODE on libpq 17+. Older headers have
+  // no chunk API; single-row mode is their only batching.
   int armed;
 #ifdef LIBPQ_HAS_CHUNK_MODE
+  constexpr int kStreamChunkRows = 1024;
   armed = PQsetChunkedRowsMode(conn_, kStreamChunkRows);
 #else
   armed = PQsetSingleRowMode(conn_);
@@ -95,14 +133,46 @@ Status PqResultHelper::BeginRowStream() {
   return Status::Ok();
 }
 
+void PqResultHelper::PullBufferedTail() {
+  if (!streaming_ || pending_ != nullptr) return;
+  if (PQconsumeInput(conn_) != 1 || PQisBusy(conn_) != 0) return;
+  PGresult* next = PQgetResult(conn_);
+  if (next == nullptr) {
+    streaming_ = false;
+    return;
+  }
+  const ExecStatusType status = PQresultStatus(next);
+  if (IsRowPacket(status)) {
+    pending_ = next;
+    return;
+  }
+  if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK &&
+      status != PGRES_EMPTY_QUERY) {
+    // An error has to reach the next read. Don't commit over it.
+    pending_ = next;
+    return;
+  }
+  PQclear(next);
+  PGresult* extra;
+  while ((extra = PQgetResult(conn_)) != nullptr) {
+    PQclear(extra);
+  }
+  streaming_ = false;
+}
+
 Status PqResultHelper::NextPacket() {
-  if (!streaming_) {
+  if (!streaming_ && pending_ == nullptr) {
     ClearResult();
     return Status::Ok();
   }
 
   ClearResult();
-  result_ = PQgetResult(conn_);
+  if (pending_ != nullptr) {
+    result_ = pending_;
+    pending_ = nullptr;
+  } else {
+    result_ = PQgetResult(conn_);
+  }
   if (result_ == nullptr) {
     streaming_ = false;
     if (PQstatus(conn_) == CONNECTION_BAD) {
@@ -112,7 +182,10 @@ Status PqResultHelper::NextPacket() {
   }
 
   const ExecStatusType status = PQresultStatus(result_);
-  if (IsRowPacket(status)) return Status::Ok();
+  if (IsRowPacket(status)) {
+    PullBufferedTail();
+    return Status::Ok();
+  }
 
   if (status == PGRES_TUPLES_OK || status == PGRES_COMMAND_OK ||
       status == PGRES_EMPTY_QUERY) {

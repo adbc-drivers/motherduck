@@ -27,6 +27,8 @@
 
 #include "connection.h"
 
+#include "result_reader.h"
+
 #include <array>
 #include <cassert>
 #include <cinttypes>
@@ -1158,7 +1160,25 @@ AdbcStatusCode PostgresConnection::Init(struct AdbcDatabase* database,
   return ADBC_STATUS_OK;
 }
 
+void PostgresConnection::TrackActiveReader(
+    const std::shared_ptr<PqResultArrayReader>& reader) {
+  active_reader_ = reader;
+}
+
+std::shared_ptr<PqResultArrayReader> PostgresConnection::ActiveReader() const {
+  return active_reader_.lock();
+}
+
+void PostgresConnection::FinishActiveReader() {
+  auto reader = active_reader_.lock();
+  active_reader_.reset();
+  if (reader) reader->ReleaseConnection();
+}
+
 AdbcStatusCode PostgresConnection::Release(struct AdbcError* error) {
+  // Detach readers before PQfinish. Their destructors must not call libpq
+  // on a connection this has already freed.
+  FinishActiveReader();
   if (cancel_) {
     PQfreeCancel(cancel_);
     cancel_ = nullptr;

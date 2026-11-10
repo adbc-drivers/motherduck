@@ -36,6 +36,7 @@
 
 namespace adbcpq {
 class PostgresDatabase;
+class PqResultArrayReader;
 class PostgresConnection {
  public:
   PostgresConnection()
@@ -83,6 +84,11 @@ class PostgresConnection {
   AdbcStatusCode SetOptionInt(const char* key, int64_t value, struct AdbcError* error);
 
   PGconn* conn() const { return conn_; }
+  // The stream currently reading from conn_, if any. Any new command on this
+  // connection has to finish that read first, whichever statement starts it.
+  void TrackActiveReader(const std::shared_ptr<PqResultArrayReader>& reader);
+  std::shared_ptr<PqResultArrayReader> ActiveReader() const;
+  void FinishActiveReader();
   const std::shared_ptr<PostgresTypeResolver>& type_resolver() const {
     return type_resolver_;
   }
@@ -100,6 +106,7 @@ class PostgresConnection {
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
   PGconn* conn_;
   PGcancel* cancel_;
+  std::weak_ptr<PqResultArrayReader> active_reader_;
   bool autocommit_;
   bool use_copy_;
   std::vector<std::pair<std::string, std::string>> post_init_options_;

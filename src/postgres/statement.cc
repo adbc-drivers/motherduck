@@ -385,7 +385,9 @@ AdbcStatusCode PostgresStatement::Bind(struct ArrowArrayStream* stream,
 }
 
 AdbcStatusCode PostgresStatement::Cancel(struct AdbcError* error) {
-  // Ultimately the same underlying PGconn
+  if (auto reader = connection_->ActiveReader()) return reader->RequestCancel(error);
+  // ExecuteQuery has not published the reader yet. Cancel the connection so a
+  // query blocked in that call can unblock.
   return connection_->Cancel(error);
 }
 
@@ -636,7 +638,9 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
     reader->SetVendorName(connection_->VendorName());
     reader->SetBatchSizeHint(batch_size_hint_bytes_);
     RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
-    if (stream != nullptr && reader->streaming_rows()) active_stream_ = reader;
+    if (stream != nullptr && reader->streaming_rows()) {
+      connection_->TrackActiveReader(reader);
+    }
     return ADBC_STATUS_OK;
   }
 
@@ -660,7 +664,9 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
     reader->SetVendorName(connection_->VendorName());
     reader->SetBatchSizeHint(batch_size_hint_bytes_);
     RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
-    if (stream != nullptr && reader->streaming_rows()) active_stream_ = reader;
+    if (stream != nullptr && reader->streaming_rows()) {
+      connection_->TrackActiveReader(reader);
+    }
     return ADBC_STATUS_OK;
   }
 
@@ -939,9 +945,8 @@ AdbcStatusCode PostgresStatement::Prepare(struct AdbcError* error) {
 }
 
 AdbcStatusCode PostgresStatement::Release(struct AdbcError* error) {
-  // The stream owns its reader and the connection. Dropping the statement
-  // must not finish that read.
-  active_stream_.reset();
+  // The connection, not this statement, finishes an open stream. Releasing
+  // the statement leaves a stream that still owns its reader usable.
   if (reader_) {
     reader_->Release();
     reader_.reset();
@@ -1075,8 +1080,8 @@ AdbcStatusCode PostgresStatement::SetOptionInt(const char* key, int64_t value,
 
 void PostgresStatement::ClearResult() {
   // TODO: we may want to synchronize here for safety
-  if (auto active = active_stream_.lock()) active->ReleaseConnection();
-  active_stream_.reset();
+  // Every statement on this connection shares one libpq command.
+  if (connection_) connection_->FinishActiveReader();
   if (reader_) reader_->Release();
   reader_ = std::make_shared<TupleReader>(connection_->conn());
   reader_->batch_size_hint_bytes_ = batch_size_hint_bytes_;

@@ -132,6 +132,8 @@ class PqResultHelper {
       : PqResultHelper(other.conn_, std::move(other.query_)) {
     result_ = other.result_;
     other.result_ = nullptr;
+    pending_ = other.pending_;
+    other.pending_ = nullptr;
     streaming_ = other.streaming_;
     other.streaming_ = false;
   }
@@ -153,6 +155,9 @@ class PqResultHelper {
   void set_query(std::string query) { query_ = std::move(query); }
   // Replace result_ with the next chunk. A finished query leaves no result.
   Status NextPacket();
+  // If the command-complete after this chunk is already buffered, drop it so
+  // the caller can commit without waiting for the stream to be read.
+  void PullBufferedTail();
   bool streaming() const { return streaming_; }
   // Read and discard whatever is left of an open query. Does not cancel.
   void Finish() { if (streaming_) AbandonStream(); }
@@ -224,6 +229,9 @@ class PqResultHelper {
 
  private:
   PGresult* result_ = nullptr;
+  // The next packet, already taken off the connection so a trailing
+  // command-complete could be dropped and the transaction closed.
+  PGresult* pending_ = nullptr;
   PGconn* conn_;
   std::string query_;
   bool streaming_ = false;
@@ -231,8 +239,8 @@ class PqResultHelper {
   Format output_format_ = Format::kText;
 
   Status PrepareInternal(int n_params, const Oid* param_oids) const;
-  // Cancel an open row stream and discard whatever is left, so releasing the
-  // reader early leaves the connection usable.
+  // Drop an open row stream so the connection can run another command.
+  // Cancels only when the next read would block.
   void AbandonStream();
 };
 

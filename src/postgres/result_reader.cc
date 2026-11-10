@@ -39,8 +39,13 @@
 namespace adbcpq {
 
 PqResultArrayReader::~PqResultArrayReader() {
-  if (helper_.streaming()) helper_.Finish();
-  EndOwnedTransaction(true);
+  // ReleaseConnection already finished the libpq calls while the connection
+  // was still open. Touching PGconn after PostgresConnection::Release is a
+  // use-after-free: Release disconnects even if this reader still exists.
+  if (!closed_) {
+    if (helper_.streaming()) helper_.Finish();
+    EndOwnedTransaction(false);
+  }
   ResetErrors();
 }
 
@@ -59,6 +64,16 @@ int PqResultArrayReader::GetSchema(struct ArrowSchema* out) {
 }
 
 int PqResultArrayReader::GetNext(struct ArrowArray* out) {
+  if (cancel_requested_ && !closed_) {
+    closed_ = true;
+    if (helper_.streaming()) helper_.Finish();
+    EndOwnedTransaction(false);
+    Status status(ADBC_STATUS_CANCELLED,
+                  "[libpq] canceling statement due to user request");
+    status.SetSqlState("57014");
+    return Fail(status);
+  }
+
   if (closed_) {
     if (error_.message == nullptr) {
       status_ = ADBC_STATUS_INVALID_STATE;
@@ -211,6 +226,15 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
         EndOwnedTransaction(false);
         return Status::IO("[libpq] Query returned no result");
       }
+    }
+    if (!helper_.streaming()) {
+      // The server is done, including a command whose only leftover was a
+      // buffered trailer. Commit before returning so the change is visible.
+      UNWRAP_STATUS(EndOwnedTransaction(true));
+    }
+    if (helper_.streaming() || helper_.NumRows() > 0) {
+      // More packets are coming, or this packet still has rows to split on
+      // the byte hint. The count stays unknown: it is not written later.
       streaming_rows_ = true;
       if (rows_affected != nullptr) *rows_affected = -1;
     } else if (rows_affected != nullptr) {
@@ -353,7 +377,11 @@ Status PqResultArrayReader::OpenRowStream() {
   // The result readers decode binary values, and only the extended protocol
   // can ask for those. It also accepts one statement. An explicit transaction
   // keeps the earlier statements from committing when a later one fails.
-  if (autocommit_) {
+  // The connection's flag wins. The member defaults to on so a caller that
+  // never sets it still gets one transaction.
+  const bool autocommit =
+      connection_ != nullptr ? connection_->autocommit() : autocommit_;
+  if (autocommit) {
     PGresult* begin = PQexec(conn_, "BEGIN");
     if (begin == nullptr || !IsResultOk(begin)) {
       Status status = MakeStatus(begin, "[libpq] Failed to execute query '{}': {}",
@@ -385,16 +413,24 @@ Status PqResultArrayReader::OpenRowStream() {
 
 void PqResultArrayReader::ReleaseConnection() {
   if (closed_) return;
-  if (helper_.streaming()) {
-    closed_ = true;
-    helper_.Finish();
-    status_ = ADBC_STATUS_INVALID_STATE;
-    InternalAdbcSetError(&error_, "%s",
-                         "[libpq] Reader invalidated (statement or reader was closed)");
-  }
-  // A finished result can stay readable. The transaction still has to end or
-  // the next command runs inside it.
-  EndOwnedTransaction(true);
+  closed_ = true;
+  if (helper_.streaming()) helper_.Finish();
+  EndOwnedTransaction(false);
+  status_ = ADBC_STATUS_INVALID_STATE;
+  InternalAdbcSetError(&error_, "%s",
+                       "[libpq] Reader invalidated (statement or reader was closed)");
+}
+
+AdbcStatusCode PqResultArrayReader::RequestCancel(struct AdbcError* error) {
+  cancel_requested_ = true;
+  if (!helper_.streaming() || connection_ == nullptr) return ADBC_STATUS_OK;
+  // Between reads, a buffered remainder must not be cancelled: the server is
+  // already idle and the cancel would hit the next command. PQcancel itself
+  // is what unblocks a thread stuck in PQgetResult, where this returns busy.
+  // shortcut: PQconsumeInput is not safe if another thread is inside
+  // PQgetResult. Cancel during ExecuteQuery does not come through here.
+  if (PQconsumeInput(conn_) == 1 && PQisBusy(conn_) == 0) return ADBC_STATUS_OK;
+  return connection_->Cancel(error);
 }
 
 Status PqResultArrayReader::BindNextAndExecute(int64_t* affected_rows) {
