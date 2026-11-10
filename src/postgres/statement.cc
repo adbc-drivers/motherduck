@@ -551,18 +551,10 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
 AdbcStatusCode PostgresStatement::ResolveCopyTargetTypes(
     const std::string& escaped_table, const std::vector<std::string>& source_field_names,
     PostgresType* copy_target_types, struct AdbcError* error) {
-  // Read the column types from an empty query on the table rather than casting
-  // its name with ::regclass, which MotherDuck can't parse for quoted, qualified
-  // names (#13). The name resolves as in any query, and a missing table fails
-  // with 42P01 (NOT_FOUND). Without parameters, Execute sends one simple query,
-  // whose result still describes the columns. Unlike the catalog lookup, this
-  // needs SELECT on the table; MotherDuck has no GRANT, so anyone who can
-  // append can read it.
-  PqResultHelper result_helper{connection_->conn(),
-                               "SELECT * FROM " + escaped_table + " LIMIT 0"};
-  RAISE_STATUS(error, result_helper.Execute());
+  // Look up the columns by querying the table rather than casting its name with
+  // ::regclass, which MotherDuck can't parse for quoted, qualified names (#13).
   PostgresType table_type;
-  RAISE_STATUS(error, result_helper.ResolveOutputTypes(*type_resolver_, &table_type));
+  RAISE_STATUS(error, connection_->DescribeTable(escaped_table, &table_type));
 
   std::vector<std::pair<std::string, uint32_t>> table_fields;
   table_fields.reserve(table_type.n_children());
