@@ -32,6 +32,7 @@
 #include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
 
+#include "driver/framework/status.h"
 #include "postgres_type.h"
 
 namespace adbc::driver {
@@ -99,6 +100,15 @@ class PostgresConnection {
   bool use_copy() const { return use_copy_; }
   std::string_view VendorName();
   const std::array<int, 3>& VendorVersion();
+
+  /// \brief The columns of a table or view, as a record type.
+  ///
+  /// Runs an empty query on qualified_name, an already quoted name, so the name
+  /// resolves as in any query: through the search path, and ignoring case where
+  /// the server does. A missing table fails with 42P01 (NOT_FOUND). Unlike a
+  /// catalog lookup, this needs SELECT on the table.
+  adbc::driver::Status DescribeTable(const std::string& qualified_name,
+                                     PostgresType* columns);
 
  protected:
   virtual std::unique_ptr<adbc::driver::GetObjectsHelper> MakeGetObjectsHelper();
