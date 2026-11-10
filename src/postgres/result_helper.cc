@@ -23,6 +23,8 @@
 // For #warning Please include winsock2.h before windows.h on RTools/msys2
 #ifdef _WIN32
 #include <winsock2.h>
+#else
+#include <poll.h>
 #endif
 
 #include "result_helper.h"
@@ -49,55 +51,75 @@ namespace {
 // Wait until the server has accepted the cancel. A bare PQcancel returns
 // before the server applies it, so it can abort the next query instead.
 bool SendCancel(PGconn* conn) {
-#ifdef LIBPQ_HAS_ASYNC_CANCEL
   PGcancelConn* cancel = PQcancelCreate(conn);
   if (cancel == nullptr) return false;
   const int rc = PQcancelBlocking(cancel);
   PQcancelFinish(cancel);
   return rc == 1;
+}
+
+bool IsFailure(const PGresult* result) {
+  if (result == nullptr) return false;
+  const ExecStatusType status = PQresultStatus(result);
+  return status == PGRES_FATAL_ERROR || status == PGRES_BAD_RESPONSE;
+}
+
+void WaitForSocket(int sock) {
+  if (sock < 0) return;
+#ifdef _WIN32
+  fd_set input;
+  FD_ZERO(&input);
+  FD_SET(sock, &input);
+  timeval timeout;
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 50 * 1000;
+  select(0, &input, nullptr, nullptr, &timeout);
 #else
-  char errbuf[256];
-  PGcancel* cancel = PQgetCancel(conn);
-  if (cancel == nullptr) return false;
-  const int rc = PQcancel(cancel, errbuf, sizeof(errbuf));
-  PQfreeCancel(cancel);
-  return rc == 1;
+  pollfd pfd;
+  pfd.fd = sock;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  poll(&pfd, 1, 50);
 #endif
 }
 
 }  // namespace
 
-void PqResultHelper::AbandonStream() {
-  if (!streaming_ && pending_ == nullptr) return;
+void PqResultHelper::WaitUntilReady() {
+  // The cancel thread only sets cancel_flag_. This thread sends the cancel,
+  // and only while the next read would block, so it cannot hit a later query.
+  for (;;) {
+    if (PQconsumeInput(conn_) != 1) return;
+    if (PQisBusy(conn_) == 0) return;
+    if (cancel_flag_ != nullptr && cancel_flag_->load(std::memory_order_acquire) &&
+        !cancel_sent_) {
+      SendCancel(conn_);
+      cancel_sent_ = true;
+      return;
+    }
+    WaitForSocket(PQsocket(conn_));
+  }
+}
+
+bool PqResultHelper::AbandonStream() {
+  if (!streaming_ && pending_ == nullptr) return false;
+  bool failed = IsFailure(pending_);
   streaming_ = false;
   PQclear(pending_);
   pending_ = nullptr;
-  // Cancel only when the next read would block. If the rest is already
-  // buffered, a cancel has nothing to interrupt and can hit the next query.
-  bool sent_cancel = false;
-  if (PQconsumeInput(conn_) == 1 && PQisBusy(conn_) == 1) {
-    sent_cancel = SendCancel(conn_);
-  }
-  PGresult* result;
-  while ((result = PQgetResult(conn_)) != nullptr) {
+  for (;;) {
+    WaitUntilReady();
+    PGresult* result = PQgetResult(conn_);
+    if (result == nullptr) return failed;
+    if (IsFailure(result)) failed = true;
     PQclear(result);
-  }
-  // If the cancel missed this query, spend it on a dummy command.
-  if (sent_cancel && PQstatus(conn_) == CONNECTION_OK &&
-      PQtransactionStatus(conn_) != PQTRANS_INERROR) {
-    PGresult* probe = PQexec(conn_, "SELECT 1");
-    PQclear(probe);
   }
 }
 
 namespace {
 
 bool IsRowPacket(ExecStatusType status) {
-  if (status == PGRES_SINGLE_TUPLE) return true;
-#ifdef LIBPQ_HAS_CHUNK_MODE
-  if (status == PGRES_TUPLES_CHUNK) return true;
-#endif
-  return false;
+  return status == PGRES_TUPLES_CHUNK || status == PGRES_SINGLE_TUPLE;
 }
 
 }  // namespace
@@ -114,15 +136,8 @@ Status PqResultHelper::BeginRowStream() {
                       PQerrorMessage(conn_));
   }
 
-  // libpq-fe.h defines LIBPQ_HAS_CHUNK_MODE on libpq 17+. Older headers have
-  // no chunk API; single-row mode is their only batching.
-  int armed;
-#ifdef LIBPQ_HAS_CHUNK_MODE
   constexpr int kStreamChunkRows = 1024;
-  armed = PQsetChunkedRowsMode(conn_, kStreamChunkRows);
-#else
-  armed = PQsetSingleRowMode(conn_);
-#endif
+  const int armed = PQsetChunkedRowsMode(conn_, kStreamChunkRows);
   if (armed != 1) {
     streaming_ = true;
     AbandonStream();
@@ -171,6 +186,7 @@ Status PqResultHelper::NextPacket() {
     result_ = pending_;
     pending_ = nullptr;
   } else {
+    WaitUntilReady();
     result_ = PQgetResult(conn_);
   }
   if (result_ == nullptr) {

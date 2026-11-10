@@ -43,8 +43,10 @@ PqResultArrayReader::~PqResultArrayReader() {
   // was still open. Touching PGconn after PostgresConnection::Release is a
   // use-after-free: Release disconnects even if this reader still exists.
   if (!closed_) {
-    if (helper_.streaming()) helper_.Finish();
-    EndOwnedTransaction(false);
+    const bool failed = helper_.Finish();
+    const bool cancel = cancel_requested_.load(std::memory_order_acquire);
+    // A clean drain commits, matching one PQexec. A failure or a cancel does not.
+    EndOwnedTransaction(!(failed || cancel));
   }
   ResetErrors();
 }
@@ -64,9 +66,9 @@ int PqResultArrayReader::GetSchema(struct ArrowSchema* out) {
 }
 
 int PqResultArrayReader::GetNext(struct ArrowArray* out) {
-  if (cancel_requested_ && !closed_) {
+  if (cancel_requested_.load(std::memory_order_acquire) && !closed_) {
     closed_ = true;
-    if (helper_.streaming()) helper_.Finish();
+    helper_.Finish();
     EndOwnedTransaction(false);
     Status status(ADBC_STATUS_CANCELLED,
                   "[libpq] canceling statement due to user request");
@@ -413,24 +415,25 @@ Status PqResultArrayReader::OpenRowStream() {
 
 void PqResultArrayReader::ReleaseConnection() {
   if (closed_) return;
+  if (!helper_.streaming()) {
+    // Rows are already local. Leave them readable and commit any script that
+    // finished on the server.
+    EndOwnedTransaction(true);
+    return;
+  }
   closed_ = true;
-  if (helper_.streaming()) helper_.Finish();
-  EndOwnedTransaction(false);
+  const bool failed = helper_.Finish();
+  const bool cancel = cancel_requested_.load(std::memory_order_acquire);
+  EndOwnedTransaction(!(failed || cancel));
   status_ = ADBC_STATUS_INVALID_STATE;
   InternalAdbcSetError(&error_, "%s",
                        "[libpq] Reader invalidated (statement or reader was closed)");
 }
 
 AdbcStatusCode PqResultArrayReader::RequestCancel(struct AdbcError* error) {
-  cancel_requested_ = true;
-  if (!helper_.streaming() || connection_ == nullptr) return ADBC_STATUS_OK;
-  // Between reads, a buffered remainder must not be cancelled: the server is
-  // already idle and the cancel would hit the next command. PQcancel itself
-  // is what unblocks a thread stuck in PQgetResult, where this returns busy.
-  // shortcut: PQconsumeInput is not safe if another thread is inside
-  // PQgetResult. Cancel during ExecuteQuery does not come through here.
-  if (PQconsumeInput(conn_) == 1 && PQisBusy(conn_) == 0) return ADBC_STATUS_OK;
-  return connection_->Cancel(error);
+  (void)error;
+  cancel_requested_.store(true, std::memory_order_release);
+  return ADBC_STATUS_OK;
 }
 
 Status PqResultArrayReader::BindNextAndExecute(int64_t* affected_rows) {

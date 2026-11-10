@@ -24,6 +24,7 @@
 
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -150,6 +151,7 @@ class PostgresStatement {
   // Helper methods
 
   void ClearResult();
+  void RememberReader(const std::shared_ptr<PqResultArrayReader>& reader);
   AdbcStatusCode CreateBulkTable(const std::string& current_schema,
                                  const struct ArrowSchema& source_schema,
                                  std::string* escaped_table,
@@ -211,6 +213,10 @@ class PostgresStatement {
   } ingest_;
 
   std::shared_ptr<TupleReader> reader_;
+  // This statement's latest result, so Cancel can signal it without touching
+  // libpq. Guarded by cancel_mu_; Cancel runs on another thread.
+  std::mutex cancel_mu_;
+  std::weak_ptr<PqResultArrayReader> cancel_reader_;
   int64_t batch_size_hint_bytes_;
 };
 }  // namespace adbcpq

@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <charconv>
 #include <cstdint>
@@ -159,8 +160,10 @@ class PqResultHelper {
   // the caller can commit without waiting for the stream to be read.
   void PullBufferedTail();
   bool streaming() const { return streaming_; }
-  // Read and discard whatever is left of an open query. Does not cancel.
-  void Finish() { if (streaming_) AbandonStream(); }
+  void SetCancelFlag(const std::atomic<bool>* flag) { cancel_flag_ = flag; }
+  // Discard an open read. Returns true when a discarded packet was a failure,
+  // so the caller rolls the script back instead of committing it.
+  bool Finish() { return AbandonStream(); }
   Status ExecuteCopy();
   Status ResolveParamTypes(PostgresTypeResolver& type_resolver,
                            PostgresType* param_types);
@@ -235,13 +238,17 @@ class PqResultHelper {
   PGconn* conn_;
   std::string query_;
   bool streaming_ = false;
+  bool cancel_sent_ = false;
+  const std::atomic<bool>* cancel_flag_ = nullptr;
   Format param_format_ = Format::kText;
   Format output_format_ = Format::kText;
 
   Status PrepareInternal(int n_params, const Oid* param_oids) const;
-  // Drop an open row stream so the connection can run another command.
-  // Cancels only when the next read would block.
-  void AbandonStream();
+  // Drop an open row stream. True if a discarded result was a failure.
+  bool AbandonStream();
+  // Block until a packet is buffered or the cancel flag is set. Sends the
+  // cancel from this thread, and only when the next read would block.
+  void WaitUntilReady();
 };
 
 }  // namespace adbcpq

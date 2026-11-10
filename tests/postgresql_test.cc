@@ -3748,7 +3748,7 @@ TEST_F(PostgresStatementTest, ResultStreamReplacedWhileOpen) {
   ASSERT_EQ(first.array->length, 1);
   ASSERT_EQ(first.rows_affected, -1);
 
-  // The next command on this connection finishes the open read.
+  // The result is already buffered, so the next command must not invalidate it.
   adbc_validation::StreamReader second;
   ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 7 AS n", &error),
               IsOkStatus(&error));
@@ -3759,11 +3759,9 @@ TEST_F(PostgresStatementTest, ResultStreamReplacedWhileOpen) {
   ASSERT_NO_FATAL_FAILURE(second.Next());
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(second.array_view->children[0], 0), 7);
 
-  ASSERT_EQ(EINVAL, first.MaybeNext());
-  ASSERT_THAT(first.stream->get_last_error(&first.stream.value),
-              ::testing::HasSubstr("Reader invalidated"));
-  ASSERT_THAT(first.stream->get_last_error(&first.stream.value),
-              ::testing::Not(::testing::HasSubstr("another command is already in progress")));
+  ASSERT_NO_FATAL_FAILURE(first.Next());
+  ASSERT_EQ(first.array->length, 1);
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(first.array_view->children[0], 0), 2);
 }
 
 TEST_F(PostgresStatementTest, ResultStreamOutlivesStatement) {
@@ -3854,19 +3852,15 @@ TEST_F(PostgresStatementTest, CancelBetweenReads) {
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(next.array_view->children[0], 0), 9);
 }
 
-TEST_F(PostgresStatementTest, SecondStatementFinishesOpenStream) {
+TEST_F(PostgresStatementTest, BufferedResultSurvivesNextCommand) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
   adbc_validation::Handle<struct AdbcStatement> other;
   ASSERT_THAT(AdbcStatementNew(&connection, &other.value, &error), IsOkStatus(&error));
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &statement, "SELECT g FROM generate_series(1, 3) t(g)", &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
   adbc_validation::StreamReader reader;
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
               IsOkStatus(&error));
-  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
-  ASSERT_NO_FATAL_FAILURE(reader.Next());
 
   ASSERT_THAT(AdbcStatementSetSqlQuery(&other.value, "SELECT 8", &error), IsOkStatus(&error));
   adbc_validation::StreamReader next;
@@ -3876,26 +3870,37 @@ TEST_F(PostgresStatementTest, SecondStatementFinishesOpenStream) {
   ASSERT_NO_FATAL_FAILURE(next.Next());
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(next.array_view->children[0], 0), 8);
 
-  ASSERT_EQ(EINVAL, reader.MaybeNext());
-  ASSERT_THAT(reader.stream->get_last_error(&reader.stream.value),
-              ::testing::HasSubstr("Reader invalidated"));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 1);
 }
 
-TEST_F(PostgresStatementTest, ConnectionReleaseDetachesOpenStream) {
+TEST_F(PostgresStatementTest, StatementNewLeavesBufferedStream) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &statement, "SELECT g FROM generate_series(1, 3) t(g)", &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 4", &error), IsOkStatus(&error));
   adbc_validation::StreamReader reader;
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
               IsOkStatus(&error));
+
+  adbc_validation::Handle<struct AdbcStatement> other;
+  ASSERT_THAT(AdbcStatementNew(&connection, &other.value, &error), IsOkStatus(&error));
+
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
   ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 4);
+}
+
+TEST_F(PostgresStatementTest, BufferedResultSurvivesConnectionRelease) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 5", &error), IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+              IsOkStatus(&error));
 
   ASSERT_THAT(AdbcConnectionRelease(&connection, &error), IsOkStatus(&error));
-  ASSERT_EQ(EINVAL, reader.MaybeNext());
-  ASSERT_THAT(reader.stream->get_last_error(&reader.stream.value),
-              ::testing::HasSubstr("Reader invalidated"));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 5);
 }
 
 TEST_F(PostgresStatementTest, MultipleStatementsDmlVisibleBeforeRead) {
@@ -3907,9 +3912,11 @@ TEST_F(PostgresStatementTest, MultipleStatementsDmlVisibleBeforeRead) {
                   "INSERT INTO test_stream_visible VALUES (1)",
                   &error),
               IsOkStatus(&error));
-  adbc_validation::StreamReader unread;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
-              IsOkStatus(&error));
+  {
+    adbc_validation::StreamReader unread;
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
+                IsOkStatus(&error));
+  }
 
   adbc_validation::Handle<struct AdbcConnection> other;
   adbc_validation::Handle<struct AdbcStatement> other_statement;

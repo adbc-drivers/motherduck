@@ -26,6 +26,7 @@
 #define NOMINMAX
 #endif
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <utility>
@@ -50,6 +51,7 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
         autocommit_(true) {
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
+    helper_.SetCancelFlag(&cancel_requested_);
   }
 
   virtual ~PqResultArrayReader();
@@ -71,11 +73,12 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
     batch_size_hint_bytes_ = batch_size_hint_bytes;
   }
   bool streaming_rows() const { return streaming_rows_; }
-  // End an in-flight query so the connection can run another one. A finished
-  // result is left alone.
+  // True while the server still owes this reader a packet.
+  bool server_streaming() const { return helper_.streaming(); }
+  // Drop a server read so the connection can run another command. A result
+  // that is already fully buffered stays readable.
   void ReleaseConnection();
-  // Stop an in-flight read. Sends a server cancel only when the next read
-  // would block; otherwise the next GetNext returns ECANCELED locally.
+  // Thread-safe. Sets the cancel flag. The reading thread sends the cancel.
   AdbcStatusCode RequestCancel(struct AdbcError* error);
   void SetConnection(std::shared_ptr<PostgresConnection> connection) {
     connection_ = std::move(connection);
@@ -105,7 +108,8 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   int next_row_ = 0;
   bool streaming_rows_ = false;
   bool closed_ = false;
-  bool cancel_requested_ = false;
+  // Written by the cancel thread, read by the reading thread.
+  std::atomic<bool> cancel_requested_{false};
   // Set when this reader issued BEGIN so a multi-statement query stays one
   // transaction. Cleared once that transaction is committed or rolled back.
   bool own_txn_ = false;
@@ -125,10 +129,12 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
         next_row_(other->next_row_),
         streaming_rows_(other->streaming_rows_),
         closed_(other->closed_),
-        cancel_requested_(other->cancel_requested_),
+        cancel_requested_(other->cancel_requested_.load()),
         own_txn_(other->own_txn_),
         status_(other->status_) {
+    other->cancel_requested_.store(false);
     other->own_txn_ = false;
+    helper_.SetCancelFlag(&cancel_requested_);
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
   }

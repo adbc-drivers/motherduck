@@ -350,7 +350,10 @@ AdbcStatusCode PostgresStatement::New(struct AdbcConnection* connection,
       *reinterpret_cast<std::shared_ptr<PostgresConnection>*>(connection->private_data);
   type_resolver_ = connection_->type_resolver();
   use_copy_ = connection_->use_copy();
-  ClearResult();
+  // Do not finish another statement's stream. New only prepares this one.
+  if (reader_) reader_->Release();
+  reader_ = std::make_shared<TupleReader>(connection_->conn());
+  reader_->batch_size_hint_bytes_ = batch_size_hint_bytes_;
   return ADBC_STATUS_OK;
 }
 
@@ -385,10 +388,20 @@ AdbcStatusCode PostgresStatement::Bind(struct ArrowArrayStream* stream,
 }
 
 AdbcStatusCode PostgresStatement::Cancel(struct AdbcError* error) {
-  if (auto reader = connection_->ActiveReader()) return reader->RequestCancel(error);
+  std::shared_ptr<PqResultArrayReader> reader;
+  {
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    reader = cancel_reader_.lock();
+  }
+  if (reader) return reader->RequestCancel(error);
   // ExecuteQuery has not published the reader yet. Cancel the connection so a
   // query blocked in that call can unblock.
   return connection_->Cancel(error);
+}
+
+void PostgresStatement::RememberReader(const std::shared_ptr<PqResultArrayReader>& reader) {
+  std::lock_guard<std::mutex> lock(cancel_mu_);
+  cancel_reader_ = reader;
 }
 
 AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_schema,
@@ -602,6 +615,7 @@ AdbcStatusCode PostgresStatement::ExecuteBind(struct ArrowArrayStream* stream,
   reader->SetAutocommit(connection_->autocommit());
   reader->SetBind(&bind_);
   reader->SetVendorName(connection_->VendorName());
+  if (stream != nullptr) RememberReader(reader);
   RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
   return ADBC_STATUS_OK;
 }
@@ -609,6 +623,7 @@ AdbcStatusCode PostgresStatement::ExecuteBind(struct ArrowArrayStream* stream,
 AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
                                                int64_t* rows_affected,
                                                struct AdbcError* error) {
+  if (connection_) connection_->FinishActiveReader();
   ClearResult();
 
   // Use a dedicated path to handle bulk ingest
@@ -637,8 +652,9 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
     reader->SetAutocommit(connection_->autocommit());
     reader->SetVendorName(connection_->VendorName());
     reader->SetBatchSizeHint(batch_size_hint_bytes_);
+    if (stream != nullptr) RememberReader(reader);
     RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
-    if (stream != nullptr && reader->streaming_rows()) {
+    if (stream != nullptr && reader->server_streaming()) {
       connection_->TrackActiveReader(reader);
     }
     return ADBC_STATUS_OK;
@@ -663,8 +679,9 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
     reader->SetAutocommit(connection_->autocommit());
     reader->SetVendorName(connection_->VendorName());
     reader->SetBatchSizeHint(batch_size_hint_bytes_);
+    if (stream != nullptr) RememberReader(reader);
     RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
-    if (stream != nullptr && reader->streaming_rows()) {
+    if (stream != nullptr && reader->server_streaming()) {
       connection_->TrackActiveReader(reader);
     }
     return ADBC_STATUS_OK;
@@ -695,6 +712,7 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
 
 AdbcStatusCode PostgresStatement::ExecuteSchema(struct ArrowSchema* schema,
                                                 struct AdbcError* error) {
+  if (connection_) connection_->FinishActiveReader();
   ClearResult();
   if (query_.empty()) {
     InternalAdbcSetError(error, "%s", "[libpq] Must SetSqlQuery before ExecuteQuery");
@@ -947,6 +965,10 @@ AdbcStatusCode PostgresStatement::Prepare(struct AdbcError* error) {
 AdbcStatusCode PostgresStatement::Release(struct AdbcError* error) {
   // The connection, not this statement, finishes an open stream. Releasing
   // the statement leaves a stream that still owns its reader usable.
+  {
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    cancel_reader_.reset();
+  }
   if (reader_) {
     reader_->Release();
     reader_.reset();
@@ -1080,8 +1102,6 @@ AdbcStatusCode PostgresStatement::SetOptionInt(const char* key, int64_t value,
 
 void PostgresStatement::ClearResult() {
   // TODO: we may want to synchronize here for safety
-  // Every statement on this connection shares one libpq command.
-  if (connection_) connection_->FinishActiveReader();
   if (reader_) reader_->Release();
   reader_ = std::make_shared<TupleReader>(connection_->conn());
   reader_->batch_size_hint_bytes_ = batch_size_hint_bytes_;

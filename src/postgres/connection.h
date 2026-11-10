@@ -25,6 +25,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -106,6 +107,8 @@ class PostgresConnection {
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
   PGconn* conn_;
   PGcancel* cancel_;
+  // Guards active_reader_. Cancel runs on another thread from the read.
+  mutable std::mutex active_reader_mu_;
   std::weak_ptr<PqResultArrayReader> active_reader_;
   bool autocommit_;
   bool use_copy_;

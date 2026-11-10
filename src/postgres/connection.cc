@@ -1162,16 +1162,22 @@ AdbcStatusCode PostgresConnection::Init(struct AdbcDatabase* database,
 
 void PostgresConnection::TrackActiveReader(
     const std::shared_ptr<PqResultArrayReader>& reader) {
+  std::lock_guard<std::mutex> lock(active_reader_mu_);
   active_reader_ = reader;
 }
 
 std::shared_ptr<PqResultArrayReader> PostgresConnection::ActiveReader() const {
+  std::lock_guard<std::mutex> lock(active_reader_mu_);
   return active_reader_.lock();
 }
 
 void PostgresConnection::FinishActiveReader() {
-  auto reader = active_reader_.lock();
-  active_reader_.reset();
+  std::shared_ptr<PqResultArrayReader> reader;
+  {
+    std::lock_guard<std::mutex> lock(active_reader_mu_);
+    reader = active_reader_.lock();
+    active_reader_.reset();
+  }
   if (reader) reader->ReleaseConnection();
 }
 

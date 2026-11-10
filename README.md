@@ -31,8 +31,7 @@ The upstream PostgreSQL driver's approach credits [pgeon](https://github.com/0x0
 
 ## Build
 
-Requires CMake 3.24+, a C++20 compiler, and PostgreSQL's client library and
-headers (libpq). The driver bundles the Apache common/framework code, nanoarrow,
+Requires CMake 3.24+, a C++20 compiler, and libpq 17 or newer. The driver bundles the Apache common/framework code, nanoarrow,
 fmt, portable-snippets, and boost.int128 it needs. Test builds also require
 GoogleTest/GoogleMock; CMake downloads GoogleTest 1.15.2 if it is not installed.
 
@@ -138,7 +137,7 @@ Unless the URI or `PGSSLMODE` sets `sslmode`, the driver uses
 `sslmode=require` instead of libpq's default, `prefer`, so the token is never
 sent unencrypted. `require` doesn't verify the server's certificate; set
 `sslmode=verify-full` to verify it. With `sslrootcert=system` (in the URI or
-`PGSSLROOTCERT`), libpq 16 and later already default to `verify-full`, so the
+`PGSSLROOTCERT`), libpq already defaults to `verify-full`, so the
 driver leaves `sslmode` alone. Naming a connection service also turns this
 default off, since the service file may set `sslmode` itself.
 
