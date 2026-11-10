@@ -53,7 +53,7 @@ std::vector<std::regex> BuildPatterns() {
       // name = v, name TO v, name: v, PASSWORD 'v', name(v), (name) VALUES (v).
       std::regex("(" + credential + R"([\w.$]{0,64}))" + value, kFlags),
       // scheme://user:password@host
-      std::regex(R"((://[^\s'"@/]{0,128}:)[^\s'"@]{0,1024}@)", kFlags),
+      std::regex(R"((://[^\s'"@/]{0,128}:\s*)[^\s'"@]{0,1024}@)", kFlags),
       // md:<token>@database, motherduck:<token>@database
       std::regex(R"((\b(?:md|motherduck):)[^'"@]{0,1024}@)", kFlags),
       // md_create_flight(source_code := ..., config => ...): free-form payloads.
