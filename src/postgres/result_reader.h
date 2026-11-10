@@ -132,6 +132,15 @@ class PqResultArrayReader {
     return status;
   }
   virtual Status ExecuteAll(int64_t* affected_rows);
+  // Prepare the query with the bind stream's parameter types
+  virtual Status PrepareWithParamTypes();
+  // Resolve the types of any all-null (Arrow NA) parameters from the types the
+  // server expects
+  virtual Status ResolveNullParamTypes();
+  // Reconcile the bind stream with the prepared statement's parameter types
+  Status ReconcileWithPreparedParamTypes();
+  // The name to give a result column the server named name
+  virtual std::string ResultColumnName(std::string name) const { return name; }
 
   void ResetErrors() {
     ArrowErrorInit(&na_error_);
