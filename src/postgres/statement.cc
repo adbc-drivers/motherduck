@@ -395,9 +395,12 @@ AdbcStatusCode PostgresStatement::Cancel(struct AdbcError* error) {
   }
   if (reader) {
     reader->RequestCancel(error);
-    // Dropping this reference must not run the destructor here. Park it so
-    // the connection thread destroys it.
-    if (connection_) connection_->RetireReader(std::move(reader));
+    // The stream still owns the reader. Holding another reference here would
+    // keep the read alive after the stream is released, and dropping the last
+    // one would destroy it on this thread.
+    if (reader.use_count() == 1 && connection_ != nullptr) {
+      connection_->RetireReader(std::move(reader));
+    }
     return ADBC_STATUS_OK;
   }
   // No streaming reader. Cancel whatever command the connection is running.

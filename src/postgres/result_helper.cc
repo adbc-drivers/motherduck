@@ -31,6 +31,7 @@
 
 #include <charconv>
 #include <memory>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,12 @@ bool IsFailure(const PGresult* result) {
   if (result == nullptr) return false;
   const ExecStatusType status = PQresultStatus(result);
   return status == PGRES_FATAL_ERROR || status == PGRES_BAD_RESPONSE;
+}
+
+bool IsCancelError(const PGresult* result) {
+  if (result == nullptr || PQresultStatus(result) != PGRES_FATAL_ERROR) return false;
+  const char* sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
+  return sqlstate != nullptr && std::strncmp(sqlstate, "57014", 5) == 0;
 }
 
 void WaitForSocket(int sock) {
@@ -124,9 +131,19 @@ void PqResultHelper::WaitUntilReady() {
 bool PqResultHelper::AbandonStream() {
   if (!streaming_ && pending_.empty()) return false;
   abandon_ = true;
+  const auto failed_script = [this](const PGresult* result) {
+    if (!IsFailure(result)) return false;
+    // A cancel this drain sent, so the connection can be reused, is not a
+    // failed script. A user cancel still is.
+    if (IsCancelError(result) &&
+        (cancel_flag_ == nullptr || !cancel_flag_->load(std::memory_order_acquire))) {
+      return false;
+    }
+    return true;
+  };
   bool failed = false;
   for (PGresult* result : pending_) {
-    if (IsFailure(result)) failed = true;
+    if (failed_script(result)) failed = true;
     PQclear(result);
   }
   pending_.clear();
@@ -135,7 +152,7 @@ bool PqResultHelper::AbandonStream() {
     WaitUntilReady();
     PGresult* result = PQgetResult(conn_);
     if (result == nullptr) return failed;
-    if (IsFailure(result)) failed = true;
+    if (failed_script(result)) failed = true;
     PQclear(result);
   }
 }
@@ -151,6 +168,31 @@ bool IsRowPacket(ExecStatusType status) {
 }
 
 }  // namespace
+
+Status PqResultHelper::ExecuteCancellable(const std::string& sql) {
+  if (PQsendQuery(conn_, sql.c_str()) != 1) {
+    return MakeStatus(nullptr, "[libpq] Failed to execute query '{}': {}", sql.c_str(),
+                      PQerrorMessage(conn_));
+  }
+  Status failure = Status::Ok();
+  for (;;) {
+    WaitUntilReady();
+    PGresult* result = PQgetResult(conn_);
+    if (result == nullptr) break;
+    if (IsFailure(result) && failure.ok()) {
+      if (cancel_flag_ != nullptr && cancel_flag_->load(std::memory_order_acquire)) {
+        failure = Status(ADBC_STATUS_CANCELLED,
+                         "[libpq] canceling statement due to user request");
+        failure.SetSqlState("57014");
+      } else {
+        failure = MakeStatus(result, "[libpq] Failed to execute query '{}': {}", sql.c_str(),
+                             PQresultErrorMessage(result));
+      }
+    }
+    PQclear(result);
+  }
+  return failure;
+}
 
 Status PqResultHelper::BeginRowStream() {
   ClearResult();
@@ -197,6 +239,8 @@ void PqResultHelper::PullBufferedTail() {
     const ExecStatusType status = PQresultStatus(next);
     if (IsRowPacket(status)) {
       pending_.push_back(next);
+      // One packet of read-ahead. More than that lets a fast server fill memory.
+      if (pending_.size() >= 1) return;
       continue;
     }
     if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK &&

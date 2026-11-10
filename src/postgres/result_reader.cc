@@ -48,8 +48,7 @@ PqResultArrayReader::~PqResultArrayReader() {
   }
   if (!closed_) {
     const bool failed = helper_.Finish();
-    const bool cancel =
-        cancel_requested_.load(std::memory_order_acquire) || helper_.CancelSent();
+    const bool cancel = cancel_requested_.load(std::memory_order_acquire);
     // A clean drain of a finished script commits. A cancel or a failure does not.
     EndOwnedTransaction(!(failed || cancel));
   }
@@ -389,27 +388,17 @@ Status PqResultArrayReader::OpenRowStream() {
   const bool autocommit =
       connection_ != nullptr ? connection_->autocommit() : autocommit_;
   if (autocommit) {
-    PGresult* begin = PQexec(conn_, "BEGIN");
-    if (begin == nullptr || !IsResultOk(begin)) {
-      Status status = MakeStatus(begin, "[libpq] Failed to execute query '{}': {}",
-                                 "BEGIN", PQerrorMessage(conn_));
-      PQclear(begin);
-      return status;
-    }
-    PQclear(begin);
+    Status begin = helper_.ExecuteCancellable("BEGIN");
+    if (!begin.ok()) return begin;
     own_txn_ = true;
   }
 
   for (size_t i = 0; i + 1 < statements.size(); i++) {
-    PGresult* result = PQexec(conn_, statements[i].c_str());
-    if (result == nullptr || !IsResultOk(result)) {
-      Status status = MakeStatus(result, "[libpq] Failed to execute query '{}': {}",
-                                 statements[i].c_str(), PQerrorMessage(conn_));
-      PQclear(result);
+    Status status = helper_.ExecuteCancellable(statements[i]);
+    if (!status.ok()) {
       EndOwnedTransaction(false);
       return status;
     }
-    PQclear(result);
   }
 
   helper_.set_query(std::move(statements.back()));
@@ -428,8 +417,7 @@ void PqResultArrayReader::ReleaseConnection() {
   }
   closed_ = true;
   const bool failed = helper_.Finish();
-  const bool cancel =
-      cancel_requested_.load(std::memory_order_acquire) || helper_.CancelSent();
+  const bool cancel = cancel_requested_.load(std::memory_order_acquire);
   EndOwnedTransaction(!(failed || cancel));
   status_ = ADBC_STATUS_INVALID_STATE;
   InternalAdbcSetError(&error_, "%s",

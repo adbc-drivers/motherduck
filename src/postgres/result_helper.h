@@ -150,6 +150,8 @@ class PqResultHelper {
   Status DescribePrepared();
   Status Execute(const std::vector<std::string>& params = {},
                  PostgresType* param_types = nullptr);
+  // Simple-protocol execution that notices a cancel between packets.
+  Status ExecuteCancellable(const std::string& sql);
   // Send the query and have libpq return rows as they arrive, instead of
   // buffering the whole result the way Execute() does.
   Status BeginRowStream();
