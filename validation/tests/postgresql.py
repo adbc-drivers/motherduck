@@ -27,12 +27,10 @@ from pathlib import Path
 
 from adbc_drivers_validation import model, quirks
 
-# MotherDuck says `Table with name foo does not exist!`, or
-# `relation "foo" does not exist`; the driver's own table lookups say
-# `Table not found: "main"."foo"`, with each name quoted.
+# MotherDuck says `Table with name foo does not exist!`, or for a failed
+# `::regclass` cast, `relation "foo" does not exist`.
 _TABLE_NOT_FOUND = re.compile(
-    r'(?:(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
-    r'|table not found: ((?:"(?:[^"]|"")*"\.?)+))'
+    r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
 )
 
 _database_args = {
@@ -57,9 +55,10 @@ class PostgreSQLQuirks(model.DriverQuirks):
         connection_get_table_schema=True,
         connection_transactions=True,
         get_objects=True,
-        get_objects_constraints_foreign=False,
-        get_objects_constraints_primary=False,
-        get_objects_constraints_unique=False,
+        get_objects_constraints_check=True,
+        get_objects_constraints_foreign=True,
+        get_objects_constraints_primary=True,
+        get_objects_constraints_unique=True,
         metadata_type_name=True,
         # Needs COPY FROM STDIN, which the endpoint lacks (#31).
         statement_bulk_ingest=False,
@@ -113,14 +112,28 @@ class PostgreSQLQuirks(model.DriverQuirks):
         # into the error, which may mention "table" and the table's name.
         match = _TABLE_NOT_FOUND.search(str(error).lower())
         return match is not None and (
-            table_name is None
-            or table_name.lower() in (match.group(1) or match.group(2))
+            table_name is None or table_name.lower() in match.group(1)
         )
 
     def quote_one_identifier(self, identifier: str) -> str:
         """Quote an identifier using PostgreSQL's double-quote syntax."""
         identifier = identifier.replace('"', '""')
         return f'"{identifier}"'
+
+    @property
+    def sample_ddl_constraints(self) -> list[str]:
+        return [
+            "CREATE TABLE constraint_check (a INT CHECK (a > 0), b INT, CHECK (a + b > 0))",
+            "CREATE TABLE constraint_unique (a INT UNIQUE, b INT, c INT, UNIQUE (c, b))",
+            "CREATE TABLE constraint_primary (a INT PRIMARY KEY)",
+            "CREATE TABLE constraint_primary_multi (a INT, b INT, PRIMARY KEY (b, a))",
+            "CREATE TABLE constraint_primary_multi2 (a INT, b INT, PRIMARY KEY (a, b))",
+            "CREATE TABLE constraint_foreign (a INT, b INT REFERENCES constraint_primary (a))",
+            (
+                "CREATE TABLE constraint_foreign_multi (a INT, b INT, c INT,"
+                " FOREIGN KEY (c, b) REFERENCES constraint_primary_multi2 (a, b))"
+            ),
+        ]
 
     def split_statement(self, statement: str) -> list[str]:
         """Split a multi-statement SQL string into individual statements."""

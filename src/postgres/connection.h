@@ -32,11 +32,15 @@
 #include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
 
-#include "driver/framework/status.h"
 #include "postgres_type.h"
+
+namespace adbc::driver {
+struct GetObjectsHelper;
+}  // namespace adbc::driver
 
 namespace adbcpq {
 class PostgresDatabase;
+
 class PostgresConnection {
  public:
   PostgresConnection()
@@ -65,15 +69,19 @@ class PostgresConnection {
                                  struct AdbcError* error);
   AdbcStatusCode GetOptionInt(const char* option, int64_t* value,
                               struct AdbcError* error);
-  AdbcStatusCode GetStatistics(const char* catalog, const char* db_schema,
-                               const char* table_name, bool approximate,
-                               struct ArrowArrayStream* out, struct AdbcError* error);
-  AdbcStatusCode GetStatisticNames(struct ArrowArrayStream* out, struct AdbcError* error);
-  AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
-                                const char* table_name, struct ArrowSchema* schema,
-                                struct AdbcError* error);
-  AdbcStatusCode GetTableTypes(struct AdbcConnection* connection,
-                               struct ArrowArrayStream* out, struct AdbcError* error);
+  virtual AdbcStatusCode GetStatistics(const char* catalog, const char* db_schema,
+                                       const char* table_name, bool approximate,
+                                       struct ArrowArrayStream* out,
+                                       struct AdbcError* error);
+  virtual AdbcStatusCode GetStatisticNames(struct ArrowArrayStream* out,
+                                           struct AdbcError* error);
+  virtual AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
+                                        const char* table_name,
+                                        struct ArrowSchema* schema,
+                                        struct AdbcError* error);
+  virtual AdbcStatusCode GetTableTypes(struct AdbcConnection* connection,
+                                       struct ArrowArrayStream* out,
+                                       struct AdbcError* error);
   AdbcStatusCode Init(struct AdbcDatabase* database, struct AdbcError* error);
   AdbcStatusCode Release(struct AdbcError* error);
   AdbcStatusCode Rollback(struct AdbcError* error);
@@ -92,17 +100,8 @@ class PostgresConnection {
   std::string_view VendorName();
   const std::array<int, 3>& VendorVersion();
 
-  /// \brief Look up the columns of a table or view by name.
-  ///
-  /// Matches the catalog, schema and table names exactly, rather than parsing a
-  /// qualified name with ::regclass, which MotherDuck can't do for quoted names.
-  /// A null catalog or db_schema means the current one.
-  ///
-  /// \param[out] columns The (name, type OID) of each column, in column order.
-  /// \return NOT_FOUND if there is no such table or view.
-  adbc::driver::Status GetTableColumns(const char* catalog, const char* db_schema,
-                                       const char* table_name,
-                                       std::vector<std::pair<std::string, Oid>>* columns);
+ protected:
+  virtual std::unique_ptr<adbc::driver::GetObjectsHelper> MakeGetObjectsHelper();
 
  private:
   friend class PostgresStatement;

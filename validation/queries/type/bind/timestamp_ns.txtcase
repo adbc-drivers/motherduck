@@ -24,15 +24,17 @@
 
 # DuckDB's TIMESTAMP_NS spans 1677-09-22 to 2262-04-11 and reserves INT64_MIN
 # and INT64_MAX nanoseconds for infinity, so the base case's extremes can't be
-# stored. Bind the first and last whole days in range instead.
+# stored. The endpoint also rejects 1677-09-22, which is in range, when
+# binding into TIMESTAMP(9) (#64), so bind 1678-01-01 and 2262-04-11 instead.
+# The endpoint returns TIMESTAMP_NS as text, so the result is a string.
 [tags]
-sql-type-name = "timestamp"
+sql-type-name = "duckdb_timestamp_ns"
 
 // part: bind
 
 {"idx": 3, "res": 1684158330000000000}
 {"idx": 2, "res": 946684800000000000}
-{"idx": 1, "res": -9223286400000000000}
+{"idx": 1, "res": -9214560000000000000}
 {"idx": 4, "res": 9223286400000000000}
 {"idx": 0, "res": null}
 
@@ -43,8 +45,9 @@ sql-type-name = "timestamp"
     "children": [
         {
             "name": "res",
-            "format": "tsu:",
-            "flags": ["nullable"]
+            "format": "u",
+            "flags": ["nullable"],
+            "metadata": {"POSTGRESQL:type": "duckdb_timestamp_ns"}
         }
     ]
 }
@@ -52,7 +55,7 @@ sql-type-name = "timestamp"
 // part: expected
 
 {"res": null}
-{"res": -9223286400000000}
-{"res": 946684800000000}
-{"res": 1684158330000000}
-{"res": 9223286400000000}
+{"res": "1678-01-01 00:00:00"}
+{"res": "2000-01-01 00:00:00"}
+{"res": "2023-05-15 13:45:30"}
+{"res": "2262-04-11 00:00:00"}
