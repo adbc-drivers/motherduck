@@ -19,7 +19,6 @@
 
 #include "motherduck_get_objects.h"
 
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -31,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "motherduck_ascii.h"
 #include "result_helper.h"
 
 namespace adbcpq {
@@ -133,13 +133,6 @@ class Query {
 
 std::string Text(const PqRecord& record) { return std::string(record.data, record.len); }
 
-std::string Lower(std::string_view text) {
-  std::string lower(text);
-  for (char& c : lower)
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return lower;
-}
-
 // The table types a table_types filter asks for. It ignores case, like the
 // other filters, and takes SQL's "BASE TABLE" for a table. With no filter,
 // both.
@@ -153,7 +146,7 @@ struct TableTypes {
       return;
     }
     for (std::string_view type : filter) {
-      std::string lower = Lower(type);
+      std::string lower = AsciiLower(type);
       if (lower == "table" || lower == "base table") tables = true;
       if (lower == "view") views = true;
     }
