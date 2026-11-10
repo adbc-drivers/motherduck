@@ -35,6 +35,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cinttypes>
+#include <unordered_set>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -396,12 +397,21 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                                   PostgresType* copy_target_types,
                                                   bool* has_copy_target_types,
                                                   struct AdbcError* error) {
-  // A NULL column name can't be escaped (or used at all).
+  // Reject names the server would refuse before any DDL runs: replace mode drops
+  // the target table in its own statement, so a later CREATE failure loses it.
+  std::unordered_set<std::string> seen_names;
   for (int64_t i = 0; i < source_schema.n_children; i++) {
-    if (source_schema.children[i]->name == nullptr) {
+    const char* name = source_schema.children[i]->name;
+    if (name == nullptr || name[0] == '\0') {
       InternalAdbcSetError(
-          error, "[libpq] Cannot ingest column %" PRId64 ": column name must not be NULL",
-          i);
+          error, "[libpq] Cannot ingest column %" PRId64 ": column name must not be %s",
+          i, name == nullptr ? "NULL" : "empty");
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    if (!seen_names.insert(name).second) {
+      InternalAdbcSetError(
+          error, "[libpq] Cannot ingest column %" PRId64 ": duplicate column name %s", i,
+          name);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
   }

@@ -125,23 +125,26 @@ TEST(PostgresConnectionUnitTest, SetCurrentSchemaNull) {
   EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
             connection.SetOption(ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA, nullptr,
                                  &error));
+  ASSERT_NE(nullptr, error.message);
+  EXPECT_NE(nullptr, std::strstr(error.message, "requires a value")) << error.message;
   if (error.release) error.release(&error);
 }
 
-TEST(PostgresStatementUnitTest, CreateBulkTableNullColumnName) {
+// The statement has no connection: the name checks must run before touching it.
+static void ExpectCreateBulkTableRejects(const char* name0, const char* name1,
+                                         const char* expected_message) {
   struct ArrowSchema child0 = {};
   child0.format = "i";
-  child0.name = "ok";
+  child0.name = name0;
   struct ArrowSchema child1 = {};
   child1.format = "i";
-  child1.name = nullptr;
+  child1.name = name1;
   struct ArrowSchema* children[] = {&child0, &child1};
   struct ArrowSchema source_schema = {};
   source_schema.format = "+s";
   source_schema.n_children = 2;
   source_schema.children = children;
 
-  // The statement has no connection: the check must run before touching it.
   PostgresStatement statement;
   std::string escaped_table;
   std::string escaped_field_list;
@@ -153,10 +156,22 @@ TEST(PostgresStatementUnitTest, CreateBulkTableNullColumnName) {
                                       &escaped_field_list, &copy_target_types,
                                       &has_copy_target_types, &error));
   ASSERT_NE(nullptr, error.message);
-  EXPECT_NE(nullptr, std::strstr(error.message, "column 1: column name must not be NULL"))
-      << error.message;
+  EXPECT_NE(nullptr, std::strstr(error.message, expected_message)) << error.message;
   EXPECT_TRUE(escaped_table.empty());
+  EXPECT_TRUE(escaped_field_list.empty());
   if (error.release) error.release(&error);
+}
+
+TEST(PostgresStatementUnitTest, CreateBulkTableNullColumnName) {
+  ExpectCreateBulkTableRejects("ok", nullptr, "column 1: column name must not be NULL");
+}
+
+TEST(PostgresStatementUnitTest, CreateBulkTableEmptyColumnName) {
+  ExpectCreateBulkTableRejects("ok", "", "column 1: column name must not be empty");
+}
+
+TEST(PostgresStatementUnitTest, CreateBulkTableDuplicateColumnName) {
+  ExpectCreateBulkTableRejects("id", "id", "column 1: duplicate column name id");
 }
 
 }  // namespace adbcpq
