@@ -40,10 +40,11 @@ $ export MOTHERDUCK_TOKEN=...
 
 `ci/scripts/pre-test.sh` writes the connection settings to `.env.override`.
 Pass your platform and architecture; they only go into the database name.
-Setting `GITHUB_JOB=validate` keeps the name distinct from the C++ tests'.
+Outside GitHub Actions each invocation adds a unique suffix, so this database
+never collides with one the C++ tests use.
 
 ```shell
-$ GITHUB_JOB=validate ./ci/scripts/pre-test.sh macos arm64
+$ ./ci/scripts/pre-test.sh macos arm64
 $ set -a; source .env.override; set +a
 ```
 

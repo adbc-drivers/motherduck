@@ -210,9 +210,10 @@ MOTHERDUCK_TEST_POSTGRESQL=ON ./ci/scripts/build.sh test macos arm64
 pixi run validate
 ```
 
-By default each run gets a fresh database, `adbc_ci_<run>_<job>_<platform>_<arch>`,
-which the tests create before they start and drop when they finish, so
-concurrent jobs and runs don't share tables. Set `MOTHERDUCK_TEST_DATABASE` to
+By default each run gets a fresh database, `adbc_ci_<run>_<job>_<platform>_<arch>`
+(locally `<run>` is a unique `local_<timestamp>_<pid>`), which the tests create
+before they start and drop when they finish, so concurrent jobs and runs don't
+share tables. A failed drop is logged, not treated as a test failure. Set `MOTHERDUCK_TEST_DATABASE` to
 an existing database to use it instead; the tests leave it in place.
 `MOTHERDUCK_PG_HOST` overrides the default host
 (`pg.us-east-1-aws.motherduck.com`). Test connections use the driver's default

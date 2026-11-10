@@ -41,7 +41,13 @@ if [[ -n "${MOTHERDUCK_TEST_DATABASE:-}" ]]; then
   fi
   manage_database=false
 else
-  run="${GITHUB_RUN_ID:-local}_${GITHUB_RUN_ATTEMPT:-1}"
+  if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+    run="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT:-1}"
+  else
+    # Outside CI, give every invocation its own database so the C++ tests and
+    # the validation suite can run at the same time.
+    run="local_$(date +%s)_$$"
+  fi
   database="adbc_ci_${run}_${GITHUB_JOB:-test}_${1}_${2}"
   manage_database=true
 fi

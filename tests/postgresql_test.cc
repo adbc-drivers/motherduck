@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <future>
 #include <limits>
 #include <optional>
@@ -48,6 +49,7 @@
 #include <arrow-adbc/adbc.h>
 #include <arrow-adbc/driver/postgresql.h>
 #include <gtest/gtest-param-test.h>
+#include <gtest/gtest-spi.h>
 #include <gtest/gtest.h>
 #include <libpq-fe.h>
 #include <nanoarrow/nanoarrow.h>
@@ -317,7 +319,19 @@ class MotherDuckTestDatabase : public ::testing::Environment {
 
   void TearDown() override {
     if (!Configured()) return;
-    ASSERT_NO_FATAL_FAILURE(Execute("DROP DATABASE IF EXISTS " + catalog_));
+    // A failed cleanup shouldn't fail a run whose tests passed, so capture
+    // the failures and log them instead.
+    ::testing::TestPartResultArray failures;
+    {
+      ::testing::ScopedFakeTestPartResultReporter reporter(
+          ::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
+          &failures);
+      Execute("DROP DATABASE IF EXISTS " + catalog_);
+    }
+    if (failures.size() > 0) {
+      std::cerr << "warning: failed to drop test database " << catalog_ << ": "
+                << failures.GetTestPartResult(0).message() << std::endl;
+    }
   }
 
  private:

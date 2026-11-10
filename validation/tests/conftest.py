@@ -22,6 +22,7 @@
 
 import os
 import sys
+import warnings
 from pathlib import Path
 
 import adbc_driver_manager.dbapi
@@ -91,7 +92,11 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
 
     execute(f"DROP DATABASE IF EXISTS {name}", f"CREATE DATABASE {name}")
     yield
-    execute(f"DROP DATABASE IF EXISTS {name}")
+    try:
+        execute(f"DROP DATABASE IF EXISTS {name}")
+    except Exception as e:
+        # A failed cleanup shouldn't fail a run whose tests passed.
+        warnings.warn(f"failed to drop test database {catalog}: {e}", stacklevel=1)
 
 
 @pytest.fixture(scope="session", autouse=True)
