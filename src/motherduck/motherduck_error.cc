@@ -37,9 +37,10 @@ bool Contains(std::string_view text, std::string_view part) {
 bool MotherduckIsMissingObject(const char* primary_message) {
   if (primary_message == nullptr) return false;
   std::string_view message(primary_message);
-  // Not a regclass cast's "Invalid Input Error: relation ... does not exist":
-  // the endpoint also reports that for a quoted, qualified name of a table that
-  // exists (#13), so it doesn't show that the table is missing.
+  // Not "Invalid Input Error: relation ... does not exist", which a ::regclass
+  // cast reports even for a table that exists when its name is quoted and
+  // qualified, so it doesn't show that the table is missing. The driver itself
+  // no longer casts to regclass (#13).
 
   // Catalog "db" does not exist!
   if (StartsWith(message, "Binder Error: Catalog \"")) {

@@ -28,6 +28,7 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include "error.h"
+#include "motherduck_ascii.h"
 #include "motherduck_pipeline.h"
 
 namespace adbcpq {
@@ -313,6 +314,19 @@ Status MotherduckStatement::PrepareQuery(PGconn* conn, const std::string& query,
 
 std::string MotherduckStatement::ResultColumnName(std::string name) const {
   return param_casts_.empty() ? name : UncastParameters(name, param_casts_);
+}
+
+// DuckDB column names ignore case.
+bool MotherduckStatement::SameColumnName(std::string_view table_column,
+                                         std::string_view source_column) const {
+  return AsciiEqualsIgnoreCase(table_column, source_column);
+}
+
+// The Postgres endpoint rejects CREATE TEMP TABLE.
+Status MotherduckStatement::CheckTemporaryIngest() const {
+  return Status::NotImplemented(
+      "[motherduck] Ingesting into a temporary table isn't supported: MotherDuck's "
+      "Postgres endpoint can't create temporary tables");
 }
 
 // MotherDuck answers DDL with an empty result set instead of a command tag.
