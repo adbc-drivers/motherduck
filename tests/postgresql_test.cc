@@ -3852,6 +3852,38 @@ TEST_F(PostgresStatementTest, CancelBetweenReads) {
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(next.array_view->children[0], 0), 9);
 }
 
+TEST_F(PostgresStatementTest, CancelNullStreamIgnoresOldReader) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+              IsOkStatus(&error));
+
+  // The buffered stream must not stay the cancel target. This null-stream
+  // query has to be the one that gets cancelled.
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  const bool motherduck = uri != nullptr && std::strstr(uri, "motherduck.com") != nullptr;
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, motherduck ? "SELECT sleep_ms(5000)" : "SELECT pg_sleep(5)",
+                  &error),
+              IsOkStatus(&error));
+  std::thread canceller([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    struct AdbcError cancel_error = ADBC_ERROR_INIT;
+    AdbcStatementCancel(&statement, &cancel_error);
+    if (cancel_error.release != nullptr) cancel_error.release(&cancel_error);
+  });
+  const AdbcStatusCode status =
+      AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error);
+  canceller.join();
+  ASSERT_THAT(status, IsStatus(ADBC_STATUS_CANCELLED, &error));
+  if (error.release != nullptr) error.release(&error);
+
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 1);
+}
+
 TEST_F(PostgresStatementTest, BufferedResultSurvivesNextCommand) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
   adbc_validation::Handle<struct AdbcStatement> other;

@@ -393,15 +393,25 @@ AdbcStatusCode PostgresStatement::Cancel(struct AdbcError* error) {
     std::lock_guard<std::mutex> lock(cancel_mu_);
     reader = cancel_reader_.lock();
   }
-  if (reader) return reader->RequestCancel(error);
-  // ExecuteQuery has not published the reader yet. Cancel the connection so a
-  // query blocked in that call can unblock.
+  if (reader) {
+    reader->RequestCancel(error);
+    // Dropping this reference must not run the destructor here. Park it so
+    // the connection thread destroys it.
+    if (connection_) connection_->RetireReader(std::move(reader));
+    return ADBC_STATUS_OK;
+  }
+  // No streaming reader. Cancel whatever command the connection is running.
   return connection_->Cancel(error);
 }
 
 void PostgresStatement::RememberReader(const std::shared_ptr<PqResultArrayReader>& reader) {
   std::lock_guard<std::mutex> lock(cancel_mu_);
   cancel_reader_ = reader;
+}
+
+void PostgresStatement::ForgetReader() {
+  std::lock_guard<std::mutex> lock(cancel_mu_);
+  cancel_reader_.reset();
 }
 
 AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_schema,
@@ -617,12 +627,18 @@ AdbcStatusCode PostgresStatement::ExecuteBind(struct ArrowArrayStream* stream,
   reader->SetVendorName(connection_->VendorName());
   if (stream != nullptr) RememberReader(reader);
   RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
+  if (stream != nullptr && reader->server_streaming()) {
+    connection_->TrackActiveReader(reader);
+  } else if (stream == nullptr) {
+    ForgetReader();
+  }
   return ADBC_STATUS_OK;
 }
 
 AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
                                                int64_t* rows_affected,
                                                struct AdbcError* error) {
+  ForgetReader();
   if (connection_) connection_->FinishActiveReader();
   ClearResult();
 
@@ -656,6 +672,8 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
     RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
     if (stream != nullptr && reader->server_streaming()) {
       connection_->TrackActiveReader(reader);
+    } else if (stream == nullptr) {
+      ForgetReader();
     }
     return ADBC_STATUS_OK;
   }
@@ -683,6 +701,8 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
     RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
     if (stream != nullptr && reader->server_streaming()) {
       connection_->TrackActiveReader(reader);
+    } else if (stream == nullptr) {
+      ForgetReader();
     }
     return ADBC_STATUS_OK;
   }
@@ -712,6 +732,7 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
 
 AdbcStatusCode PostgresStatement::ExecuteSchema(struct ArrowSchema* schema,
                                                 struct AdbcError* error) {
+  ForgetReader();
   if (connection_) connection_->FinishActiveReader();
   ClearResult();
   if (query_.empty()) {
@@ -911,6 +932,7 @@ AdbcStatusCode PostgresStatement::GetOptionInt(const char* key, int64_t* value,
 
 AdbcStatusCode PostgresStatement::GetParameterSchema(struct ArrowSchema* schema,
                                                      struct AdbcError* error) {
+  if (connection_) connection_->FinishActiveReader();
   if (query_.empty()) {
     InternalAdbcSetError(error, "[libpq] Must SetSqlQuery before GetParameterSchema");
     return ADBC_STATUS_INVALID_STATE;
@@ -951,6 +973,7 @@ Status PostgresStatement::PrepareQuery(PGconn* conn, const std::string& query,
 }
 
 AdbcStatusCode PostgresStatement::Prepare(struct AdbcError* error) {
+  if (connection_) connection_->FinishActiveReader();
   if (query_.empty()) {
     InternalAdbcSetError(error, "%s", "[libpq] Must SetSqlQuery() before Prepare()");
     return ADBC_STATUS_INVALID_STATE;

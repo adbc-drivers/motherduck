@@ -26,6 +26,7 @@
 #include <cassert>
 #include <charconv>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -133,8 +134,8 @@ class PqResultHelper {
       : PqResultHelper(other.conn_, std::move(other.query_)) {
     result_ = other.result_;
     other.result_ = nullptr;
-    pending_ = other.pending_;
-    other.pending_ = nullptr;
+    pending_ = std::move(other.pending_);
+    other.pending_.clear();
     streaming_ = other.streaming_;
     other.streaming_ = false;
   }
@@ -164,6 +165,9 @@ class PqResultHelper {
   // Discard an open read. Returns true when a discarded packet was a failure,
   // so the caller rolls the script back instead of committing it.
   bool Finish() { return AbandonStream(); }
+  bool CancelSent() const { return cancel_sent_; }
+  // Free result memory without talking to the server. Used after PQfinish.
+  void DiscardLocal();
   Status ExecuteCopy();
   Status ResolveParamTypes(PostgresTypeResolver& type_resolver,
                            PostgresType* param_types);
@@ -232,13 +236,16 @@ class PqResultHelper {
 
  private:
   PGresult* result_ = nullptr;
-  // The next packet, already taken off the connection so a trailing
-  // command-complete could be dropped and the transaction closed.
-  PGresult* pending_ = nullptr;
+  // Packets already taken off the connection, so a buffered command-complete
+  // can be dropped and the transaction closed without waiting for the caller.
+  std::deque<PGresult*> pending_;
   PGconn* conn_;
   std::string query_;
   bool streaming_ = false;
   bool cancel_sent_ = false;
+  // Set while discarding a read, so a blocked drain cancels instead of
+  // reading the rest of the result.
+  bool abandon_ = false;
   const std::atomic<bool>* cancel_flag_ = nullptr;
   Format param_format_ = Format::kText;
   Format output_format_ = Format::kText;

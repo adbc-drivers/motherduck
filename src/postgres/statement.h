@@ -152,6 +152,7 @@ class PostgresStatement {
 
   void ClearResult();
   void RememberReader(const std::shared_ptr<PqResultArrayReader>& reader);
+  void ForgetReader();
   AdbcStatusCode CreateBulkTable(const std::string& current_schema,
                                  const struct ArrowSchema& source_schema,
                                  std::string* escaped_table,

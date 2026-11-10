@@ -482,6 +482,7 @@ AdbcStatusCode PostgresConnection::Cancel(struct AdbcError* error) {
 }
 
 AdbcStatusCode PostgresConnection::Commit(struct AdbcError* error) {
+  FinishActiveReader();
   if (autocommit_) {
     InternalAdbcSetError(error, "%s", "[libpq] Cannot commit when autocommit is enabled");
     return ADBC_STATUS_INVALID_STATE;
@@ -508,6 +509,7 @@ AdbcStatusCode PostgresConnection::Commit(struct AdbcError* error) {
 }
 
 AdbcStatusCode PostgresConnection::EnsureTransaction(struct AdbcError* error) {
+  FinishActiveReader();
   if (autocommit_) {
     return ADBC_STATUS_OK;
   }
@@ -537,6 +539,7 @@ AdbcStatusCode PostgresConnection::GetInfo(struct AdbcConnection* connection,
                                            size_t info_codes_length,
                                            struct ArrowArrayStream* out,
                                            struct AdbcError* error) {
+  FinishActiveReader();
   if (!info_codes) {
     info_codes = kSupportedInfoCodes;
     info_codes_length = sizeof(kSupportedInfoCodes) / sizeof(kSupportedInfoCodes[0]);
@@ -591,6 +594,7 @@ AdbcStatusCode PostgresConnection::GetObjects(
     struct AdbcConnection* connection, int c_depth, const char* catalog,
     const char* db_schema, const char* table_name, const char** table_type,
     const char* column_name, struct ArrowArrayStream* out, struct AdbcError* error) {
+  FinishActiveReader();
   PostgresGetObjectsHelper helper(conn_);
 
   const auto catalog_filter =
@@ -968,10 +972,11 @@ AdbcStatusCode PostgresConnectionGetStatisticsImpl(PGconn* conn, const char* db_
 }
 
 AdbcStatusCode PostgresConnection::GetStatistics(const char* catalog,
-                                                 const char* db_schema,
-                                                 const char* table_name, bool approximate,
-                                                 struct ArrowArrayStream* out,
-                                                 struct AdbcError* error) {
+                                                  const char* db_schema,
+                                                  const char* table_name, bool approximate,
+                                                  struct ArrowArrayStream* out,
+                                                  struct AdbcError* error) {
+  FinishActiveReader();
   // Simplify our jobs here
   if (!approximate) {
     InternalAdbcSetError(error, "[libpq] Exact statistics are not implemented");
@@ -1037,7 +1042,8 @@ AdbcStatusCode PostgresConnectionGetStatisticNamesImpl(struct ArrowSchema* schem
 }
 
 AdbcStatusCode PostgresConnection::GetStatisticNames(struct ArrowArrayStream* out,
-                                                     struct AdbcError* error) {
+                                                      struct AdbcError* error) {
+  FinishActiveReader();
   // We don't support any extended statistics, just return an empty stream
   struct ArrowSchema schema;
   std::memset(&schema, 0, sizeof(schema));
@@ -1060,6 +1066,7 @@ AdbcStatusCode PostgresConnection::GetTableSchema(const char* catalog,
                                                   const char* table_name,
                                                   struct ArrowSchema* schema,
                                                   struct AdbcError* error) {
+  FinishActiveReader();
   RAISE_ADBC(EnsureTransaction(error));
 
   AdbcStatusCode final_status = ADBC_STATUS_OK;
@@ -1121,6 +1128,7 @@ AdbcStatusCode PostgresConnection::GetTableSchema(const char* catalog,
 AdbcStatusCode PostgresConnection::GetTableTypes(struct AdbcConnection* connection,
                                                  struct ArrowArrayStream* out,
                                                  struct AdbcError* error) {
+  FinishActiveReader();
   std::vector<std::string> table_types;
   table_types.reserve(kPgTableTypes.size());
   for (auto const& table_type : kPgTableTypes) {
@@ -1171,7 +1179,23 @@ std::shared_ptr<PqResultArrayReader> PostgresConnection::ActiveReader() const {
   return active_reader_.lock();
 }
 
+void PostgresConnection::DrainRetiredReaders() {
+  std::vector<std::shared_ptr<PqResultArrayReader>> retired;
+  {
+    std::lock_guard<std::mutex> lock(retired_mu_);
+    retired.swap(retired_);
+  }
+  retired.clear();
+}
+
+void PostgresConnection::RetireReader(std::shared_ptr<PqResultArrayReader> reader) {
+  std::lock_guard<std::mutex> lock(retired_mu_);
+  if (disconnected_.load(std::memory_order_acquire)) return;
+  retired_.push_back(std::move(reader));
+}
+
 void PostgresConnection::FinishActiveReader() {
+  DrainRetiredReaders();
   std::shared_ptr<PqResultArrayReader> reader;
   {
     std::lock_guard<std::mutex> lock(active_reader_mu_);
@@ -1182,9 +1206,11 @@ void PostgresConnection::FinishActiveReader() {
 }
 
 AdbcStatusCode PostgresConnection::Release(struct AdbcError* error) {
-  // Detach readers before PQfinish. Their destructors must not call libpq
-  // on a connection this has already freed.
+  // Detach readers on this thread before PQfinish. A reader parked by Cancel
+  // is destroyed here, not on the cancel thread.
   FinishActiveReader();
+  disconnected_.store(true, std::memory_order_release);
+  DrainRetiredReaders();
   if (cancel_) {
     PQfreeCancel(cancel_);
     cancel_ = nullptr;
@@ -1196,6 +1222,7 @@ AdbcStatusCode PostgresConnection::Release(struct AdbcError* error) {
 }
 
 AdbcStatusCode PostgresConnection::Rollback(struct AdbcError* error) {
+  FinishActiveReader();
   if (autocommit_) {
     InternalAdbcSetError(error, "%s",
                          "[libpq] Cannot rollback when autocommit is enabled");
@@ -1223,6 +1250,7 @@ AdbcStatusCode PostgresConnection::Rollback(struct AdbcError* error) {
 
 AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
                                              struct AdbcError* error) {
+  FinishActiveReader();
   if (value == nullptr) {
     InternalAdbcSetError(error, "[libpq] Option %s requires a value", key);
     return ADBC_STATUS_INVALID_ARGUMENT;

@@ -40,8 +40,8 @@
 namespace adbcpq {
 
 PqResultHelper::~PqResultHelper() {
-  PQclear(pending_);
-  pending_ = nullptr;
+  for (PGresult* result : pending_) PQclear(result);
+  pending_.clear();
   ClearResult();
   if (streaming_) AbandonStream();
 }
@@ -51,11 +51,22 @@ namespace {
 // Wait until the server has accepted the cancel. A bare PQcancel returns
 // before the server applies it, so it can abort the next query instead.
 bool SendCancel(PGconn* conn) {
+#ifdef LIBPQ_HAS_ASYNC_CANCEL
   PGcancelConn* cancel = PQcancelCreate(conn);
   if (cancel == nullptr) return false;
   const int rc = PQcancelBlocking(cancel);
   PQcancelFinish(cancel);
   return rc == 1;
+#else
+  // libpq 15 and 16. The caller is blocked in this read and consumes the
+  // result immediately, so the older asynchronous cancel still hits this query.
+  char errbuf[256];
+  PGcancel* cancel = PQgetCancel(conn);
+  if (cancel == nullptr) return false;
+  const int rc = PQcancel(cancel, errbuf, sizeof(errbuf));
+  PQfreeCancel(cancel);
+  return rc == 1;
+#endif
 }
 
 bool IsFailure(const PGresult* result) {
@@ -85,14 +96,23 @@ void WaitForSocket(int sock) {
 
 }  // namespace
 
+void PqResultHelper::DiscardLocal() {
+  for (PGresult* result : pending_) PQclear(result);
+  pending_.clear();
+  ClearResult();
+  streaming_ = false;
+}
+
 void PqResultHelper::WaitUntilReady() {
   // The cancel thread only sets cancel_flag_. This thread sends the cancel,
   // and only while the next read would block, so it cannot hit a later query.
   for (;;) {
     if (PQconsumeInput(conn_) != 1) return;
     if (PQisBusy(conn_) == 0) return;
-    if (cancel_flag_ != nullptr && cancel_flag_->load(std::memory_order_acquire) &&
-        !cancel_sent_) {
+    const bool stop =
+        abandon_ || (cancel_flag_ != nullptr &&
+                     cancel_flag_->load(std::memory_order_acquire));
+    if (stop && !cancel_sent_) {
       SendCancel(conn_);
       cancel_sent_ = true;
       return;
@@ -102,11 +122,15 @@ void PqResultHelper::WaitUntilReady() {
 }
 
 bool PqResultHelper::AbandonStream() {
-  if (!streaming_ && pending_ == nullptr) return false;
-  bool failed = IsFailure(pending_);
+  if (!streaming_ && pending_.empty()) return false;
+  abandon_ = true;
+  bool failed = false;
+  for (PGresult* result : pending_) {
+    if (IsFailure(result)) failed = true;
+    PQclear(result);
+  }
+  pending_.clear();
   streaming_ = false;
-  PQclear(pending_);
-  pending_ = nullptr;
   for (;;) {
     WaitUntilReady();
     PGresult* result = PQgetResult(conn_);
@@ -119,7 +143,11 @@ bool PqResultHelper::AbandonStream() {
 namespace {
 
 bool IsRowPacket(ExecStatusType status) {
-  return status == PGRES_TUPLES_CHUNK || status == PGRES_SINGLE_TUPLE;
+  if (status == PGRES_SINGLE_TUPLE) return true;
+#ifdef LIBPQ_HAS_CHUNK_MODE
+  if (status == PGRES_TUPLES_CHUNK) return true;
+#endif
+  return false;
 }
 
 }  // namespace
@@ -136,8 +164,14 @@ Status PqResultHelper::BeginRowStream() {
                       PQerrorMessage(conn_));
   }
 
+#ifdef LIBPQ_HAS_CHUNK_MODE
   constexpr int kStreamChunkRows = 1024;
   const int armed = PQsetChunkedRowsMode(conn_, kStreamChunkRows);
+#else
+  // libpq 15 and 16 deliver one row per packet. PullBufferedTail still drains
+  // every packet that is already buffered, so a finished script can commit.
+  const int armed = PQsetSingleRowMode(conn_);
+#endif
   if (armed != 1) {
     streaming_ = true;
     AbandonStream();
@@ -149,42 +183,52 @@ Status PqResultHelper::BeginRowStream() {
 }
 
 void PqResultHelper::PullBufferedTail() {
-  if (!streaming_ || pending_ != nullptr) return;
-  if (PQconsumeInput(conn_) != 1 || PQisBusy(conn_) != 0) return;
-  PGresult* next = PQgetResult(conn_);
-  if (next == nullptr) {
+  if (!streaming_) return;
+  // Single-row mode (libpq 15 and 16) puts each row in its own packet. Keep
+  // taking packets that are already buffered until the command completes, so
+  // the script can commit without the caller reading every row.
+  for (;;) {
+    if (PQconsumeInput(conn_) != 1 || PQisBusy(conn_) != 0) return;
+    PGresult* next = PQgetResult(conn_);
+    if (next == nullptr) {
+      streaming_ = false;
+      return;
+    }
+    const ExecStatusType status = PQresultStatus(next);
+    if (IsRowPacket(status)) {
+      pending_.push_back(next);
+      continue;
+    }
+    if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK &&
+        status != PGRES_EMPTY_QUERY) {
+      // An error has to reach the next read. Don't commit over it.
+      pending_.push_back(next);
+      return;
+    }
+    PQclear(next);
+    PGresult* extra;
+    while ((extra = PQgetResult(conn_)) != nullptr) {
+      if (IsFailure(extra) || IsRowPacket(PQresultStatus(extra))) {
+        pending_.push_back(extra);
+        return;
+      }
+      PQclear(extra);
+    }
     streaming_ = false;
     return;
   }
-  const ExecStatusType status = PQresultStatus(next);
-  if (IsRowPacket(status)) {
-    pending_ = next;
-    return;
-  }
-  if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK &&
-      status != PGRES_EMPTY_QUERY) {
-    // An error has to reach the next read. Don't commit over it.
-    pending_ = next;
-    return;
-  }
-  PQclear(next);
-  PGresult* extra;
-  while ((extra = PQgetResult(conn_)) != nullptr) {
-    PQclear(extra);
-  }
-  streaming_ = false;
 }
 
 Status PqResultHelper::NextPacket() {
-  if (!streaming_ && pending_ == nullptr) {
+  if (!streaming_ && pending_.empty()) {
     ClearResult();
     return Status::Ok();
   }
 
   ClearResult();
-  if (pending_ != nullptr) {
-    result_ = pending_;
-    pending_ = nullptr;
+  if (!pending_.empty()) {
+    result_ = pending_.front();
+    pending_.pop_front();
   } else {
     WaitUntilReady();
     result_ = PQgetResult(conn_);

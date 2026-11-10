@@ -40,12 +40,17 @@ namespace adbcpq {
 
 PqResultArrayReader::~PqResultArrayReader() {
   // ReleaseConnection already finished the libpq calls while the connection
-  // was still open. Touching PGconn after PostgresConnection::Release is a
-  // use-after-free: Release disconnects even if this reader still exists.
+  // was still open. After PQfinish only the result memory may be freed.
+  if (connection_ != nullptr && connection_->disconnected()) {
+    helper_.DiscardLocal();
+    ResetErrors();
+    return;
+  }
   if (!closed_) {
     const bool failed = helper_.Finish();
-    const bool cancel = cancel_requested_.load(std::memory_order_acquire);
-    // A clean drain commits, matching one PQexec. A failure or a cancel does not.
+    const bool cancel =
+        cancel_requested_.load(std::memory_order_acquire) || helper_.CancelSent();
+    // A clean drain of a finished script commits. A cancel or a failure does not.
     EndOwnedTransaction(!(failed || cancel));
   }
   ResetErrors();
@@ -423,7 +428,8 @@ void PqResultArrayReader::ReleaseConnection() {
   }
   closed_ = true;
   const bool failed = helper_.Finish();
-  const bool cancel = cancel_requested_.load(std::memory_order_acquire);
+  const bool cancel =
+      cancel_requested_.load(std::memory_order_acquire) || helper_.CancelSent();
   EndOwnedTransaction(!(failed || cancel));
   status_ = ADBC_STATUS_INVALID_STATE;
   InternalAdbcSetError(&error_, "%s",

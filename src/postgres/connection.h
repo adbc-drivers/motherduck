@@ -23,6 +23,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -90,6 +91,10 @@ class PostgresConnection {
   void TrackActiveReader(const std::shared_ptr<PqResultArrayReader>& reader);
   std::shared_ptr<PqResultArrayReader> ActiveReader() const;
   void FinishActiveReader();
+  // Park a reader the cancel thread is done with, so its destructor runs on
+  // the thread that uses the connection.
+  void RetireReader(std::shared_ptr<PqResultArrayReader> reader);
+  bool disconnected() const { return disconnected_.load(std::memory_order_acquire); }
   const std::shared_ptr<PostgresTypeResolver>& type_resolver() const {
     return type_resolver_;
   }
@@ -102,6 +107,7 @@ class PostgresConnection {
   friend class PostgresStatement;
 
   AdbcStatusCode EnsureTransaction(struct AdbcError* error);
+  void DrainRetiredReaders();
 
   std::shared_ptr<PostgresDatabase> database_;
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
@@ -110,6 +116,10 @@ class PostgresConnection {
   // Guards active_reader_. Cancel runs on another thread from the read.
   mutable std::mutex active_reader_mu_;
   std::weak_ptr<PqResultArrayReader> active_reader_;
+  // Set before PQfinish. A reader destroyed after that only frees results.
+  std::atomic<bool> disconnected_{false};
+  std::mutex retired_mu_;
+  std::vector<std::shared_ptr<PqResultArrayReader>> retired_;
   bool autocommit_;
   bool use_copy_;
   std::vector<std::pair<std::string, std::string>> post_init_options_;
