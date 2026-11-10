@@ -22,8 +22,19 @@
 
 // part: metadata
 
+# DuckDB's TIMESTAMP_NS spans 1677-09-22 to 2262-04-11 and reserves INT64_MIN
+# and INT64_MAX nanoseconds for infinity, so the base case's extremes can't be
+# stored. Bind the first and last whole days in range instead.
 [tags]
 sql-type-name = "timestamp"
+
+// part: bind
+
+{"idx": 3, "res": 1684158330000000000}
+{"idx": 2, "res": 946684800000000000}
+{"idx": 1, "res": -9223286400000000000}
+{"idx": 4, "res": 9223286400000000000}
+{"idx": 0, "res": null}
 
 // part: expected_schema
 
@@ -41,7 +52,7 @@ sql-type-name = "timestamp"
 // part: expected
 
 {"res": null}
-{"res": -9223372036854775}
+{"res": -9223286400000000}
 {"res": 946684800000000}
 {"res": 1684158330000000}
-{"res": 9223372036854775}
+{"res": 9223286400000000}
