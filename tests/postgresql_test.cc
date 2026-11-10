@@ -3616,8 +3616,8 @@ TEST_F(PostgresStatementTest, SqlReadIntervalOverflow) {
         AdbcErrorFromArrayStream(&reader.stream.value, &status);
     ASSERT_NE(nullptr, detail);
     ASSERT_EQ(ADBC_STATUS_INTERNAL, status);
-    ASSERT_THAT(detail->message, ::testing::HasSubstr(
-                                     "would overflow when converting to nanoseconds"));
+    ASSERT_THAT(detail->message,
+                ::testing::HasSubstr("would overflow when converting to nanoseconds"));
     ASSERT_EQ(reader.array->release, nullptr);
   }
 
@@ -3641,8 +3641,8 @@ TEST_F(PostgresStatementTest, SqlReadIntervalOverflow) {
         AdbcErrorFromArrayStream(&reader.stream.value, &status);
     ASSERT_NE(nullptr, detail);
     ASSERT_EQ(ADBC_STATUS_INTERNAL, status);
-    ASSERT_THAT(detail->message, ::testing::HasSubstr(
-                                     "would overflow when converting to nanoseconds"));
+    ASSERT_THAT(detail->message,
+                ::testing::HasSubstr("would overflow when converting to nanoseconds"));
     ASSERT_EQ(reader.array->release, nullptr);
   }
 }
@@ -4307,9 +4307,8 @@ TEST_F(PostgresStatementTest, Cancel) {
   });
 
   adbc_validation::StreamReader reader;
-  const AdbcStatusCode status =
-      AdbcStatementExecuteQuery(&statement, &reader.stream.value, &reader.rows_affected,
-                                &error);
+  const AdbcStatusCode status = AdbcStatementExecuteQuery(
+      &statement, &reader.stream.value, &reader.rows_affected, &error);
   canceller.join();
   ASSERT_THAT(status, IsStatus(ADBC_STATUS_CANCELLED, &error));
   ASSERT_EQ("57014", std::string_view(error.sqlstate, 5));
@@ -4347,8 +4346,9 @@ TEST_F(PostgresStatementTest, MultipleStatementsResultStream) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   // The last statement is the result. The earlier one still has to run.
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1 AS n; SELECT 2 AS n", &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(&statement, "SELECT 1 AS n; SELECT 2 AS n", &error),
+      IsOkStatus(&error));
   adbc_validation::StreamReader reader;
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                         &reader.rows_affected, &error),
@@ -4395,9 +4395,10 @@ TEST_F(PostgresStatementTest, MultipleStatementsResultStreamQuotedSemicolon) {
 
 TEST_F(PostgresStatementTest, ResultStreamReplacedWhileOpen) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  for (const char* query : {"DROP TABLE IF EXISTS test_stream_replace",
-                            "CREATE TABLE test_stream_replace (ints INT)",
-                            "INSERT INTO test_stream_replace (ints) VALUES (1), (2), (3)"}) {
+  for (const char* query :
+       {"DROP TABLE IF EXISTS test_stream_replace",
+        "CREATE TABLE test_stream_replace (ints INT)",
+        "INSERT INTO test_stream_replace (ints) VALUES (1), (2), (3)"}) {
     ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
                 IsOkStatus(&error));
@@ -4405,9 +4406,10 @@ TEST_F(PostgresStatementTest, ResultStreamReplacedWhileOpen) {
   ASSERT_THAT(AdbcStatementSetOption(&statement, "adbc.postgresql.batch_size_hint_bytes",
                                      "1", &error),
               IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &statement, "SELECT ints FROM test_stream_replace ORDER BY ints", &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, "SELECT ints FROM test_stream_replace ORDER BY ints", &error),
+      IsOkStatus(&error));
 
   adbc_validation::StreamReader first;
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &first.stream.value,
@@ -4487,9 +4489,8 @@ TEST_F(PostgresStatementTest, ResultStreamReleasedBeforeNextQuery) {
   adbc_validation::StreamReader next;
   ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 4 AS n", &error),
               IsOkStatus(&error));
-  ASSERT_THAT(
-      AdbcStatementExecuteQuery(&statement, &next.stream.value, nullptr, &error),
-      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &next.stream.value, nullptr, &error),
+              IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(next.GetSchema());
   ASSERT_NO_FATAL_FAILURE(next.Next());
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(next.array_view->children[0], 0), 4);
@@ -4504,8 +4505,9 @@ TEST_F(PostgresStatementTest, CancelBetweenReads) {
                   &statement, "SELECT g FROM generate_series(1, 3) t(g)", &error),
               IsOkStatus(&error));
   adbc_validation::StreamReader reader;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+      IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_EQ(reader.array->length, 1);
@@ -4513,7 +4515,8 @@ TEST_F(PostgresStatementTest, CancelBetweenReads) {
   ASSERT_THAT(AdbcStatementCancel(&statement, &error), IsOkStatus(&error));
   ASSERT_EQ(ECANCELED, reader.MaybeNext());
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 9", &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 9", &error),
+              IsOkStatus(&error));
   adbc_validation::StreamReader next;
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &next.stream.value, nullptr, &error),
               IsOkStatus(&error));
@@ -4524,10 +4527,12 @@ TEST_F(PostgresStatementTest, CancelBetweenReads) {
 
 TEST_F(PostgresStatementTest, CancelNullStreamIgnoresOldReader) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
-  adbc_validation::StreamReader reader;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error),
               IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+      IsOkStatus(&error));
 
   // The buffered stream must not stay the cancel target. This null-stream
   // query has to be the one that gets cancelled.
@@ -4558,12 +4563,11 @@ TEST_F(PostgresStatementTest, CancelLeadingStatement) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   const bool motherduck = uri != nullptr && std::strstr(uri, "motherduck.com") != nullptr;
-  ASSERT_THAT(
-      AdbcStatementSetSqlQuery(&statement,
-                               motherduck ? "SELECT sleep_ms(5000); SELECT 1"
-                                          : "SELECT pg_sleep(5); SELECT 1",
-                               &error),
-      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       motherduck ? "SELECT sleep_ms(5000); SELECT 1"
+                                                  : "SELECT pg_sleep(5); SELECT 1",
+                                       &error),
+              IsOkStatus(&error));
   std::thread canceller([&] {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     struct AdbcError cancel_error = ADBC_ERROR_INIT;
@@ -4577,7 +4581,8 @@ TEST_F(PostgresStatementTest, CancelLeadingStatement) {
   ASSERT_THAT(status, IsStatus(ADBC_STATUS_CANCELLED, &error));
   if (error.release != nullptr) error.release(&error);
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error),
+              IsOkStatus(&error));
   adbc_validation::StreamReader next;
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &next.stream.value, nullptr, &error),
               IsOkStatus(&error));
@@ -4606,8 +4611,9 @@ TEST_F(PostgresStatementTest, EarlyCloseCommitsEarlierStatement) {
               IsOkStatus(&error));
   {
     adbc_validation::StreamReader unread;
-    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
-                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
+        IsOkStatus(&error));
   }
 
   adbc_validation::Handle<struct AdbcConnection> other;
@@ -4616,12 +4622,13 @@ TEST_F(PostgresStatementTest, EarlyCloseCommitsEarlierStatement) {
   ASSERT_THAT(AdbcConnectionInit(&other.value, &database, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&other.value, &other_statement.value, &error),
               IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &other_statement.value, "SELECT COUNT(*) FROM test_stream_early_close", &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(&other_statement.value,
+                               "SELECT COUNT(*) FROM test_stream_early_close", &error),
+      IsOkStatus(&error));
   adbc_validation::StreamReader count;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&other_statement.value, &count.stream.value, nullptr,
-                                        &error),
+  ASSERT_THAT(AdbcStatementExecuteQuery(&other_statement.value, &count.stream.value,
+                                        nullptr, &error),
               IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(count.GetSchema());
   ASSERT_NO_FATAL_FAILURE(count.Next());
@@ -4636,21 +4643,24 @@ TEST_F(PostgresStatementTest, EarlyCloseLeavesCallerTransactionOpen) {
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &statement, motherduck ? "SELECT sleep_ms(2000)" : "SELECT pg_sleep(2)", &error),
+                  &statement, motherduck ? "SELECT sleep_ms(2000)" : "SELECT pg_sleep(2)",
+                  &error),
               IsOkStatus(&error));
   {
     adbc_validation::StreamReader unread;
-    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
-                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
+        IsOkStatus(&error));
   }
 
-  ASSERT_EQ("intrans",
-            adbc_validation::ConnectionGetOption(&connection, "adbc.postgresql.transaction_status",
-                                                 &error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
-  adbc_validation::StreamReader reader;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+  ASSERT_EQ("intrans", adbc_validation::ConnectionGetOption(
+                           &connection, "adbc.postgresql.transaction_status", &error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error),
               IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+      IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 1);
@@ -4658,17 +4668,21 @@ TEST_F(PostgresStatementTest, EarlyCloseLeavesCallerTransactionOpen) {
 
 TEST_F(PostgresStatementTest, ScriptCopyFailsFast) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "COPY (SELECT 1) TO STDOUT; SELECT 2", &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(&statement, "COPY (SELECT 1) TO STDOUT; SELECT 2", &error),
+      IsOkStatus(&error));
   adbc_validation::StreamReader failed;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &failed.stream.value, nullptr, &error),
-              ::testing::Not(IsOkStatus(&error)));
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &failed.stream.value, nullptr, &error),
+      ::testing::Not(IsOkStatus(&error)));
   if (error.release != nullptr) error.release(&error);
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
-  adbc_validation::StreamReader reader;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error),
               IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+      IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 1);
@@ -4679,15 +4693,19 @@ TEST_F(PostgresStatementTest, BufferedResultSurvivesNextCommand) {
   adbc_validation::Handle<struct AdbcStatement> other;
   ASSERT_THAT(AdbcStatementNew(&connection, &other.value, &error), IsOkStatus(&error));
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error),
+              IsOkStatus(&error));
   adbc_validation::StreamReader reader;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+      IsOkStatus(&error));
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&other.value, "SELECT 8", &error), IsOkStatus(&error));
-  adbc_validation::StreamReader next;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&other.value, &next.stream.value, nullptr, &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&other.value, "SELECT 8", &error),
               IsOkStatus(&error));
+  adbc_validation::StreamReader next;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&other.value, &next.stream.value, nullptr, &error),
+      IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(next.GetSchema());
   ASSERT_NO_FATAL_FAILURE(next.Next());
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(next.array_view->children[0], 0), 8);
@@ -4699,10 +4717,12 @@ TEST_F(PostgresStatementTest, BufferedResultSurvivesNextCommand) {
 
 TEST_F(PostgresStatementTest, StatementNewLeavesBufferedStream) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 4", &error), IsOkStatus(&error));
-  adbc_validation::StreamReader reader;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 4", &error),
               IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+      IsOkStatus(&error));
 
   adbc_validation::Handle<struct AdbcStatement> other;
   ASSERT_THAT(AdbcStatementNew(&connection, &other.value, &error), IsOkStatus(&error));
@@ -4714,10 +4734,12 @@ TEST_F(PostgresStatementTest, StatementNewLeavesBufferedStream) {
 
 TEST_F(PostgresStatementTest, BufferedResultSurvivesConnectionRelease) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 5", &error), IsOkStatus(&error));
-  adbc_validation::StreamReader reader;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 5", &error),
               IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+      IsOkStatus(&error));
 
   ASSERT_THAT(AdbcConnectionRelease(&connection, &error), IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
@@ -4727,17 +4749,17 @@ TEST_F(PostgresStatementTest, BufferedResultSurvivesConnectionRelease) {
 
 TEST_F(PostgresStatementTest, MultipleStatementsDmlVisibleBeforeRead) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &statement,
-                  "DROP TABLE IF EXISTS test_stream_visible; "
-                  "CREATE TABLE test_stream_visible (ints INT); "
-                  "INSERT INTO test_stream_visible VALUES (1)",
-                  &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "DROP TABLE IF EXISTS test_stream_visible; "
+                                       "CREATE TABLE test_stream_visible (ints INT); "
+                                       "INSERT INTO test_stream_visible VALUES (1)",
+                                       &error),
               IsOkStatus(&error));
   {
     adbc_validation::StreamReader unread;
-    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
-                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
+        IsOkStatus(&error));
   }
 
   adbc_validation::Handle<struct AdbcConnection> other;
@@ -4746,13 +4768,14 @@ TEST_F(PostgresStatementTest, MultipleStatementsDmlVisibleBeforeRead) {
   ASSERT_THAT(AdbcConnectionInit(&other.value, &database, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&other.value, &other_statement.value, &error),
               IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&other_statement.value,
-                                      "SELECT COUNT(*) FROM test_stream_visible", &error),
-              IsOkStatus(&error));
-  adbc_validation::StreamReader reader;
   ASSERT_THAT(
-      AdbcStatementExecuteQuery(&other_statement.value, &reader.stream.value, nullptr, &error),
+      AdbcStatementSetSqlQuery(&other_statement.value,
+                               "SELECT COUNT(*) FROM test_stream_visible", &error),
       IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&other_statement.value, &reader.stream.value,
+                                        nullptr, &error),
+              IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_EQ(reader.array->length, 1);
@@ -4761,13 +4784,16 @@ TEST_F(PostgresStatementTest, MultipleStatementsDmlVisibleBeforeRead) {
 
 TEST_F(PostgresStatementTest, NullStreamDoesNotHoldConnection) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error),
+              IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
               IsOkStatus(&error));
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 2", &error), IsOkStatus(&error));
-  adbc_validation::StreamReader reader;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 2", &error),
               IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+      IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 2);
@@ -4782,24 +4808,25 @@ TEST_F(PostgresStatementTest, MultipleStatementsStayAtomic) {
                 IsOkStatus(&error));
   }
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &statement,
-                  "INSERT INTO test_stream_atomic VALUES (1); "
-                  "SELECT * FROM test_stream_atomic_missing",
-                  &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "INSERT INTO test_stream_atomic VALUES (1); "
+                                       "SELECT * FROM test_stream_atomic_missing",
+                                       &error),
               IsOkStatus(&error));
   adbc_validation::StreamReader failed;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &failed.stream.value, nullptr, &error),
-              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &failed.stream.value, nullptr, &error),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
   ASSERT_EQ("42P01", std::string_view(error.sqlstate, 5));
   error.release(&error);
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(
-                  &statement, "SELECT COUNT(*) FROM test_stream_atomic", &error),
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "SELECT COUNT(*) FROM test_stream_atomic", &error),
               IsOkStatus(&error));
   adbc_validation::StreamReader reader;
-  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+      IsOkStatus(&error));
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_EQ(reader.array->length, 1);

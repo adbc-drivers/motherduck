@@ -30,8 +30,8 @@
 #include "result_helper.h"
 
 #include <charconv>
-#include <memory>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -116,9 +116,8 @@ void PqResultHelper::WaitUntilReady() {
   for (;;) {
     if (PQconsumeInput(conn_) != 1) return;
     if (PQisBusy(conn_) == 0) return;
-    const bool stop = stop_if_blocked_ ||
-                      (cancel_flag_ != nullptr &&
-                       cancel_flag_->load(std::memory_order_acquire));
+    const bool stop = stop_if_blocked_ || (cancel_flag_ != nullptr &&
+                                           cancel_flag_->load(std::memory_order_acquire));
     if (stop && !cancel_sent_) {
       SendCancel(conn_);
       cancel_sent_ = true;
@@ -198,7 +197,8 @@ Status PqResultHelper::ExecuteCancellable(const std::string& sql) {
     PGresult* result = PQgetResult(conn_);
     if (result == nullptr) break;
     const ExecStatusType status = PQresultStatus(result);
-    if (status == PGRES_COPY_IN || status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH) {
+    if (status == PGRES_COPY_IN || status == PGRES_COPY_OUT ||
+        status == PGRES_COPY_BOTH) {
       if (failure.ok()) {
         failure = Status(ADBC_STATUS_NOT_IMPLEMENTED,
                          "[libpq] COPY is not supported in a multi-statement query");
@@ -213,8 +213,8 @@ Status PqResultHelper::ExecuteCancellable(const std::string& sql) {
                          "[libpq] canceling statement due to user request");
         failure.SetSqlState("57014");
       } else {
-        failure = MakeStatus(result, "[libpq] Failed to execute query '{}': {}", sql.c_str(),
-                             PQresultErrorMessage(result));
+        failure = MakeStatus(result, "[libpq] Failed to execute query '{}': {}",
+                             sql.c_str(), PQresultErrorMessage(result));
       }
     }
     PQclear(result);

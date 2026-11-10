@@ -502,9 +502,9 @@ int PqResultArrayReader::Fail(const Status& status) {
 int PqResultArrayReader::FailArrow(int code) {
   if (code == NANOARROW_OK) return NANOARROW_OK;
   status_ = ADBC_STATUS_INTERNAL;
-  InternalAdbcSetError(&error_, "[libpq] %s",
-                       na_error_.message[0] != '\0' ? na_error_.message
-                                                    : "failed to build result batch");
+  InternalAdbcSetError(
+      &error_, "[libpq] %s",
+      na_error_.message[0] != '\0' ? na_error_.message : "failed to build result batch");
   return code;
 }
 
@@ -529,8 +529,8 @@ int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
     }
 
     if (!started) {
-      if (int code = FailArrow(
-              ArrowArrayInitFromSchema(tmp.get(), schema_.get(), &na_error_))) {
+      if (int code =
+              FailArrow(ArrowArrayInitFromSchema(tmp.get(), schema_.get(), &na_error_))) {
         return code;
       }
       if (int code = FailArrow(ArrowArrayStartAppending(tmp.get()))) return code;
@@ -548,9 +548,9 @@ int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
       PqRecord value = row[i];
       item.data.data = value.data;
       item.size_bytes = value.is_null ? -1 : value.len;
-      if (int code = FailArrow(field_readers_[i]->Read(
-              &item, static_cast<int32_t>(item.size_bytes), tmp->children[i],
-              &na_error_))) {
+      if (int code = FailArrow(
+              field_readers_[i]->Read(&item, static_cast<int32_t>(item.size_bytes),
+                                      tmp->children[i], &na_error_))) {
         return code;
       }
     }

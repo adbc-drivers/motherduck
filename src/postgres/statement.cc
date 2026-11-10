@@ -401,7 +401,8 @@ AdbcStatusCode PostgresStatement::Cancel(struct AdbcError* error) {
   return connection_->Cancel(error);
 }
 
-void PostgresStatement::RememberReader(const std::shared_ptr<PqResultArrayReader>& reader) {
+void PostgresStatement::RememberReader(
+    const std::shared_ptr<PqResultArrayReader>& reader) {
   std::lock_guard<std::mutex> lock(cancel_mu_);
   cancel_reader_ = reader;
 }

@@ -976,10 +976,10 @@ AdbcStatusCode PostgresConnectionGetStatisticsImpl(PGconn* conn, const char* db_
 }
 
 AdbcStatusCode PostgresConnection::GetStatistics(const char* catalog,
-                                                  const char* db_schema,
-                                                  const char* table_name, bool approximate,
-                                                  struct ArrowArrayStream* out,
-                                                  struct AdbcError* error) {
+                                                 const char* db_schema,
+                                                 const char* table_name, bool approximate,
+                                                 struct ArrowArrayStream* out,
+                                                 struct AdbcError* error) {
   // Simplify our jobs here
   if (!approximate) {
     InternalAdbcSetError(error, "[libpq] Exact statistics are not implemented");
@@ -1046,7 +1046,7 @@ AdbcStatusCode PostgresConnectionGetStatisticNamesImpl(struct ArrowSchema* schem
 }
 
 AdbcStatusCode PostgresConnection::GetStatisticNames(struct ArrowArrayStream* out,
-                                                      struct AdbcError* error) {
+                                                     struct AdbcError* error) {
   // We don't support any extended statistics, just return an empty stream
   struct ArrowSchema schema;
   std::memset(&schema, 0, sizeof(schema));
