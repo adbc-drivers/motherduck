@@ -555,7 +555,9 @@ AdbcStatusCode PostgresStatement::ResolveCopyTargetTypes(
   // its name with ::regclass, which MotherDuck can't parse for quoted, qualified
   // names (#13). The name resolves as in any query, and a missing table fails
   // with 42P01 (NOT_FOUND). Without parameters, Execute sends one simple query,
-  // whose result still describes the columns.
+  // whose result still describes the columns. Unlike the catalog lookup, this
+  // needs SELECT on the table; MotherDuck has no GRANT, so anyone who can
+  // append can read it.
   PqResultHelper result_helper{connection_->conn(),
                                "SELECT * FROM " + escaped_table + " LIMIT 0"};
   RAISE_STATUS(error, result_helper.Execute());
@@ -571,12 +573,17 @@ AdbcStatusCode PostgresStatement::ResolveCopyTargetTypes(
 
   *copy_target_types = PostgresType(PostgresTypeId::kRecord);
   for (const auto& field_name : source_field_names) {
-    auto it = std::find_if(table_fields.begin(), table_fields.end(),
-                           [&](const auto& item) { return item.first == field_name; });
-    if (it == table_fields.end()) {
-      it = std::find_if(table_fields.begin(), table_fields.end(), [&](const auto& item) {
-        return SameColumnName(item.first, field_name);
-      });
+    // Prefer an exact match, then one the server considers the same name.
+    auto it = table_fields.end();
+    for (auto candidate = table_fields.begin(); candidate != table_fields.end();
+         ++candidate) {
+      if (candidate->first == field_name) {
+        it = candidate;
+        break;
+      }
+      if (it == table_fields.end() && SameColumnName(candidate->first, field_name)) {
+        it = candidate;
+      }
     }
     if (it == table_fields.end()) {
       InternalAdbcSetError(error,

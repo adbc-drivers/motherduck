@@ -3094,12 +3094,16 @@ TEST_F(PostgresStatementTest, SqlIngestAppendTargetLookupErrors) {
               IsStatus(ADBC_STATUS_ALREADY_EXISTS, &error));
 
   // DuckDB column names ignore case, so a differently cased column passes the
-  // lookup; the append then stops at COPY FROM STDIN (#31).
-  AdbcStatusCode status = append(nullptr, "INGEST_LOOKUP", "AMOUNT");
-  const char* message = error.message ? error.message : "";
-  EXPECT_NE(status, ADBC_STATUS_NOT_FOUND) << message;
-  EXPECT_NE(status, ADBC_STATUS_ALREADY_EXISTS) << message;
+  // lookup; if the append still fails, it's at COPY FROM STDIN, which the
+  // endpoint lacks (#31).
+  if (append(nullptr, "INGEST_LOOKUP", "AMOUNT") != ADBC_STATUS_OK) {
+    EXPECT_THAT(error.message ? error.message : "",
+                ::testing::HasSubstr("COPY query failed"));
+  }
   if (error.release) error.release(&error);
+
+  ASSERT_THAT(quirks()->DropTable(&connection, "ingest_lookup", &error),
+              IsOkStatus(&error));
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendIntegerIntoNumeric) {
