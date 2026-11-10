@@ -496,7 +496,7 @@ AdbcStatusCode PostgresConnection::Commit(struct AdbcError* error) {
   PGresult* result = PQexec(conn_, "COMMIT");
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
     AdbcStatusCode code =
-        MakeStatus(result, "[libpq] Failed to commit: {}", PqErrorText(nullptr, conn_))
+        MakeStatus(result, "[libpq] Failed to commit: {}", PqErrorText(result, conn_))
             .ToAdbc(error);
     PQclear(result);
     return code;

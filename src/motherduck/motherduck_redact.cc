@@ -17,6 +17,7 @@
 #include "motherduck_redact.h"
 
 #include <algorithm>
+#include <exception>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -45,14 +46,15 @@ const std::vector<std::regex>& Patterns() {
     return std::vector<std::regex>{
         // CREATE [OR REPLACE] [PERSISTENT] SECRET <name> (options): drop the name too.
         std::regex(R"((\b(?:create|alter)\b[\s\S]{0,200}?\bsecret\b))", kFlags),
-        // name = v, name TO v, name: v, PASSWORD 'v', name(v), or a comment hiding one.
+        // name = v, name TO v, name: v, PASSWORD 'v', name(v), (name) VALUES (v), or a
+        // comment hiding one.
         std::regex(
-            "(" + credential + R"([\w.$]{0,64})\s*(?:=|:(?!:)|\bto\b|["'(]|/\*|--))",
+            "(" + credential + R"([\w.$]{0,64})\s*(?:=|:(?!:)|\bto\b|["'(),]|/\*|--))",
             kFlags),
         // scheme://user:password@host
-        std::regex(R"((://[^\s'"@/]{0,128}:)[^\s'"@]{0,256}@)", kFlags),
+        std::regex(R"((://[^\s'"@/]{0,128}:)[^\s'"@]{0,1024}@)", kFlags),
         // md:<token>@database, motherduck:<token>@database
-        std::regex(R"((\b(?:md|motherduck):)[^'"@]{0,512}@)", kFlags),
+        std::regex(R"((\b(?:md|motherduck):)[^'"@]{0,1024}@)", kFlags),
         // md_create_flight(source_code := ..., config => ...): free-form payloads.
         std::regex(R"((\b(?:source_code|config))\s*(?::=|=>?|/\*|--))", kFlags),
     };
@@ -63,16 +65,25 @@ const std::vector<std::regex>& Patterns() {
 }  // namespace
 
 std::string RedactSecretStatements(std::string_view query) {
-  const std::string text(query);
-  size_t cut = text.size();
-  bool found = false;
-  for (const std::regex& pattern : Patterns()) {
-    std::smatch match;
-    if (!std::regex_search(text, match, pattern)) continue;
-    cut = std::min(cut, static_cast<size_t>(match.position(1) + match.length(1)));
-    found = true;
+  // This runs while an error is being built, so it must not throw. If a pattern can't be
+  // built or the matcher gives up, hide everything.
+  if (query.empty()) return std::string();
+  try {
+    const char* begin = query.data();
+    const char* end = begin + query.size();
+    size_t cut = query.size();
+    bool found = false;
+    for (const std::regex& pattern : Patterns()) {
+      std::cmatch match;
+      if (!std::regex_search(begin, end, match, pattern)) continue;
+      cut = std::min(cut, static_cast<size_t>(match.position(1) + match.length(1)));
+      found = true;
+    }
+    if (!found) return std::string(query);
+    return std::string(query.substr(0, cut)) + " ...";
+  } catch (const std::exception&) {
+    return "(redacted)";
   }
-  return found ? text.substr(0, cut) + " ..." : text;
 }
 
 void InstallMotherDuckQueryRedactor() { SetQueryRedactor(&RedactSecretStatements); }

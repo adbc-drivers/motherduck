@@ -48,7 +48,7 @@ TEST(MotherDuckRedactTest, ExactOutputs) {
 
 // None of these may let the marker through, however the statement is dressed up.
 TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
-  const char* kQueries[] = {
+  const std::string kQueries[] = {
       "CREATE /* see (note) */ SECRET s (TYPE s3, SECRET 'ZZ9')",
       "CREATE -- (c)\n SECRET s (SECRET 'ZZ9')",
       "CREATE SECRET s SECRET 'ZZ9' -- (forgot parens)",
@@ -103,6 +103,9 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
       "SET VARIABLE pw = 'ZZ9'",
       "ATTACH 'host=h user=u pass=ZZ9' AS m (TYPE mysql)",
       "SET db_pass = 'ZZ9'",
+      // Column lists: the values come later.
+      "INSERT INTO creds (id, password) VALUES (1, 'ZZ9')",
+      "INSERT INTO creds (api_key, id) VALUES ('ZZ9', 1)",
       "SET http_bearer = 'ZZ9'",
       "SET session_jwt = 'ZZ9'",
       "SET sticky_cookie = 'ZZ9'",
@@ -127,6 +130,9 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
       "ATTACH 'md:ZZ9@mydb'",
       "ATTACH 'md:ZZ9@mydb;attach_mode=single'",
       "ATTACH 'md: ZZ9@mydb'",
+      // Tokens are JWTs, far longer than a password.
+      "ATTACH 'md:ZZ9" + std::string(900, 'x') + "@mydb'",
+      "INSTALL x FROM 'https://u:ZZ9" + std::string(900, 'x') + "@repo.example.com'",
       "ATTACH 'md:/* c */ZZ9@mydb'",
       "ATTACH 'motherduck:ZZ9@mydb'",
       "ATTACH 'md:mydb?slt=ZZ9'",
@@ -147,7 +153,7 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
       // HTTP headers.
       "SELECT http_get('https://x', headers = {'Authorization': 'Bearer ZZ9'})",
   };
-  for (const char* query : kQueries) {
+  for (const std::string& query : kQueries) {
     const std::string out = RedactSecretStatements(query);
     EXPECT_EQ(out.find("ZZ9"), std::string::npos) << query << "\n -> " << out;
   }
@@ -156,7 +162,6 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
 TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
   const char* kQueries[] = {
       "SELECT 1",
-      "SELECT keyboard, key FROM t ORDER BY id",
       "SELECT key::int FROM t",
       "SELECT config, source_code FROM flights WHERE config IS NOT NULL",
       "ATTACH 'md:my_db' AS d (READ_ONLY)",
@@ -181,6 +186,7 @@ TEST(MotherDuckRedactTest, OverMasksCredentialLookingSql) {
   const std::pair<const char*, const char*> kCases[] = {
       {"SELECT * FROM t WHERE key = 5 ORDER BY id", "SELECT * FROM t WHERE key ..."},
       {"SELECT * FROM t WHERE monkey = 1", "SELECT * FROM t WHERE monkey ..."},
+      {"SELECT keyboard, key FROM t ORDER BY id", "SELECT keyboard ..."},
       {"CREATE TABLE t (id INT, PRIMARY KEY (id))",
        "CREATE TABLE t (id INT, PRIMARY KEY ..."},
       {"DETAIL: Key (id)=(1) already exists.", "DETAIL: Key ..."},
@@ -201,12 +207,31 @@ TEST(MotherDuckRedactTest, MalformedInputDoesNotCrash) {
         "key =", "token TO", "://", "x://u:", "CREATE SECRET", "secret ("}) {
     RedactSecretStatements(query);
   }
+  // The largest input the driver hands over (server text), full of triggers.
+  for (const char* unit : {"md:", "://a:", "key ", "create ", "/*", "'", "secret "}) {
+    std::string text;
+    while (text.size() < kMaxMessageBytes) text += unit;
+    RedactSecretStatements(text);
+  }
 }
 
 TEST(MotherDuckRedactTest, InstalledRedactorAppliesToErrors) {
   EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET s (SECRET 'x')");
   InstallMotherDuckQueryRedactor();
   EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET ...");
+  SetQueryRedactor(nullptr);
+}
+
+// A secret that straddles the truncation point must not get through, whether the cut
+// lands before the credential name, inside it or inside the value.
+TEST(MotherDuckRedactTest, SecretNearTheTruncationPointIsNotLogged) {
+  InstallMotherDuckQueryRedactor();
+  for (size_t pad = kMaxQueryBytes - 50; pad < kMaxQueryBytes + 5; pad++) {
+    const std::string query =
+        "SELECT '" + std::string(pad, 'a') + "' AS x, 1 FROM t WITH PASSWORD 'ZZ9ZZ9ZZ9'";
+    const std::string out = RedactQuery(query);
+    EXPECT_EQ(out.find("ZZ9"), std::string::npos) << "pad " << pad;
+  }
   SetQueryRedactor(nullptr);
 }
 
