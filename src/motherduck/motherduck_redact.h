@@ -28,11 +28,14 @@ namespace adbcpq {
 /// part is dropped and " ..." is appended:
 ///  - CREATE/ALTER ... SECRET: kept up to SECRET.
 ///  - A name containing secret, token, pass, key or similar, followed by '=', ':', TO, a
-///    quote, '(' or a comment opener: kept up to the name.
+///    single quote, '(', ')', ',' or a comment opener (or a double quote after a space):
+///    kept up to the name. This also masks column lists such as (id, password).
 ///  - user:password@ in a URL, and md:<token>@db.
 ///  - source_code and config arguments of md_create_flight.
-/// This favours masking too much over leaking (`WHERE key = 5` is masked). Other text is
-/// returned unchanged.
+/// This favours masking too much over leaking (`WHERE key = 5` is masked). A quoted name
+/// on its own ("api_key" not found) is left readable. Other text is returned unchanged.
+/// If the patterns can't be built or the matcher fails, the whole text becomes
+/// "(redacted)".
 std::string RedactSecretStatements(std::string_view query);
 
 /// \brief Install RedactSecretStatements as the driver's error-message query redactor.
