@@ -1242,6 +1242,10 @@ AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
     }
     return ADBC_STATUS_OK;
   } else if (std::strcmp(key, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA) == 0) {
+    if (value == nullptr) {
+      InternalAdbcSetError(error, "[libpq] %s must not be NULL", key);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
     if (!conn_) {
       post_init_options_.emplace_back(key, value);
       return ADBC_STATUS_OK;

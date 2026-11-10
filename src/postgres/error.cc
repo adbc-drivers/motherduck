@@ -90,10 +90,17 @@ AdbcStatusCode EscapeIdentifier(PGconn* conn, std::string_view identifier,
                                 std::string* out, struct AdbcError* error) {
   char* escaped = PQescapeIdentifier(conn, identifier.data(), identifier.size());
   if (escaped == nullptr) {
-    InternalAdbcSetError(error, "[libpq] Could not escape identifier %.*s: %s",
-                         static_cast<int>(identifier.size()), identifier.data(),
-                         PQerrorMessage(conn));
-    return ADBC_STATUS_INVALID_ARGUMENT;
+    // Keep the message bounded and free of embedded NULs, whatever the caller passed.
+    constexpr size_t kMaxShown = 64;
+    std::string shown(identifier.substr(0, kMaxShown));
+    shown.resize(std::strlen(shown.c_str()));
+    InternalAdbcSetError(error, "[libpq] Could not escape identifier %s%s: %s",
+                         shown.c_str(), identifier.size() > kMaxShown ? "..." : "",
+                         conn ? PQerrorMessage(conn) : "no connection");
+    // Without a healthy connection the failure says nothing about the identifier.
+    return (conn != nullptr && PQstatus(conn) == CONNECTION_OK)
+               ? ADBC_STATUS_INVALID_ARGUMENT
+               : ADBC_STATUS_INTERNAL;
   }
   *out = escaped;
   PQfreemem(escaped);

@@ -97,7 +97,7 @@ TEST(PostgresErrorTest, EscapeIdentifierFailure) {
   // input that is invalid in the client encoding.
   struct AdbcError error = ADBC_ERROR_INIT;
   std::string escaped = "unchanged";
-  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+  EXPECT_EQ(ADBC_STATUS_INTERNAL,
             EscapeIdentifier(nullptr, "my_table", &escaped, &error));
   EXPECT_EQ("unchanged", escaped);
   ASSERT_NE(nullptr, error.message);
@@ -116,6 +116,15 @@ TEST(PostgresConnectionUnitTest, GetTableSchemaNullTableName) {
   EXPECT_NE(nullptr, std::strstr(error.message, "table_name must not be NULL"))
       << error.message;
   EXPECT_EQ(nullptr, schema.release);
+  if (error.release) error.release(&error);
+}
+
+TEST(PostgresConnectionUnitTest, SetCurrentSchemaNull) {
+  PostgresConnection connection;
+  struct AdbcError error = ADBC_ERROR_INIT;
+  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+            connection.SetOption(ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA, nullptr,
+                                 &error));
   if (error.release) error.release(&error);
 }
 
