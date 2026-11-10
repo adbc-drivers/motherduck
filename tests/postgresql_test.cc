@@ -3924,10 +3924,14 @@ TEST_F(PostgresStatementTest, EarlyCloseCommitsEarlierStatement) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
                 IsOkStatus(&error));
   }
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  const bool motherduck = uri != nullptr && std::strstr(uri, "motherduck.com") != nullptr;
   ASSERT_THAT(AdbcStatementSetSqlQuery(
                   &statement,
-                  "INSERT INTO test_stream_early_close VALUES (1); "
-                  "SELECT i FROM range(3000) t(i)",
+                  motherduck ? "INSERT INTO test_stream_early_close VALUES (1); "
+                               "SELECT i FROM range(3000) t(i)"
+                             : "INSERT INTO test_stream_early_close VALUES (1); "
+                               "SELECT g FROM generate_series(1, 3000) t(g)",
                   &error),
               IsOkStatus(&error));
   {
@@ -3952,6 +3956,34 @@ TEST_F(PostgresStatementTest, EarlyCloseCommitsEarlierStatement) {
   ASSERT_NO_FATAL_FAILURE(count.GetSchema());
   ASSERT_NO_FATAL_FAILURE(count.Next());
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(count.array_view->children[0], 0), 1);
+}
+
+TEST_F(PostgresStatementTest, EarlyCloseLeavesCallerTransactionOpen) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  const bool motherduck = uri != nullptr && std::strstr(uri, "motherduck.com") != nullptr;
+  ASSERT_THAT(AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_AUTOCOMMIT,
+                                      ADBC_OPTION_VALUE_DISABLED, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, motherduck ? "SELECT sleep_ms(2000)" : "SELECT pg_sleep(2)", &error),
+              IsOkStatus(&error));
+  {
+    adbc_validation::StreamReader unread;
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
+                IsOkStatus(&error));
+  }
+
+  ASSERT_EQ("intrans",
+            adbc_validation::ConnectionGetOption(&connection, "adbc.postgresql.transaction_status",
+                                                 &error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 1);
 }
 
 TEST_F(PostgresStatementTest, ScriptCopyFailsFast) {

@@ -173,7 +173,8 @@ void AbortCopy(PGconn* conn, ExecStatusType status) {
     PQputCopyEnd(conn, "COPY is not supported in a multi-statement query");
   }
   if (status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH) {
-    SendCancel(conn);
+    // A finished COPY is already buffered. Cancelling then can hit the next command.
+    if (PQconsumeInput(conn) == 1 && PQisBusy(conn) == 1) SendCancel(conn);
     char* buffer = nullptr;
     for (;;) {
       const int n = PQgetCopyData(conn, &buffer, /*async=*/0);

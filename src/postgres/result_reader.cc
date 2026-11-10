@@ -47,9 +47,13 @@ void PqResultArrayReader::Close() {
   }
   closed_ = true;
   const bool user_cancel = cancel_requested_.load(std::memory_order_acquire);
-  // Cancelling a script aborts its transaction. A caller who only stopped
-  // reading should let the server finish, then commit.
-  const bool failed = helper_.Finish(user_cancel || !own_txn_);
+  // Cancel only a statement that has no transaction to preserve. Cancelling
+  // inside the caller's transaction aborts it. An owned script is drained
+  // instead: the MotherDuck endpoint rejects SAVEPOINT, so there is no way to
+  // cancel the last statement and still commit the earlier ones. Closing
+  // INSERT ...; SELECT <huge> therefore reads the rest of that SELECT.
+  const bool cancel_if_blocked = user_cancel || (autocommit_ && !own_txn_);
+  const bool failed = helper_.Finish(cancel_if_blocked);
   EndOwnedTransaction(!(failed || user_cancel));
 }
 
