@@ -35,6 +35,7 @@
 
 #include "adbc_driver_motherduck_config.h"
 #include "driver/common/utils.h"
+#include "motherduck_ascii.h"
 #include "motherduck_trust_store.h"
 #include "motherduck_type_resolver.h"
 
@@ -70,19 +71,10 @@ std::string GetEnv(const char* name) {
 #endif
 }
 
-// ASCII lowercase, unlike std::tolower, which follows the C locale.
-std::string ToLower(std::string_view value) {
-  std::string lower(value);
-  for (char& c : lower) {
-    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-  }
-  return lower;
-}
-
 // A host for comparison: lowercase, without a trailing dot.
 std::string NormalizeHost(std::string_view host) {
   if (!host.empty() && host.back() == '.') host.remove_suffix(1);
-  return ToLower(host);
+  return AsciiLower(host);
 }
 
 // Whether options ends in a backslash that escapes nothing, which would escape
@@ -263,7 +255,7 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     session_name_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     // The region becomes part of a hostname. An empty value unsets it.
-    std::string region = ToLower(value);
+    std::string region = AsciiLower(value);
     if (!region.empty() && RegionHost(region).empty()) {
       InternalAdbcSetError(error,
                            "[libpq] Invalid value for option %s=%s: expected a region "

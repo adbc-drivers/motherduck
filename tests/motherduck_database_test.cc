@@ -712,6 +712,27 @@ TEST(MotherDuckNullOptionTest, StatementRejectsNullValue) {
               IsOkStatus(&error));
 }
 
+// The Postgres endpoint can't create temporary tables, so enabling temporary
+// ingestion fails up front rather than at CREATE TEMP TABLE.
+TEST(MotherDuckIngestOptionTest, TemporaryNotSupported) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  adbc_validation::Handle<struct AdbcStatement> statement;
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(AdbcStatementSetOption(&statement.value, ADBC_INGEST_OPTION_TEMPORARY,
+                                     ADBC_OPTION_VALUE_ENABLED, &error),
+              IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
+  EXPECT_THAT(error.message ? error.message : "",
+              ::testing::HasSubstr("temporary table"));
+  if (error.release) error.release(&error);
+  // Disabling it, as clients such as Python always do, still works.
+  EXPECT_THAT(AdbcStatementSetOption(&statement.value, ADBC_INGEST_OPTION_TEMPORARY,
+                                     ADBC_OPTION_VALUE_DISABLED, &error),
+              IsOkStatus(&error));
+}
+
 // The PostgreSQL driver's type resolver mode (and the server type table it
 // selects) must not show through the MotherDuck driver.
 TEST(MotherDuckPostgresOptionsTest, TypeResolverModeNotReported) {

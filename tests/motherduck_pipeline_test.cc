@@ -83,6 +83,61 @@ TEST(SplitStatementsTest, Unterminated) {
               ElementsAre("SELECT 1", "SELECT /* a; b"));
 }
 
+TEST(CastParametersTest, Casts) {
+  EXPECT_EQ(CastParameters("SELECT $1", {"int4"}), "SELECT CAST($1 AS int4)");
+  EXPECT_EQ(CastParameters("SELECT 1 + $2, $1, $2", {"text", "int8"}),
+            "SELECT 1 + CAST($2 AS int8), CAST($1 AS text), CAST($2 AS int8)");
+  EXPECT_EQ(CastParameters("SELECT $1::int4", {"text ARRAY"}),
+            "SELECT CAST($1 AS text ARRAY)::int4");
+  EXPECT_EQ(CastParameters("SELECT $10", std::vector<std::string>(10, "bool")),
+            "SELECT CAST($10 AS bool)");
+}
+
+TEST(CastParametersTest, LeavesUntyped) {
+  // No type, or a parameter past the bound ones.
+  EXPECT_EQ(CastParameters("SELECT $1, $2, $3", {"", "int4"}),
+            "SELECT $1, CAST($2 AS int4), $3");
+  EXPECT_EQ(CastParameters("SELECT $0, $99999999999999999999999", {"int4"}),
+            "SELECT $0, $99999999999999999999999");
+  // 2^64 + 3, which wraps to 3 if the parse overflows.
+  EXPECT_EQ(CastParameters("SELECT $18446744073709551619", {"int4", "int4", "int4"}),
+            "SELECT $18446744073709551619");
+  EXPECT_EQ(CastParameters("SELECT 1", {"int4"}), "SELECT 1");
+}
+
+TEST(CastParametersTest, SkipsNonParameters) {
+  EXPECT_EQ(CastParameters(R"(SELECT '$1', "$1", E'\'$1', $1)", {"int4"}),
+            R"(SELECT '$1', "$1", E'\'$1', CAST($1 AS int4))");
+  EXPECT_EQ(CastParameters("SELECT $$ $1 $$, $q$ $1 $q$, a$1, $1", {"int4"}),
+            "SELECT $$ $1 $$, $q$ $1 $q$, a$1, CAST($1 AS int4)");
+  EXPECT_EQ(CastParameters("SELECT $1 -- $1\n/* $1 /* $1 */ */", {"int4"}),
+            "SELECT CAST($1 AS int4) -- $1\n/* $1 /* $1 */ */");
+  EXPECT_EQ(CastParameters(R"(SELECT 'a\', $1)", {"int4"}),
+            R"(SELECT 'a\', CAST($1 AS int4))");
+  EXPECT_EQ(CastParameters(R"(SELECT 'a\', $1)", {"int4"}, /*backslash_escapes=*/true),
+            R"(SELECT 'a\', $1)");
+}
+
+TEST(UncastParametersTest, Uncasts) {
+  const std::vector<std::string> types = {"int4", "", "numeric(10, 5)"};
+  EXPECT_EQ(UncastParameters("CAST($1 AS INTEGER)", types), "$1");
+  EXPECT_EQ(UncastParameters("(CAST($1 AS INTEGER) + 1)", types), "($1 + 1)");
+  EXPECT_EQ(UncastParameters("CAST($3 AS DECIMAL(10,5))", types), "$3");
+  EXPECT_EQ(
+      UncastParameters("f(CAST($1 AS INTEGER[]), CAST($3 AS DECIMAL(10,5)))", types),
+      "f($1, $3)");
+}
+
+TEST(UncastParametersTest, LeavesOthers) {
+  const std::vector<std::string> types = {"int4", ""};
+  // Parameters that weren't cast, or past the bound ones
+  EXPECT_EQ(UncastParameters("CAST($2 AS INTEGER)", types), "CAST($2 AS INTEGER)");
+  EXPECT_EQ(UncastParameters("CAST($3 AS INTEGER)", types), "CAST($3 AS INTEGER)");
+  EXPECT_EQ(UncastParameters("CAST(x AS INTEGER)", types), "CAST(x AS INTEGER)");
+  EXPECT_EQ(UncastParameters("CAST($1 AS INTEGER", types), "CAST($1 AS INTEGER");
+  EXPECT_EQ(UncastParameters("v", types), "v");
+}
+
 TEST(IsCopyStatementTest, Copy) {
   EXPECT_TRUE(IsCopyStatement("COPY t FROM STDIN"));
   EXPECT_TRUE(IsCopyStatement("copy (SELECT 1) TO STDOUT"));

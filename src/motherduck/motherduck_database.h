@@ -72,6 +72,7 @@ class MotherduckDatabase : public PostgresDatabase {
     find_ca_bundle_ = std::move(finder);
   }
 
+  std::string_view InfoVendorName() override { return "MotherDuck"; }
   std::string_view DriverName() override { return "ADBC MotherDuck Driver"; }
   std::string_view DriverVersion() override;
 
