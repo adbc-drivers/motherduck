@@ -142,13 +142,10 @@ AdbcStatusCode MotherduckConnection::GetTableSchema(const char* catalog,
     PQfreemem(quoted);
   }
 
-  // Describing a query resolves the name as any query does: ignoring case and
-  // through the search path. A missing table fails with 42P01 (NOT_FOUND).
-  PqResultHelper helper(conn(), "SELECT * FROM " + name);
-  RAISE_STATUS(error, helper.Prepare());
-  RAISE_STATUS(error, helper.DescribePrepared());
+  // The name resolves as in any query: ignoring case and through the search
+  // path. A missing table fails with 42P01 (NOT_FOUND).
   PostgresType output_type;
-  RAISE_STATUS(error, helper.ResolveOutputTypes(*type_resolver(), &output_type));
+  RAISE_STATUS(error, DescribeTable(name, &output_type));
 
   nanoarrow::UniqueSchema result;
   ArrowSchemaInit(result.get());

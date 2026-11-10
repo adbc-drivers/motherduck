@@ -34,6 +34,7 @@
 
 #include "driver/framework/status.h"
 #include "error.h"
+#include "motherduck_ascii.h"
 
 using adbc::driver::Status;
 
@@ -625,7 +626,7 @@ bool IsCopyStatement(std::string_view statement) {
   constexpr std::string_view kCopy = "copy";
   if (statement.size() - i < kCopy.size()) return false;
   for (size_t j = 0; j < kCopy.size(); j++) {
-    if (std::tolower(static_cast<unsigned char>(statement[i + j])) != kCopy[j]) {
+    if (AsciiLower(statement[i + j]) != kCopy[j]) {
       return false;
     }
   }
