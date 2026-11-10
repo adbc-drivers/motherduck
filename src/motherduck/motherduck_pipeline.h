@@ -43,6 +43,22 @@ std::vector<std::string> SplitStatements(std::string_view query,
 // Whether a statement is a COPY, ignoring leading whitespace and comments.
 bool IsCopyStatement(std::string_view statement);
 
+// Rewrite each parameter $n outside quotes and comments to
+// CAST($n AS <types[n - 1]>), leaving it as is if that type is empty or
+// missing. backslash_escapes is as for SplitStatements.
+std::string CastParameters(std::string_view query, const std::vector<std::string>& types,
+                           bool backslash_escapes = false);
+
+// Undo CastParameters in a result column name the server derived from the
+// cast query: each CAST($n AS ...) for a parameter types gives a type to
+// becomes $n again.
+std::string UncastParameters(std::string_view name,
+                             const std::vector<std::string>& types);
+
+// Whether every string literal on this connection takes backslash escapes
+// (standard_conforming_strings is off).
+bool BackslashEscapes(PGconn* conn);
+
 // Whether a statement that isn't a COPY succeeded. MotherDuck answers DDL with
 // an empty result set (a Count or Success column) instead of a command tag, so
 // PGRES_TUPLES_OK counts as success alongside PGRES_COMMAND_OK.

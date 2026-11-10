@@ -702,9 +702,10 @@ AdbcStatusCode PostgresStatement::ExecuteSchema(struct ArrowSchema* schema,
       param_oids[i] = pg_type.oid();
     }
 
-    RAISE_STATUS(error, helper.Prepare(param_oids));
+    RAISE_STATUS(
+        error, PrepareQuery(connection_->conn(), query_, param_oids, param_schema.get()));
   } else {
-    RAISE_STATUS(error, helper.Prepare());
+    RAISE_STATUS(error, PrepareQuery(connection_->conn(), query_, {}, nullptr));
   }
 
   RAISE_STATUS(error, helper.DescribePrepared());
@@ -717,6 +718,12 @@ AdbcStatusCode PostgresStatement::ExecuteSchema(struct ArrowSchema* schema,
   CHECK_NA(INTERNAL,
            output_type.SetSchema(tmp.get(), std::string(connection_->VendorName())),
            error);
+  for (int64_t i = 0; i < tmp->n_children; i++) {
+    CHECK_NA(INTERNAL,
+             ArrowSchemaSetName(tmp->children[i],
+                                ResultColumnName(tmp->children[i]->name).c_str()),
+             error);
+  }
 
   tmp.move(schema);
   return ADBC_STATUS_OK;
@@ -867,8 +874,22 @@ AdbcStatusCode PostgresStatement::GetParameterSchema(struct ArrowSchema* schema,
     return ADBC_STATUS_INVALID_STATE;
   }
 
+  nanoarrow::UniqueSchema bind_schema;
+  if (bind_.release) {
+    struct ArrowError na_error;
+    ArrowErrorInit(&na_error);
+    CHECK_NA_DETAIL(INTERNAL,
+                    ArrowArrayStreamGetSchema(&bind_, bind_schema.get(), &na_error),
+                    &na_error, error);
+    if (std::string(bind_schema->format) != "+s") {
+      InternalAdbcSetError(error, "%s", "[libpq] Bind parameters must have type STRUCT");
+      return ADBC_STATUS_INVALID_STATE;
+    }
+  }
+
   PqResultHelper helper(connection_->conn(), query_);
-  RAISE_STATUS(error, helper.Prepare());
+  RAISE_STATUS(error, PrepareQuery(connection_->conn(), query_, {},
+                                   bind_schema->release ? bind_schema.get() : nullptr));
   RAISE_STATUS(error, helper.DescribePrepared());
   PostgresType param_types;
   RAISE_STATUS(error,
@@ -879,6 +900,12 @@ AdbcStatusCode PostgresStatement::GetParameterSchema(struct ArrowSchema* schema,
   RAISE_NA(param_types.SetSchema(schema, std::string(connection_->VendorName())));
 
   return ADBC_STATUS_OK;
+}
+
+Status PostgresStatement::PrepareQuery(PGconn* conn, const std::string& query,
+                                       const std::vector<Oid>& param_oids,
+                                       const struct ArrowSchema* /*bind_schema*/) {
+  return PqResultHelper(conn, query).Prepare(param_oids);
 }
 
 AdbcStatusCode PostgresStatement::Prepare(struct AdbcError* error) {

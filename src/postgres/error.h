@@ -73,6 +73,12 @@ AdbcStatusCode ClassifySqlState(const char* sqlstate);
 AdbcStatusCode EscapeIdentifier(PGconn* conn, std::string_view identifier,
                                 std::string* out, struct AdbcError* error);
 
+/// \brief The status for a server error, from its SQLSTATE and primary message.
+///
+/// Defined by the driver built on this one (motherduck/motherduck_error.cc), so
+/// it can classify errors its server reports with a generic SQLSTATE.
+AdbcStatusCode ClassifyServerError(const char* sqlstate, const char* primary_message);
+
 template <typename... Args>
 Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
   auto message = ::fmt::vformat(format_string, ::fmt::make_format_args(args...));
@@ -87,7 +93,8 @@ Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
 
   const char* sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
   if (sqlstate) {
-    code = ClassifySqlState(sqlstate);
+    code = ClassifyServerError(sqlstate,
+                               PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY));
   }
 
   Status status(code, message);
