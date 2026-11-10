@@ -594,11 +594,13 @@ AdbcStatusCode PostgresStatement::ResolveCopyTargetTypes(
 AdbcStatusCode PostgresStatement::ExecuteBind(struct ArrowArrayStream* stream,
                                               int64_t* rows_affected,
                                               struct AdbcError* error) {
-  result_reader_ = MakeResultReader(connection_->conn(), type_resolver_, query_);
-  result_reader_->SetAutocommit(connection_->autocommit());
-  result_reader_->SetBind(&bind_);
-  result_reader_->SetVendorName(connection_->VendorName());
-  RAISE_STATUS(error, result_reader_->ToArrayStream(rows_affected, stream));
+  auto reader = std::shared_ptr<PqResultArrayReader>(
+      MakeResultReader(connection_->conn(), type_resolver_, query_).release());
+  reader->SetConnection(connection_);
+  reader->SetAutocommit(connection_->autocommit());
+  reader->SetBind(&bind_);
+  reader->SetVendorName(connection_->VendorName());
+  RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
   return ADBC_STATUS_OK;
 }
 
@@ -627,10 +629,14 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
   // If we have been requested to avoid COPY or there is no output requested,
   // execute using the PqResultArrayReader.
   if (!stream || !use_copy()) {
-    result_reader_ = MakeResultReader(connection_->conn(), type_resolver_, query_);
-    result_reader_->SetVendorName(connection_->VendorName());
-    result_reader_->SetBatchSizeHint(batch_size_hint_bytes_);
-    RAISE_STATUS(error, result_reader_->ToArrayStream(rows_affected, stream));
+    auto reader = std::shared_ptr<PqResultArrayReader>(
+        MakeResultReader(connection_->conn(), type_resolver_, query_).release());
+    reader->SetConnection(connection_);
+    reader->SetAutocommit(connection_->autocommit());
+    reader->SetVendorName(connection_->VendorName());
+    reader->SetBatchSizeHint(batch_size_hint_bytes_);
+    RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
+    if (stream != nullptr && reader->streaming_rows()) active_stream_ = reader;
     return ADBC_STATUS_OK;
   }
 
@@ -647,10 +653,14 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
   // If there will be no columns in the result, we can also avoid COPY
   if (root_type.n_children() == 0) {
     // Could/should move the helper into the reader instead of repreparing
-    result_reader_ = MakeResultReader(connection_->conn(), type_resolver_, query_);
-    result_reader_->SetVendorName(connection_->VendorName());
-    result_reader_->SetBatchSizeHint(batch_size_hint_bytes_);
-    RAISE_STATUS(error, result_reader_->ToArrayStream(rows_affected, stream));
+    auto reader = std::shared_ptr<PqResultArrayReader>(
+        MakeResultReader(connection_->conn(), type_resolver_, query_).release());
+    reader->SetConnection(connection_);
+    reader->SetAutocommit(connection_->autocommit());
+    reader->SetVendorName(connection_->VendorName());
+    reader->SetBatchSizeHint(batch_size_hint_bytes_);
+    RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
+    if (stream != nullptr && reader->streaming_rows()) active_stream_ = reader;
     return ADBC_STATUS_OK;
   }
 
@@ -929,7 +939,13 @@ AdbcStatusCode PostgresStatement::Prepare(struct AdbcError* error) {
 }
 
 AdbcStatusCode PostgresStatement::Release(struct AdbcError* error) {
-  ClearResult();
+  // The stream owns its reader and the connection. Dropping the statement
+  // must not finish that read.
+  active_stream_.reset();
+  if (reader_) {
+    reader_->Release();
+    reader_.reset();
+  }
   if (bind_.release) {
     bind_.release(&bind_);
   }
@@ -1059,8 +1075,8 @@ AdbcStatusCode PostgresStatement::SetOptionInt(const char* key, int64_t value,
 
 void PostgresStatement::ClearResult() {
   // TODO: we may want to synchronize here for safety
-  // Drop the open reader first so its destructor finishes the previous query.
-  result_reader_.reset();
+  if (auto active = active_stream_.lock()) active->ReleaseConnection();
+  active_stream_.reset();
   if (reader_) reader_->Release();
   reader_ = std::make_shared<TupleReader>(connection_->conn());
   reader_->batch_size_hint_bytes_ = batch_size_hint_bytes_;

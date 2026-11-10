@@ -38,6 +38,12 @@
 
 namespace adbcpq {
 
+PqResultArrayReader::~PqResultArrayReader() {
+  if (helper_.streaming()) helper_.Finish();
+  EndOwnedTransaction(true);
+  ResetErrors();
+}
+
 int PqResultArrayReader::GetSchema(struct ArrowSchema* out) {
   ResetErrors();
 
@@ -53,6 +59,15 @@ int PqResultArrayReader::GetSchema(struct ArrowSchema* out) {
 }
 
 int PqResultArrayReader::GetNext(struct ArrowArray* out) {
+  if (closed_) {
+    if (error_.message == nullptr) {
+      status_ = ADBC_STATUS_INVALID_STATE;
+      InternalAdbcSetError(&error_, "%s",
+                           "[libpq] Reader invalidated (statement or reader was closed)");
+    }
+    return EINVAL;
+  }
+
   ResetErrors();
   status_ = ADBC_STATUS_OK;
 
@@ -184,18 +199,22 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
     }
   } else {
     UNWRAP_STATUS(OpenRowStream());
-    UNWRAP_STATUS(helper_.NextPacket());
-    if (!helper_.HasResult()) {
-      return Status::IO("[libpq] Query returned no result");
-    }
-    streaming_rows_ = true;
-    if (rows_affected != nullptr) {
-      if (helper_.streaming()) {
-        *rows_affected = -1;
-        rows_affected_out_ = rows_affected;
-      } else {
-        *rows_affected = helper_.AffectedRows();
+    if (helper_.streaming()) {
+      Status status = helper_.NextPacket();
+      if (!status.ok()) {
+        // MotherDuck keeps the transaction open after a catalog error, so
+        // this has to roll back. The destructor would otherwise commit it.
+        EndOwnedTransaction(false);
+        return status;
       }
+      if (!helper_.HasResult()) {
+        EndOwnedTransaction(false);
+        return Status::IO("[libpq] Query returned no result");
+      }
+      streaming_rows_ = true;
+      if (rows_affected != nullptr) *rows_affected = -1;
+    } else if (rows_affected != nullptr) {
+      *rows_affected = helper_.AffectedRows();
     }
   }
 
@@ -230,45 +249,21 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
 namespace {
 
 struct ResultStream {
-  static constexpr uint64_t kMagic = 0x5047525354524541ull;
-  uint64_t magic = kMagic;
-  std::weak_ptr<PqResultArrayReader> reader;
-  struct AdbcError error = ADBC_ERROR_INIT;
-  AdbcStatusCode status = ADBC_STATUS_OK;
+  std::shared_ptr<PqResultArrayReader> reader;
 
-  explicit ResultStream(std::weak_ptr<PqResultArrayReader> reader)
+  explicit ResultStream(std::shared_ptr<PqResultArrayReader> reader)
       : reader(std::move(reader)) {}
 
-  ~ResultStream() {
-    if (error.release != nullptr) error.release(&error);
-  }
-
-  int Invalid() {
-    status = ADBC_STATUS_INVALID_STATE;
-    InternalAdbcSetError(&error, "%s",
-                         "[libpq] Reader invalidated (statement or reader was closed)");
-    return EINVAL;
-  }
-
-  int GetSchema(struct ArrowSchema* out) {
-    auto locked = reader.lock();
-    if (!locked) return Invalid();
-    return locked->GetSchema(out);
-  }
-
-  int GetNext(struct ArrowArray* out) {
-    auto locked = reader.lock();
-    if (!locked) return Invalid();
-    return locked->GetNext(out);
-  }
-
-  const char* GetLastError() {
-    if (error.message != nullptr) return error.message;
-    auto locked = reader.lock();
-    if (!locked) return "[libpq] Reader invalidated (statement or reader was closed)";
-    return locked->GetLastError();
-  }
+  int GetSchema(struct ArrowSchema* out) { return reader->GetSchema(out); }
+  int GetNext(struct ArrowArray* out) { return reader->GetNext(out); }
+  const char* GetLastError() { return reader->GetLastError(); }
 };
+
+void ReleaseResultStream(struct ArrowArrayStream* stream) {
+  delete static_cast<ResultStream*>(stream->private_data);
+  stream->private_data = nullptr;
+  stream->release = nullptr;
+}
 
 int64_t RowBytes(PqResultRow row, int columns) {
   int64_t bytes = 1;
@@ -325,30 +320,81 @@ Status PqResultArrayReader::ToArrayStream(int64_t* affected_rows,
   UNWRAP_STATUS(Initialize(affected_rows));
 
   nanoarrow::ArrayStreamFactory<ResultStream>::InitArrayStream(
-      new ResultStream(weak_from_this()), out);
+      new ResultStream(shared_from_this()), out);
+  // Replace the factory release so this stream can be recognized without
+  // reading another stream's private data.
+  out->release = &ReleaseResultStream;
 
   return Status::Ok();
 }
 
-Status PqResultArrayReader::OpenRowStream() {
-  // PQsendQueryParams rejects more than one statement. Run the earlier ones
-  // the way PQexec would, and stream only the last.
-  const std::vector<std::string> statements =
-      SplitStatements(helper_.query(), BackslashEscapes(conn_));
-  if (statements.size() > 1) {
-    for (size_t i = 0; i + 1 < statements.size(); i++) {
-      PGresult* result = PQexec(conn_, statements[i].c_str());
-      if (result == nullptr || !IsResultOk(result)) {
-        Status status = MakeStatus(result, "[libpq] Failed to execute query '{}': {}",
-                                   statements[i].c_str(), PQerrorMessage(conn_));
-        PQclear(result);
-        return status;
-      }
-      PQclear(result);
-    }
-    helper_.set_query(statements.back());
+Status PqResultArrayReader::EndOwnedTransaction(bool commit) {
+  if (!own_txn_) return Status::Ok();
+  own_txn_ = false;
+  // A failed statement aborts the transaction. COMMIT would be rejected.
+  if (commit && PQtransactionStatus(conn_) == PQTRANS_INERROR) commit = false;
+  const char* sql = commit ? "COMMIT" : "ROLLBACK";
+  PGresult* result = PQexec(conn_, sql);
+  if (result == nullptr || !IsResultOk(result)) {
+    Status status = MakeStatus(result, "[libpq] Failed to execute query '{}': {}", sql,
+                               PQerrorMessage(conn_));
+    PQclear(result);
+    return status;
   }
-  return helper_.BeginRowStream();
+  PQclear(result);
+  return Status::Ok();
+}
+
+Status PqResultArrayReader::OpenRowStream() {
+  std::vector<std::string> statements =
+      SplitStatements(helper_.query(), BackslashEscapes(conn_));
+  if (statements.size() <= 1) return helper_.BeginRowStream();
+
+  // The result readers decode binary values, and only the extended protocol
+  // can ask for those. It also accepts one statement. An explicit transaction
+  // keeps the earlier statements from committing when a later one fails.
+  if (autocommit_) {
+    PGresult* begin = PQexec(conn_, "BEGIN");
+    if (begin == nullptr || !IsResultOk(begin)) {
+      Status status = MakeStatus(begin, "[libpq] Failed to execute query '{}': {}",
+                                 "BEGIN", PQerrorMessage(conn_));
+      PQclear(begin);
+      return status;
+    }
+    PQclear(begin);
+    own_txn_ = true;
+  }
+
+  for (size_t i = 0; i + 1 < statements.size(); i++) {
+    PGresult* result = PQexec(conn_, statements[i].c_str());
+    if (result == nullptr || !IsResultOk(result)) {
+      Status status = MakeStatus(result, "[libpq] Failed to execute query '{}': {}",
+                                 statements[i].c_str(), PQerrorMessage(conn_));
+      PQclear(result);
+      EndOwnedTransaction(false);
+      return status;
+    }
+    PQclear(result);
+  }
+
+  helper_.set_query(std::move(statements.back()));
+  Status status = helper_.BeginRowStream();
+  if (!status.ok()) EndOwnedTransaction(false);
+  return status;
+}
+
+void PqResultArrayReader::ReleaseConnection() {
+  if (closed_) return;
+  if (helper_.streaming()) {
+    closed_ = true;
+    helper_.Finish();
+    status_ = ADBC_STATUS_INVALID_STATE;
+    InternalAdbcSetError(&error_, "%s",
+                         "[libpq] Reader invalidated (statement or reader was closed)");
+  }
+  // A finished result can stay readable. The transaction still has to end or
+  // the next command runs inside it.
+  EndOwnedTransaction(true);
 }
 
 Status PqResultArrayReader::BindNextAndExecute(int64_t* affected_rows) {
@@ -424,13 +470,6 @@ int PqResultArrayReader::FailArrow(int code) {
   return code;
 }
 
-void PqResultArrayReader::PublishRowCount() {
-  if (rows_affected_out_ == nullptr || helper_.streaming()) return;
-  const int64_t tagged = helper_.HasResult() ? helper_.AffectedRows() : -1;
-  *rows_affected_out_ = tagged >= 0 ? tagged : streamed_rows_;
-  rows_affected_out_ = nullptr;
-}
-
 int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
   nanoarrow::UniqueArray tmp;
   bool started = false;
@@ -440,16 +479,15 @@ int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
   // is what still knows how many columns the batch has.
   const int columns = static_cast<int>(schema_->n_children);
 
-  bool finished = false;
   while (true) {
     if (!helper_.HasResult() || next_row_ >= helper_.NumRows()) {
       Status status = helper_.NextPacket();
       next_row_ = 0;
-      if (!status.ok()) return Fail(status);
-      if (!helper_.HasResult() || helper_.NumRows() == 0) {
-        finished = true;
-        break;
+      if (!status.ok()) {
+        EndOwnedTransaction(false);
+        return Fail(status);
       }
+      if (!helper_.HasResult() || helper_.NumRows() == 0) break;
     }
 
     if (!started) {
@@ -481,11 +519,12 @@ int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
     bytes += RowBytes(row, columns);
     next_row_++;
     nrows++;
-    streamed_rows_++;
     if (bytes >= batch_size_hint_bytes_) break;
   }
 
-  if (finished) PublishRowCount();
+  if (!helper_.streaming()) {
+    if (Status end = EndOwnedTransaction(true); !end.ok()) return Fail(end);
+  }
 
   if (nrows == 0) {
     out->release = nullptr;
@@ -509,17 +548,13 @@ int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
 
 const struct AdbcError* PqResultArrayReader::ErrorFromArrayStream(
     struct ArrowArrayStream* stream, AdbcStatusCode* status) {
-  if (stream == nullptr || stream->private_data == nullptr || stream->release == nullptr) {
+  if (stream == nullptr || stream->private_data == nullptr ||
+      stream->release != &ReleaseResultStream) {
     return nullptr;
   }
   auto* holder = static_cast<ResultStream*>(stream->private_data);
-  if (holder->magic != ResultStream::kMagic) return nullptr;
-  if (auto locked = holder->reader.lock()) {
-    if (status != nullptr) *status = locked->status_;
-    if (locked->error_.message != nullptr) return &locked->error_;
-  }
-  if (status != nullptr) *status = holder->status;
-  return holder->error.message != nullptr ? &holder->error : nullptr;
+  if (status != nullptr) *status = holder->reader->status_;
+  return holder->reader->error_.message != nullptr ? &holder->reader->error_ : nullptr;
 }
 
 }  // namespace adbcpq

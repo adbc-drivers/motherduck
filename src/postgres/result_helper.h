@@ -154,6 +154,8 @@ class PqResultHelper {
   // Replace result_ with the next chunk. A finished query leaves no result.
   Status NextPacket();
   bool streaming() const { return streaming_; }
+  // Read and discard whatever is left of an open query. Does not cancel.
+  void Finish() { if (streaming_) AbandonStream(); }
   Status ExecuteCopy();
   Status ResolveParamTypes(PostgresTypeResolver& type_resolver,
                            PostgresType* param_types);

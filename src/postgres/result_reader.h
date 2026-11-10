@@ -34,6 +34,7 @@
 #include <libpq-fe.h>
 
 #include "bind_stream.h"
+#include "connection.h"
 #include "copy/reader.h"
 #include "result_helper.h"
 
@@ -51,7 +52,7 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
     error_ = ADBC_ERROR_INIT;
   }
 
-  virtual ~PqResultArrayReader() { ResetErrors(); }
+  virtual ~PqResultArrayReader();
 
   // Ensure the reader knows what the autocommit status was on creation. This is used
   // so that the temporary timezone setting required for parameter binding can be wrapped
@@ -69,6 +70,13 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   void SetBatchSizeHint(int64_t batch_size_hint_bytes) {
     batch_size_hint_bytes_ = batch_size_hint_bytes;
   }
+  bool streaming_rows() const { return streaming_rows_; }
+  // End an in-flight query so the connection can run another one. A finished
+  // result is left alone.
+  void ReleaseConnection();
+  void SetConnection(std::shared_ptr<PostgresConnection> connection) {
+    connection_ = std::move(connection);
+  }
 
   int GetSchema(struct ArrowSchema* out);
   int GetNext(struct ArrowArray* out);
@@ -81,6 +89,7 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   Status Initialize(int64_t* affected_rows);
 
  protected:
+  std::shared_ptr<PostgresConnection> connection_;
   PGconn* conn_;
   PqResultHelper helper_;
   std::unique_ptr<BindStream> bind_stream_;
@@ -92,14 +101,17 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   int64_t batch_size_hint_bytes_ = 16777216;
   int next_row_ = 0;
   bool streaming_rows_ = false;
-  int64_t streamed_rows_ = 0;
-  int64_t* rows_affected_out_ = nullptr;
+  bool closed_ = false;
+  // Set when this reader issued BEGIN so a multi-statement query stays one
+  // transaction. Cleared once that transaction is committed or rolled back.
+  bool own_txn_ = false;
   AdbcStatusCode status_ = ADBC_STATUS_OK;
   struct AdbcError error_;
   struct ArrowError na_error_;
 
   explicit PqResultArrayReader(PqResultArrayReader* other)
-      : conn_(other->conn_),
+      : connection_(std::move(other->connection_)),
+        conn_(other->conn_),
         helper_(std::move(other->helper_)),
         bind_stream_(std::move(other->bind_stream_)),
         type_resolver_(std::move(other->type_resolver_)),
@@ -108,21 +120,23 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
         batch_size_hint_bytes_(other->batch_size_hint_bytes_),
         next_row_(other->next_row_),
         streaming_rows_(other->streaming_rows_),
-        streamed_rows_(other->streamed_rows_),
-        rows_affected_out_(other->rows_affected_out_),
+        closed_(other->closed_),
+        own_txn_(other->own_txn_),
         status_(other->status_) {
+    other->own_txn_ = false;
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
   }
 
   Status BindNextAndExecute(int64_t* affected_rows);
   virtual Status ExecuteAll(int64_t* affected_rows);
-  // Run every statement but the last, then start streaming the last one.
   Status OpenRowStream();
+  // End the transaction this reader opened. commit is ignored when the server
+  // has already aborted it. Does nothing when this reader did not begin one.
+  Status EndOwnedTransaction(bool commit);
   int GetNextStream(struct ArrowArray* out);
   int Fail(const Status& status);
   int FailArrow(int code);
-  void PublishRowCount();
 
   // Prepare the query with the bind stream's parameter types
   virtual Status PrepareWithParamTypes();

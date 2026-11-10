@@ -43,13 +43,9 @@ PqResultHelper::~PqResultHelper() {
 }
 
 void PqResultHelper::AbandonStream() {
+  // Drain only. A cancel request is asynchronous and can arrive after this
+  // query has finished, which would abort the next query on the connection.
   streaming_ = false;
-  char errbuf[256];
-  PGcancel* cancel = PQgetCancel(conn_);
-  if (cancel != nullptr) {
-    (void)PQcancel(cancel, errbuf, sizeof(errbuf));
-    PQfreeCancel(cancel);
-  }
   PGresult* result;
   while ((result = PQgetResult(conn_)) != nullptr) {
     PQclear(result);
@@ -80,10 +76,12 @@ Status PqResultHelper::BeginRowStream() {
                       PQerrorMessage(conn_));
   }
 
-  // One row per packet, so the Arrow batch can stop on the byte hint exactly.
+  // One row is not a batch. Ask libpq for up to this many rows per packet;
+  // the Arrow batch still stops on the byte hint.
+  constexpr int kStreamChunkRows = 1024;
   int armed;
 #ifdef LIBPQ_HAS_CHUNK_MODE
-  armed = PQsetChunkedRowsMode(conn_, 1);
+  armed = PQsetChunkedRowsMode(conn_, kStreamChunkRows);
 #else
   armed = PQsetSingleRowMode(conn_);
 #endif

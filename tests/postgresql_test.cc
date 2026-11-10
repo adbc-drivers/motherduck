@@ -3616,7 +3616,9 @@ TEST_F(PostgresStatementTest, ResultStreamBatchSizeHint) {
   ASSERT_EQ(reader.rows_affected, -1);
   ASSERT_NO_FATAL_FAILURE(reader.Next());
   ASSERT_EQ(reader.array->release, nullptr);
-  ASSERT_EQ(reader.rows_affected, 3);
+  // The count is not written after ExecuteQuery returns. A streaming SELECT
+  // stays unknown rather than storing the caller's pointer.
+  ASSERT_EQ(reader.rows_affected, -1);
 }
 
 TEST_F(PostgresStatementTest, Cancel) {
@@ -3668,7 +3670,7 @@ TEST_F(PostgresStatementTest, MultipleStatementsSingleQuery) {
   ASSERT_THAT(reader.MaybeNext(), adbc_validation::IsOkErrno());
   ASSERT_EQ(reader.array->length, 3);
   ASSERT_NO_FATAL_FAILURE(reader.Next());
-  ASSERT_EQ(reader.rows_affected, 3);
+  ASSERT_EQ(reader.rows_affected, -1);
 }
 
 TEST_F(PostgresStatementTest, MultipleStatementsResultStream) {
@@ -3686,7 +3688,7 @@ TEST_F(PostgresStatementTest, MultipleStatementsResultStream) {
   ASSERT_EQ(reader.array->length, 1);
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 2);
   ASSERT_NO_FATAL_FAILURE(reader.Next());
-  ASSERT_EQ(reader.rows_affected, 1);
+  ASSERT_EQ(reader.rows_affected, -1);
 }
 
 TEST_F(PostgresStatementTest, MultipleStatementsResultStreamError) {
@@ -3780,12 +3782,18 @@ TEST_F(PostgresStatementTest, ResultStreamOutlivesStatement) {
   ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
   ASSERT_NO_FATAL_FAILURE(reader.Next());
 
-  // Releasing the statement destroys the reader while the connection is still
-  // alive. The stream must not touch that connection afterwards.
+  // Releasing the statement must not free the connection out from under the
+  // stream. The reader keeps the connection alive and the remaining rows
+  // can still be read.
   ASSERT_THAT(AdbcStatementRelease(&statement, &error), IsOkStatus(&error));
-  ASSERT_EQ(EINVAL, reader.MaybeNext());
-  ASSERT_THAT(reader.stream->get_last_error(&reader.stream.value),
-              ::testing::HasSubstr("Reader invalidated"));
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->length, 1);
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 2);
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->length, 1);
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 3);
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->release, nullptr);
 }
 
 TEST_F(PostgresStatementTest, ResultStreamReleasedBeforeNextQuery) {
@@ -3794,8 +3802,8 @@ TEST_F(PostgresStatementTest, ResultStreamReleasedBeforeNextQuery) {
                                      "1", &error),
               IsOkStatus(&error));
   {
-    // Dropping the stream does not drop the reader. The statement still holds
-    // it, and the next ExecuteQuery is what finishes the open query.
+    // The stream owns the reader. Dropping it finishes the query, so the next
+    // ExecuteQuery on this statement can use the connection.
     adbc_validation::StreamReader reader;
     ASSERT_THAT(AdbcStatementSetSqlQuery(
                     &statement, "SELECT g FROM generate_series(1, 3) t(g)", &error),
@@ -3817,6 +3825,53 @@ TEST_F(PostgresStatementTest, ResultStreamReleasedBeforeNextQuery) {
   ASSERT_NO_FATAL_FAILURE(next.GetSchema());
   ASSERT_NO_FATAL_FAILURE(next.Next());
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(next.array_view->children[0], 0), 4);
+}
+
+TEST_F(PostgresStatementTest, NullStreamDoesNotHoldConnection) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 2", &error), IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 2);
+}
+
+TEST_F(PostgresStatementTest, MultipleStatementsStayAtomic) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  for (const char* query : {"DROP TABLE IF EXISTS test_stream_atomic",
+                            "CREATE TABLE test_stream_atomic (ints INT)"}) {
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement,
+                  "INSERT INTO test_stream_atomic VALUES (1); "
+                  "SELECT * FROM test_stream_atomic_missing",
+                  &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader failed;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &failed.stream.value, nullptr, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  ASSERT_EQ("42P01", std::string_view(error.sqlstate, 5));
+  error.release(&error);
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "SELECT COUNT(*) FROM test_stream_atomic", &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->length, 1);
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 0);
 }
 
 TEST_F(PostgresStatementTest, MultipleStatementsSingleQueryError) {
