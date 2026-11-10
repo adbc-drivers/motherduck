@@ -38,20 +38,23 @@
 
 namespace adbcpq {
 
-PqResultArrayReader::~PqResultArrayReader() {
-  // ReleaseConnection already finished the libpq calls while the connection
-  // was still open. After PQfinish only the result memory may be freed.
+void PqResultArrayReader::Close() {
+  if (closed_) return;
   if (connection_ != nullptr && connection_->disconnected()) {
     helper_.DiscardLocal();
-    ResetErrors();
+    closed_ = true;
     return;
   }
-  if (!closed_) {
-    const bool failed = helper_.Finish();
-    const bool cancel = cancel_requested_.load(std::memory_order_acquire);
-    // A clean drain of a finished script commits. A cancel or a failure does not.
-    EndOwnedTransaction(!(failed || cancel));
-  }
+  closed_ = true;
+  const bool user_cancel = cancel_requested_.load(std::memory_order_acquire);
+  // Cancelling a script aborts its transaction. A caller who only stopped
+  // reading should let the server finish, then commit.
+  const bool failed = helper_.Finish(user_cancel || !own_txn_);
+  EndOwnedTransaction(!(failed || user_cancel));
+}
+
+PqResultArrayReader::~PqResultArrayReader() {
+  Close();
   ResetErrors();
 }
 
@@ -71,9 +74,7 @@ int PqResultArrayReader::GetSchema(struct ArrowSchema* out) {
 
 int PqResultArrayReader::GetNext(struct ArrowArray* out) {
   if (cancel_requested_.load(std::memory_order_acquire) && !closed_) {
-    closed_ = true;
-    helper_.Finish();
-    EndOwnedTransaction(false);
+    Close();
     Status status(ADBC_STATUS_CANCELLED,
                   "[libpq] canceling statement due to user request");
     status.SetSqlState("57014");
@@ -290,7 +291,11 @@ struct ResultStream {
 };
 
 void ReleaseResultStream(struct ArrowArrayStream* stream) {
-  delete static_cast<ResultStream*>(stream->private_data);
+  auto* holder = static_cast<ResultStream*>(stream->private_data);
+  // Finish libpq work on the thread releasing the stream, while this
+  // reference still keeps the reader alive.
+  if (holder != nullptr && holder->reader != nullptr) holder->reader->Close();
+  delete holder;
   stream->private_data = nullptr;
   stream->release = nullptr;
 }
@@ -410,15 +415,11 @@ Status PqResultArrayReader::OpenRowStream() {
 void PqResultArrayReader::ReleaseConnection() {
   if (closed_) return;
   if (!helper_.streaming()) {
-    // Rows are already local. Leave them readable and commit any script that
-    // finished on the server.
+    // Rows already received stay readable. Commit a script the server finished.
     EndOwnedTransaction(true);
     return;
   }
-  closed_ = true;
-  const bool failed = helper_.Finish();
-  const bool cancel = cancel_requested_.load(std::memory_order_acquire);
-  EndOwnedTransaction(!(failed || cancel));
+  Close();
   status_ = ADBC_STATUS_INVALID_STATE;
   InternalAdbcSetError(&error_, "%s",
                        "[libpq] Reader invalidated (statement or reader was closed)");

@@ -164,9 +164,13 @@ class PqResultHelper {
   void PullBufferedTail();
   bool streaming() const { return streaming_; }
   void SetCancelFlag(const std::atomic<bool>* flag) { cancel_flag_ = flag; }
-  // Discard an open read. Returns true when a discarded packet was a failure,
-  // so the caller rolls the script back instead of committing it.
-  bool Finish() { return AbandonStream(); }
+  // Discard an open read. cancel_if_blocked stops a read the server has not
+  // finished. Leaving it false lets that read finish so an owned transaction
+  // can commit.
+  bool Finish(bool cancel_if_blocked) {
+    stop_if_blocked_ = cancel_if_blocked;
+    return AbandonStream();
+  }
   bool CancelSent() const { return cancel_sent_; }
   // Free result memory without talking to the server. Used after PQfinish.
   void DiscardLocal();
@@ -245,9 +249,9 @@ class PqResultHelper {
   std::string query_;
   bool streaming_ = false;
   bool cancel_sent_ = false;
-  // Set while discarding a read, so a blocked drain cancels instead of
-  // reading the rest of the result.
-  bool abandon_ = false;
+  // Set for a cleanup that may cancel a blocked read. An owned transaction
+  // leaves this false so the server can finish the script and commit.
+  bool stop_if_blocked_ = false;
   const std::atomic<bool>* cancel_flag_ = nullptr;
   Format param_format_ = Format::kText;
   Format output_format_ = Format::kText;

@@ -116,9 +116,9 @@ void PqResultHelper::WaitUntilReady() {
   for (;;) {
     if (PQconsumeInput(conn_) != 1) return;
     if (PQisBusy(conn_) == 0) return;
-    const bool stop =
-        abandon_ || (cancel_flag_ != nullptr &&
-                     cancel_flag_->load(std::memory_order_acquire));
+    const bool stop = stop_if_blocked_ ||
+                      (cancel_flag_ != nullptr &&
+                       cancel_flag_->load(std::memory_order_acquire));
     if (stop && !cancel_sent_) {
       SendCancel(conn_);
       cancel_sent_ = true;
@@ -130,7 +130,6 @@ void PqResultHelper::WaitUntilReady() {
 
 bool PqResultHelper::AbandonStream() {
   if (!streaming_ && pending_.empty()) return false;
-  abandon_ = true;
   const auto failed_script = [this](const PGresult* result) {
     if (!IsFailure(result)) return false;
     // A cancel this drain sent, so the connection can be reused, is not a
@@ -169,6 +168,24 @@ bool IsRowPacket(ExecStatusType status) {
 
 }  // namespace
 
+void AbortCopy(PGconn* conn, ExecStatusType status) {
+  if (status == PGRES_COPY_IN || status == PGRES_COPY_BOTH) {
+    PQputCopyEnd(conn, "COPY is not supported in a multi-statement query");
+  }
+  if (status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH) {
+    SendCancel(conn);
+    char* buffer = nullptr;
+    for (;;) {
+      const int n = PQgetCopyData(conn, &buffer, /*async=*/0);
+      if (buffer != nullptr) {
+        PQfreemem(buffer);
+        buffer = nullptr;
+      }
+      if (n < 0) break;
+    }
+  }
+}
+
 Status PqResultHelper::ExecuteCancellable(const std::string& sql) {
   if (PQsendQuery(conn_, sql.c_str()) != 1) {
     return MakeStatus(nullptr, "[libpq] Failed to execute query '{}': {}", sql.c_str(),
@@ -179,6 +196,16 @@ Status PqResultHelper::ExecuteCancellable(const std::string& sql) {
     WaitUntilReady();
     PGresult* result = PQgetResult(conn_);
     if (result == nullptr) break;
+    const ExecStatusType status = PQresultStatus(result);
+    if (status == PGRES_COPY_IN || status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH) {
+      if (failure.ok()) {
+        failure = Status(ADBC_STATUS_NOT_IMPLEMENTED,
+                         "[libpq] COPY is not supported in a multi-statement query");
+      }
+      AbortCopy(conn_, status);
+      PQclear(result);
+      continue;
+    }
     if (IsFailure(result) && failure.ok()) {
       if (cancel_flag_ != nullptr && cancel_flag_->load(std::memory_order_acquire)) {
         failure = Status(ADBC_STATUS_CANCELLED,
@@ -240,8 +267,7 @@ void PqResultHelper::PullBufferedTail() {
     if (IsRowPacket(status)) {
       pending_.push_back(next);
       // One packet of read-ahead. More than that lets a fast server fill memory.
-      if (pending_.size() >= 1) return;
-      continue;
+      return;
     }
     if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK &&
         status != PGRES_EMPTY_QUERY) {

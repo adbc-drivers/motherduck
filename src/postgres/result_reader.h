@@ -78,6 +78,8 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   // Drop a server read so the connection can run another command. A result
   // that is already fully buffered stays readable.
   void ReleaseConnection();
+  // Finish an open read on this thread. Safe to call more than once.
+  void Close();
   // Thread-safe. Sets the cancel flag. The reading thread sends the cancel.
   AdbcStatusCode RequestCancel(struct AdbcError* error);
   void SetConnection(std::shared_ptr<PostgresConnection> connection) {
