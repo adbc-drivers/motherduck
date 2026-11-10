@@ -53,8 +53,8 @@ TEST(PostgresErrorTest, RedactorSeesOnlyThePrefix) {
   SetQueryRedactor(nullptr);
 }
 
-// A result libpq makes itself, e.g. when the connection is lost, has a message but no
-// diagnostic fields. Use a connection that failed to open to get one without a server.
+// Results libpq makes itself (lost connection) have a message but no fields. A failed
+// connection gives one without a server.
 TEST(PostgresErrorTest, PqErrorTextKeepsClientSideMessages) {
   PGconn* conn = PQconnectdb("host=127.0.0.1 port=1 connect_timeout=2");
   ASSERT_NE(conn, nullptr);
@@ -70,20 +70,19 @@ TEST(PostgresErrorTest, PqErrorTextKeepsClientSideMessages) {
   EXPECT_EQ(text.find("missing error text"), std::string::npos) << text;
   PQclear(result);
 
-  // Not an error result: nothing in it, so the connection's message is used.
+  // Not an error result: use the connection's message.
   result = PQmakeEmptyPGresult(conn, PGRES_COMMAND_OK);
   ASSERT_NE(result, nullptr);
   EXPECT_EQ(PqErrorText(result, conn), conn_message);
   PQclear(result);
 
-  // No result: the connection's message, or nothing at all.
+  // No result: the connection's message, or nothing.
   EXPECT_EQ(PqErrorText(nullptr, conn), conn_message);
   EXPECT_EQ(PqErrorText(nullptr, nullptr), "");
   PQfinish(conn);
 }
 
-// MakeStatus only takes redacted text and numbers (a static_assert in error.h rejects
-// anything else), and formats them as ordinary text.
+// MakeStatus takes only numbers and RedactedText (a static_assert rejects the rest).
 TEST(PostgresErrorTest, MakeStatusFormatsRedactedText) {
   const std::string message =
       MakeStatus(nullptr, "failed '{}' [{}] {}", RedactQuery("SELECT 1"),

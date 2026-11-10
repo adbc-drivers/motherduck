@@ -28,27 +28,25 @@ namespace adbcpq {
 
 namespace {
 
-// Deliberately crude: each pattern looks at raw text, ignoring quoting and comments, and
-// the first match anywhere cuts the text there. Group 1 is the part kept. Over-masking is
-// fine; leaking is not. Loops are bounded because the input is already truncated and
-// libstdc++'s matcher recurses once per iteration.
+// Deliberately crude: patterns match raw text, ignoring quoting, and the earliest match
+// cuts the text there (group 1 is what's kept). Over-masking is fine; leaking is not.
+// Repeats are bounded because libstdc++'s matcher recurses once per iteration.
 
 std::vector<std::regex> BuildPatterns() {
   constexpr auto kFlags = std::regex::ECMAScript | std::regex::icase;
-  // A word that marks a name as a credential, as part of the name (api_key, monkey).
-  // The short words must be a whole part, so author and design don't count.
+  // Words that mark a name as a credential. The short ones must be a whole part of the
+  // name, so "author" and "design" don't count.
   const std::string credential =
       "(?:(?:secret|token|pass|key|signature|bearer|jwt|cookie|connection_string)"
       "|(?:^|[^a-z])(?:pwd|pw|sig|sas|auth|authorization|credentials?|slt|dsn)(?![a-z])"
       ")";
-  // What may follow the name: '=', ':' or TO (after an optional closing quote of a
-  // quoted name), or straight away a string, '(', ')', ',' or a comment hiding one. A
-  // double quote only counts after a space, so `Table "tokens" does not exist` stays
-  // readable while PASSWORD "v" is still masked.
+  // What may follow the name: '=', ':' or TO, or straight away a string, '(', ')', ','
+  // or a comment. A double quote counts only after a space, so `Table "tokens" does not
+  // exist` stays readable while PASSWORD "v" is masked.
   const std::string value =
       R"((?:["']?\s*(?:=|:(?!:)|\bto\b)|\s*(?:['(),]|/\*|--)|\s+"))";
   return std::vector<std::regex>{
-      // CREATE [OR REPLACE] [PERSISTENT] SECRET <name> (options): drop the name too.
+      // CREATE [OR REPLACE] [PERSISTENT] SECRET <name> (...): the name goes too.
       std::regex(R"((\b(?:create|alter)\b[\s\S]{0,200}?\bsecret\b))", kFlags),
       // name = v, name TO v, name: v, PASSWORD 'v', name(v), (name) VALUES (v).
       std::regex("(" + credential + R"([\w.$]{0,64}))" + value, kFlags),
@@ -56,12 +54,12 @@ std::vector<std::regex> BuildPatterns() {
       std::regex(R"((://[^\s'"@/]{0,128}:\s*)[^\s'"@]{0,1024}@)", kFlags),
       // md:<token>@database, motherduck:<token>@database
       std::regex(R"((\b(?:md|motherduck):)[^'"@]{0,1024}@)", kFlags),
-      // md_create_flight(source_code := ..., config => ...): free-form payloads.
+      // md_create_flight(source_code := ..., config => ...)
       std::regex(R"((\b(?:source_code|config))\s*(?::=|=>?|/\*|--))", kFlags),
   };
 }
 
-// Built once. If building fails, null for good, rather than retrying on every error.
+// Built once; null if building failed.
 const std::vector<std::regex>* Patterns() {
   static const std::vector<std::regex>* patterns =
       []() -> const std::vector<std::regex>* {
@@ -79,8 +77,7 @@ const std::vector<std::regex>* Patterns() {
 
 std::string RedactSecretStatements(std::string_view query) {
   if (query.empty()) return std::string();
-  // This runs while an error is being built, so it must not throw. If the patterns can't
-  // be built or the matcher gives up, hide everything.
+  // Runs while an error is built, so it must not throw: on failure, hide everything.
   const std::vector<std::regex>* patterns = Patterns();
   if (patterns == nullptr) return "(redacted)";
   try {

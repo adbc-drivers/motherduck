@@ -33,9 +33,8 @@ TEST(MotherduckDriverTest, InitSupportedVersions) {
 extern "C" AdbcStatusCode AdbcDriverInit(int version, void* raw_driver,
                                          struct AdbcError* error);
 
-// AdbcDriverInit forwards to AdbcDriverMotherduckInit, which also installs the error
-// message redactor. The redactor lives in the shared library, so it can't be observed
-// from here; check that the two entry points hand back the same driver.
+// AdbcDriverInit forwards to AdbcDriverMotherduckInit, which installs the redactor. That
+// can't be observed from here, so check both entry points return the same driver.
 TEST(MotherduckDriverTest, GenericInitMatchesMotherduckInit) {
   AdbcDriver generic = {};
   AdbcDriver motherduck = {};

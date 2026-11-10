@@ -23,18 +23,16 @@ namespace adbcpq {
 
 /// \brief Mask credentials in SQL text before it goes into an error message.
 ///
-/// A few regexes over the raw text, ignoring quoting and comments, so they also see
-/// inside literals, comments and $$ bodies. At the first match everything after the kept
-/// part is dropped and " ..." is appended:
-///  - CREATE/ALTER ... SECRET: kept up to SECRET.
-///  - A name containing secret, token, pass, key or similar, followed by '=', ':', TO, a
-///    single quote, '(', ')', ',' or a comment opener (or a double quote after a space):
-///    kept up to the name. This also masks column lists such as (id, password).
+/// A few regexes over the raw text, ignoring quoting and comments. At the earliest match
+/// the rest is dropped and " ..." appended. Triggers:
+///  - CREATE/ALTER ... SECRET.
+///  - A credential-like name (secret, token, pass, key, ...) followed by '=', ':', TO, a
+///    quote, '(', ')', ',' or a comment, which also masks column lists like (id,
+///    password).
 ///  - user:password@ in a URL, and md:<token>@db.
 ///  - source_code and config arguments of md_create_flight.
-/// This favours masking too much over leaking (`WHERE key = 5` is masked). A quoted name
-/// on its own ("api_key" not found) is left readable. Other text is returned unchanged.
-/// If the patterns can't be built or the matcher fails, the whole text becomes
+/// Over-masking is accepted (`WHERE key = 5` is masked), but a lone quoted name
+/// ("api_key" not found) stays readable. If the patterns fail, the text becomes
 /// "(redacted)".
 std::string RedactSecretStatements(std::string_view query);
 

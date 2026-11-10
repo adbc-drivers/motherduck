@@ -185,8 +185,7 @@ TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
   }
 }
 
-// The patterns trade precision for safety. These are masked although they hold no secret;
-// pinning them keeps the trade-off visible.
+// Masked although they hold no secret; pinned to keep the trade-off visible.
 TEST(MotherDuckRedactTest, OverMasksCredentialLookingSql) {
   const std::pair<const char*, const char*> kCases[] = {
       {"SELECT * FROM t WHERE key = 5 ORDER BY id", "SELECT * FROM t WHERE key ..."},
@@ -226,8 +225,8 @@ TEST(MotherDuckRedactTest, InstalledRedactorAppliesToErrors) {
   SetQueryRedactor(nullptr);
 }
 
-// A secret that straddles the truncation point must not get through, whether the cut
-// lands before the credential name, inside it or inside the value.
+// A secret at the truncation point must not get through, whether the cut falls before
+// the name, inside it or inside the value.
 TEST(MotherDuckRedactTest, SecretNearTheTruncationPointIsNotLogged) {
   InstallMotherDuckQueryRedactor();
   for (size_t pad = kMaxQueryBytes - 50; pad < kMaxQueryBytes + 5; pad++) {
@@ -239,12 +238,11 @@ TEST(MotherDuckRedactTest, SecretNearTheTruncationPointIsNotLogged) {
   SetQueryRedactor(nullptr);
 }
 
-// libpq echoes the statement ("LINE 1: ...") in its default error message. Make sure the
-// text we put in errors never has it.
+// libpq's default error message echoes the statement ("LINE 1: ..."); ours must not.
 TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   if (!uri) GTEST_SKIP() << "ADBC_POSTGRESQL_TEST_URI not set";
-  // The driver adds the token to the URI; do the same here.
+  // The driver adds the token; so does this.
   const char* token = std::getenv("MOTHERDUCK_TOKEN");
   const char* keywords[] = {"dbname", "password", nullptr};
   const char* values[] = {uri, token != nullptr ? token : "", nullptr};

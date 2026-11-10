@@ -40,7 +40,7 @@ void SetQueryRedactor(QueryRedactor redactor) { query_redactor.store(redactor); 
 
 namespace {
 
-// Cut text to at most max_bytes, redact the prefix, and mark the cut.
+// Cut to max_bytes, redact what is kept, and mark the cut.
 RedactedText TruncateAndRedact(std::string_view text, size_t max_bytes) {
   bool truncated = false;
   if (text.size() > max_bytes) {

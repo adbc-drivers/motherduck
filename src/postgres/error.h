@@ -69,23 +69,19 @@ AdbcStatusCode ClassifySqlState(const char* sqlstate);
 
 /// \brief Hook that masks sensitive text in SQL before it goes into an error message.
 ///
-/// The hook is only ever called with a bounded prefix of the text (see
-/// kMaxQueryBytes and kMaxMessageBytes), so it may use algorithms that are not safe on
-/// arbitrarily large input.
+/// It only sees text already cut to kMaxQueryBytes or kMaxMessageBytes.
 using QueryRedactor = std::string (*)(std::string_view query);
 
-/// Longest SQL text kept in an error message. Longer queries are cut before redaction,
-/// so nothing past the cut is ever seen, let alone logged.
+/// Longest SQL text kept in an error message; the rest is cut before redaction.
 constexpr size_t kMaxQueryBytes = 2048;
-/// Longest server-authored text (messages and diagnostic fields) kept in an error.
+/// Longest server text (messages and diagnostic fields) kept in an error.
 constexpr size_t kMaxMessageBytes = 8192;
 
 /// \brief Text that is safe to put in an error message.
 ///
-/// RedactQuery, RedactMessage and PqErrorText return this, and MakeStatus accepts
-/// nothing else as a message argument, so a raw query or PQerrorMessage can't slip into
-/// an error by accident. It is a std::string in every other way. Wrapping text that is
-/// already safe, such as a status name, is an explicit choice.
+/// RedactQuery, RedactMessage and PqErrorText return it, and MakeStatus accepts nothing
+/// else as an argument, so raw SQL or PQerrorMessage can't slip into an error. Wrapping
+/// text that is already safe, like a status name, is explicit.
 class RedactedText : public std::string {
  public:
   RedactedText() = default;
@@ -95,7 +91,7 @@ class RedactedText : public std::string {
 
 }  // namespace adbcpq
 
-// fmt matches the exact type, so a type derived from std::string needs its own formatter.
+// fmt matches exact types, so a std::string subclass needs its own formatter.
 template <>
 struct fmt::formatter<adbcpq::RedactedText> : fmt::formatter<std::string_view> {
   template <typename FormatContext>
@@ -106,14 +102,12 @@ struct fmt::formatter<adbcpq::RedactedText> : fmt::formatter<std::string_view> {
 
 namespace adbcpq {
 
-/// \brief Install the redactor used by RedactQuery. Passing nullptr restores the default,
-/// which returns the query unchanged. Call once at driver initialization.
+/// \brief Install the redactor used by RedactQuery (nullptr: none). Call at init.
 void SetQueryRedactor(QueryRedactor redactor);
 
 /// \brief Truncate SQL text to kMaxQueryBytes, then apply the installed redactor.
 ///
-/// Truncation comes first, so the redactor sees every statement header in the kept
-/// prefix and nothing else.
+/// Truncation comes first, so the redactor never sees text past the cut.
 RedactedText RedactQuery(std::string_view query);
 
 /// \brief As RedactQuery, for text the server wrote (kMaxMessageBytes).
@@ -121,15 +115,13 @@ RedactedText RedactMessage(std::string_view message);
 
 /// \brief The server's error text without the echoed statement.
 ///
-/// libpq's default verbosity appends a "LINE n:" window of the statement around the
-/// error position and, for internal queries, a "QUERY:" line. Both can contain
-/// credentials, so use the terse form for errors on user-supplied SQL. Falls back to
-/// the connection's error message when there is no result, or the result has no fields.
+/// libpq's default verbosity echoes the statement ("LINE n:", "QUERY:"), which can hold
+/// credentials, so this uses the terse form. Without a result, or when the result has no
+/// fields, it uses the connection's message.
 inline RedactedText PqErrorText(PGresult* result, PGconn* conn) {
   if (result != nullptr) {
-    // A result libpq made itself (connection lost, out of memory) or one that isn't an
-    // error has no diagnostic fields, so the verbose form would only say "missing error
-    // text". Its own message has nothing to echo, as that comes from the fields.
+    // Results libpq makes itself (lost connection) have no fields, so the verbose form
+    // says "missing error text". Their own message has no echo to leak.
     if (PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY) == nullptr) {
       std::string_view own = PQresultErrorMessage(result);
       if (!own.empty()) return RedactMessage(own);
@@ -137,11 +129,11 @@ inline RedactedText PqErrorText(PGresult* result, PGconn* conn) {
     }
     char* text =
         PQresultVerboseErrorMessage(result, PQERRORS_TERSE, PQSHOW_CONTEXT_NEVER);
-    // Never fall back to the default message, which echoes the statement.
+    // Don't fall back to the default message: it echoes the statement.
     if (text == nullptr) return RedactedText("(server error text unavailable)");
     std::string out(text);
     PQfreemem(text);
-    // The server's own message can quote the statement as well.
+    // The message itself can quote the statement too.
     return RedactMessage(out);
   }
   return conn != nullptr ? RedactMessage(PQerrorMessage(conn)) : RedactedText();
