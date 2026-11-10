@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <libpq-fe.h>
@@ -70,6 +71,9 @@ class MotherduckStatement : public PostgresStatement {
                       const std::vector<Oid>& param_oids,
                       const struct ArrowSchema* bind_schema) override;
   std::string ResultColumnName(std::string name) const override;
+  bool SameColumnName(std::string_view table_column,
+                      std::string_view source_column) const override;
+  Status CheckTemporaryIngest() const override;
 
  private:
   // The casts the last query was prepared with, if any

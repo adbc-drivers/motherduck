@@ -174,11 +174,9 @@ to fail.
 - **Rows affected** is wrong for `DELETE` (#19), and is the row count rather
   than -1 for a `SELECT` on the non-COPY path (#50). `ExecuteQuery` on an
   `INSERT` also returns the endpoint's `Count` row as a batch (#49).
-- **Metadata:** `GetObjects` and the current catalog don't reflect MotherDuck
-  databases and schemas (#14), `GetTableSchema` fails its `$1::regclass`
-  lookup (#13), `GetInfo` reports PostgreSQL and queries
-  `server_version_num` (#15), and `GetStatistics` isn't supported (it reads
-  `pg_stats`).
+- **Metadata:** the current catalog reports `md:` rather than the current
+  database when you connect to `md:` (#14), and `GetStatistics` and
+  `GetStatisticNames` aren't supported, since MotherDuck has no `pg_stats`.
 - **Transactions:** DuckDB has a single isolation level and the endpoint
   rejects `SET TRANSACTION`, so isolation levels can't be set.
 - **Types:** PostgreSQL-only types such as `jsonb` and `int2vector` don't
@@ -243,7 +241,15 @@ lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
   version.
 - `motherduck_connection`: `MotherduckConnection`, which leaves the vendor
   version out of `GetInfo` rather than report the endpoint's PostgreSQL
-  `server_version_num`.
+  `server_version_num`, describes `SELECT * FROM` the table for
+  `GetTableSchema`, reports only `table` and `view` table types, and rejects
+  the statistics calls.
+- `motherduck_get_objects`: the `GetObjects` helper, which reads DuckDB's
+  `duckdb_*()` metadata functions for every attached database, one query per
+  level, with case-insensitive filters.
+- `motherduck_error`: `ClassifyServerError`, which classifies the endpoint's
+  missing-object errors as `NOT_FOUND` although they arrive with the generic
+  SQLSTATE `XXUUU`.
 - `motherduck_statement`: `MotherduckStatement`, which accepts the result sets
   MotherDuck returns for DDL, and `MotherduckResultReader`, which runs queries
   without a result through a pipeline. Both cast parameters to their bound
@@ -260,7 +266,9 @@ The upstream files still differ from Apache's in these ways:
   includes use paths relative to `src/postgres/`.
 - Hooks for the subclasses: `virtual` methods and `protected` members in
   `PostgresDatabase`, `PostgresConnection`, `PostgresStatement`, and
-  `PqResultArrayReader`;
+  `PqResultArrayReader`; `MakeGetObjectsHelper()`, which lets a subclass
+  supply the `GetObjects` helper; `ClassifyServerError()`, which `MakeStatus`
+  calls and `motherduck_error.cc` defines;
   `DriverName()` and `DriverVersion()`, which `GetInfo` reports; and the
   factory calls in `postgresql.cc`.
 - `BindStream::SerializeCurrentRow()` is split out of

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <cstdint>
+#include <string>
 
 #include <arrow-adbc/adbc.h>
 #include <gmock/gmock.h>
@@ -22,8 +23,11 @@
 
 namespace adbcpq {
 
+using ::testing::AllOf;
 using ::testing::ElementsAre;
+using ::testing::HasSubstr;
 using ::testing::IsEmpty;
+using ::testing::StartsWith;
 
 // The PostgreSQL server version must never be reported as MotherDuck's.
 TEST(MotherduckInfoCodesTest, AllCodesOmitVendorVersion) {
@@ -41,6 +45,40 @@ TEST(MotherduckInfoCodesTest, RequestedCodesOmitVendorVersion) {
 
   const uint32_t only_version[] = {ADBC_INFO_VENDOR_VERSION};
   EXPECT_THAT(MotherduckInfoCodes(only_version, 1), IsEmpty());
+}
+
+class MotherduckStatisticsTest : public ::testing::Test {
+ protected:
+  void TearDown() override {
+    if (error_.release) error_.release(&error_);
+  }
+
+  void ExpectNotSupported(AdbcStatusCode status, const char* function) {
+    EXPECT_EQ(status, ADBC_STATUS_NOT_IMPLEMENTED);
+    ASSERT_NE(error_.message, nullptr);
+    EXPECT_THAT(std::string(error_.message),
+                AllOf(StartsWith("[motherduck] "), HasSubstr(function),
+                      HasSubstr("is not supported by the MotherDuck driver"),
+                      HasSubstr("pg_stats")));
+  }
+
+  MotherduckConnection connection_;
+  struct AdbcError error_ = ADBC_ERROR_INIT;
+};
+
+TEST_F(MotherduckStatisticsTest, GetStatistics) {
+  struct ArrowArrayStream out = {};
+  ExpectNotSupported(
+      connection_.GetStatistics(nullptr, "main", nullptr, true, &out, &error_),
+      "AdbcConnectionGetStatistics");
+  EXPECT_EQ(out.release, nullptr);
+}
+
+TEST_F(MotherduckStatisticsTest, GetStatisticNames) {
+  struct ArrowArrayStream out = {};
+  ExpectNotSupported(connection_.GetStatisticNames(&out, &error_),
+                     "AdbcConnectionGetStatisticNames");
+  EXPECT_EQ(out.release, nullptr);
 }
 
 }  // namespace adbcpq
