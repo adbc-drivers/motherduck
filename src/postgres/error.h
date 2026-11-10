@@ -96,9 +96,17 @@ std::string RedactMessage(std::string_view message);
 /// libpq's default verbosity appends a "LINE n:" window of the statement around the
 /// error position and, for internal queries, a "QUERY:" line. Both can contain
 /// credentials, so use the terse form for errors on user-supplied SQL. Falls back to
-/// the connection's error message when there is no result.
+/// the connection's error message when there is no result, or the result has no fields.
 inline std::string PqErrorText(PGresult* result, PGconn* conn) {
   if (result != nullptr) {
+    // A result libpq made itself (connection lost, out of memory) or one that isn't an
+    // error has no diagnostic fields, so the verbose form would only say "missing error
+    // text". Its own message has nothing to echo, as that comes from the fields.
+    if (PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY) == nullptr) {
+      std::string_view own = PQresultErrorMessage(result);
+      if (!own.empty()) return RedactMessage(own);
+      return conn != nullptr ? RedactMessage(PQerrorMessage(conn)) : "";
+    }
     char* text =
         PQresultVerboseErrorMessage(result, PQERRORS_TERSE, PQSHOW_CONTEXT_NEVER);
     // Never fall back to the default message, which echoes the statement.

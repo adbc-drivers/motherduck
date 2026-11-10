@@ -23,6 +23,7 @@
 #include <string>
 
 #include <gtest/gtest.h>
+#include <libpq-fe.h>
 
 #include "error.h"
 
@@ -50,6 +51,35 @@ TEST(PostgresErrorTest, RedactorSeesOnlyThePrefix) {
   const std::string long_query(kMaxQueryBytes + 500, 'x');
   EXPECT_EQ(RedactQuery(long_query), std::to_string(kMaxQueryBytes) + "... [truncated]");
   SetQueryRedactor(nullptr);
+}
+
+// A result libpq makes itself, e.g. when the connection is lost, has a message but no
+// diagnostic fields. Use a connection that failed to open to get one without a server.
+TEST(PostgresErrorTest, PqErrorTextKeepsClientSideMessages) {
+  PGconn* conn = PQconnectdb("host=127.0.0.1 port=1 connect_timeout=2");
+  ASSERT_NE(conn, nullptr);
+  ASSERT_EQ(PQstatus(conn), CONNECTION_BAD);
+  const std::string conn_message = PQerrorMessage(conn);
+  ASSERT_FALSE(conn_message.empty());
+
+  PGresult* result = PQmakeEmptyPGresult(conn, PGRES_FATAL_ERROR);
+  ASSERT_NE(result, nullptr);
+  ASSERT_EQ(PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY), nullptr);
+  const std::string text = PqErrorText(result, conn);
+  EXPECT_EQ(text, conn_message);
+  EXPECT_EQ(text.find("missing error text"), std::string::npos) << text;
+  PQclear(result);
+
+  // Not an error result: nothing in it, so the connection's message is used.
+  result = PQmakeEmptyPGresult(conn, PGRES_COMMAND_OK);
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PqErrorText(result, conn), conn_message);
+  PQclear(result);
+
+  // No result: the connection's message, or nothing at all.
+  EXPECT_EQ(PqErrorText(nullptr, conn), conn_message);
+  EXPECT_EQ(PqErrorText(nullptr, nullptr), "");
+  PQfinish(conn);
 }
 
 TEST(PostgresErrorTest, ClassifySqlState) {
