@@ -585,11 +585,16 @@ AdbcStatusCode PostgresConnection::GetInfo(struct AdbcConnection* connection,
   return ADBC_STATUS_OK;
 }
 
+std::unique_ptr<adbc::driver::GetObjectsHelper>
+PostgresConnection::MakeGetObjectsHelper() {
+  return std::make_unique<PostgresGetObjectsHelper>(conn_);
+}
+
 AdbcStatusCode PostgresConnection::GetObjects(
     struct AdbcConnection* connection, int c_depth, const char* catalog,
     const char* db_schema, const char* table_name, const char** table_type,
     const char* column_name, struct ArrowArrayStream* out, struct AdbcError* error) {
-  PostgresGetObjectsHelper helper(conn_);
+  std::unique_ptr<adbc::driver::GetObjectsHelper> helper = MakeGetObjectsHelper();
 
   const auto catalog_filter =
       catalog ? std::make_optional(std::string_view(catalog)) : std::nullopt;
@@ -630,9 +635,9 @@ AdbcStatusCode PostgresConnection::GetObjects(
 
   RAISE_ADBC(EnsureTransaction(error));
 
-  auto status = BuildGetObjects(&helper, depth, catalog_filter, schema_filter,
+  auto status = BuildGetObjects(helper.get(), depth, catalog_filter, schema_filter,
                                 table_filter, column_filter, table_type_filter, out);
-  RAISE_STATUS(error, helper.Close());
+  RAISE_STATUS(error, helper->Close());
   RAISE_STATUS(error, status);
 
   return ADBC_STATUS_OK;
