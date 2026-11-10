@@ -165,17 +165,20 @@ to fail.
   whole result at once, so it ignores `adbc.postgresql.batch_size_hint_bytes`,
   the connection reports idle in a transaction rather than active while you
   read (#11), and a running query can't be cancelled (#48).
-- **Parameterized queries** fail or return wrong results (#17), and
-  `GetParameterSchema` fails on queries whose result types the endpoint
-  can't infer.
+- **Parameter types:** the endpoint can't prepare a query whose result
+  column types depend on its parameters, as in `SELECT $1`, and ignores the
+  parameter types sent with the prepare (#17). When that happens with
+  parameters bound, the driver prepares the query again with each `$n` cast to
+  its bound type, so such queries work once parameters are bound; without
+  bound parameters, `GetParameterSchema` and `ExecuteSchema` return
+  `NOT_IMPLEMENTED` for them. An all-null parameter whose type the endpoint
+  can't infer is cast to `TEXT`, so `SELECT 1 + $1` with a null fails.
 - **Rows affected** is wrong for `DELETE` (#19), and is the row count rather
   than -1 for a `SELECT` on the non-COPY path (#50). `ExecuteQuery` on an
   `INSERT` also returns the endpoint's `Count` row as a batch (#49).
-- **Metadata:** `GetObjects` and the current catalog don't reflect MotherDuck
-  databases and schemas (#14), `GetTableSchema` fails its `$1::regclass`
-  lookup (#13), `GetInfo` reports PostgreSQL and queries
-  `server_version_num` (#15), and `GetStatistics` isn't supported (it reads
-  `pg_stats`).
+- **Metadata:** the current catalog reports `md:` rather than the current
+  database when you connect to `md:` (#14), and `GetStatistics` and
+  `GetStatisticNames` aren't supported, since MotherDuck has no `pg_stats`.
 - **Transactions:** DuckDB has a single isolation level and the endpoint
   rejects `SET TRANSACTION`, so isolation levels can't be set.
 - **Types:** PostgreSQL-only types such as `jsonb` and `int2vector` don't
@@ -240,12 +243,21 @@ lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
   version.
 - `motherduck_connection`: `MotherduckConnection`, which leaves the vendor
   version out of `GetInfo` rather than report the endpoint's PostgreSQL
-  `server_version_num`.
+  `server_version_num`, describes `SELECT * FROM` the table for
+  `GetTableSchema`, reports only `table` and `view` table types, and rejects
+  the statistics calls.
+- `motherduck_get_objects`: the `GetObjects` helper, which reads DuckDB's
+  `duckdb_*()` metadata functions for every attached database, one query per
+  level, with case-insensitive filters.
+- `motherduck_error`: `ClassifyServerError`, which classifies the endpoint's
+  missing-object errors as `NOT_FOUND` although they arrive with the generic
+  SQLSTATE `XXUUU`.
 - `motherduck_statement`: `MotherduckStatement`, which accepts the result sets
   MotherDuck returns for DDL, and `MotherduckResultReader`, which runs queries
-  without a result through a pipeline.
-- `motherduck_pipeline`: pipelined execution and splitting multi-statement
-  queries.
+  without a result through a pipeline. Both cast parameters to their bound
+  types when the endpoint can't prepare a query without them.
+- `motherduck_pipeline`: pipelined execution, splitting multi-statement
+  queries, and casting a query's parameters.
 - `motherduck_type_resolver`: DuckDB-only type OIDs.
 - `motherduck_factory`: the subclasses `postgresql.cc` creates.
 - `motherduck.cc`: the `AdbcDriverMotherduckInit` entry point.
@@ -256,7 +268,9 @@ The upstream files still differ from Apache's in these ways:
   includes use paths relative to `src/postgres/`.
 - Hooks for the subclasses: `virtual` methods and `protected` members in
   `PostgresDatabase`, `PostgresConnection`, `PostgresStatement`, and
-  `PqResultArrayReader`;
+  `PqResultArrayReader`; `MakeGetObjectsHelper()`, which lets a subclass
+  supply the `GetObjects` helper; `ClassifyServerError()`, which `MakeStatus`
+  calls and `motherduck_error.cc` defines;
   `DriverName()` and `DriverVersion()`, which `GetInfo` reports; and the
   factory calls in `postgresql.cc`.
 - `BindStream::SerializeCurrentRow()` is split out of

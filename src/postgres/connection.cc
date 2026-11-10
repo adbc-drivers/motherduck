@@ -92,8 +92,8 @@ static const char* kTablesQueryAll =
     "WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' END "
     "AS reltype FROM pg_catalog.pg_class c "
     "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-    "WHERE n.nspname = $1 AND c.relkind = "
-    "ANY($2)";
+    "WHERE n.nspname = $1 AND c.relkind::text = "
+    "ANY($2::text[])";
 
 // Parameterized on schema_name, table_name
 static const char* kColumnsQueryAll =
@@ -585,11 +585,16 @@ AdbcStatusCode PostgresConnection::GetInfo(struct AdbcConnection* connection,
   return ADBC_STATUS_OK;
 }
 
+std::unique_ptr<adbc::driver::GetObjectsHelper>
+PostgresConnection::MakeGetObjectsHelper() {
+  return std::make_unique<PostgresGetObjectsHelper>(conn_);
+}
+
 AdbcStatusCode PostgresConnection::GetObjects(
     struct AdbcConnection* connection, int c_depth, const char* catalog,
     const char* db_schema, const char* table_name, const char** table_type,
     const char* column_name, struct ArrowArrayStream* out, struct AdbcError* error) {
-  PostgresGetObjectsHelper helper(conn_);
+  std::unique_ptr<adbc::driver::GetObjectsHelper> helper = MakeGetObjectsHelper();
 
   const auto catalog_filter =
       catalog ? std::make_optional(std::string_view(catalog)) : std::nullopt;
@@ -630,9 +635,9 @@ AdbcStatusCode PostgresConnection::GetObjects(
 
   RAISE_ADBC(EnsureTransaction(error));
 
-  auto status = BuildGetObjects(&helper, depth, catalog_filter, schema_filter,
+  auto status = BuildGetObjects(helper.get(), depth, catalog_filter, schema_filter,
                                 table_filter, column_filter, table_type_filter, out);
-  RAISE_STATUS(error, helper.Close());
+  RAISE_STATUS(error, helper->Close());
   RAISE_STATUS(error, status);
 
   return ADBC_STATUS_OK;

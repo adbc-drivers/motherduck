@@ -30,7 +30,9 @@ add_library(adbc_driver_motherduck_impl STATIC
             postgres/type_resolver_init.cc
             motherduck/motherduck_connection.cc
             motherduck/motherduck_database.cc
+            motherduck/motherduck_error.cc
             motherduck/motherduck_factory.cc
+            motherduck/motherduck_get_objects.cc
             motherduck/motherduck_pipeline.cc
             motherduck/motherduck_redact.cc
             motherduck/motherduck_statement.cc

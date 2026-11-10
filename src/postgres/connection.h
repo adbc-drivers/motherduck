@@ -34,8 +34,13 @@
 
 #include "postgres_type.h"
 
+namespace adbc::driver {
+struct GetObjectsHelper;
+}  // namespace adbc::driver
+
 namespace adbcpq {
 class PostgresDatabase;
+
 class PostgresConnection {
  public:
   PostgresConnection()
@@ -64,15 +69,19 @@ class PostgresConnection {
                                  struct AdbcError* error);
   AdbcStatusCode GetOptionInt(const char* option, int64_t* value,
                               struct AdbcError* error);
-  AdbcStatusCode GetStatistics(const char* catalog, const char* db_schema,
-                               const char* table_name, bool approximate,
-                               struct ArrowArrayStream* out, struct AdbcError* error);
-  AdbcStatusCode GetStatisticNames(struct ArrowArrayStream* out, struct AdbcError* error);
-  AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
-                                const char* table_name, struct ArrowSchema* schema,
-                                struct AdbcError* error);
-  AdbcStatusCode GetTableTypes(struct AdbcConnection* connection,
-                               struct ArrowArrayStream* out, struct AdbcError* error);
+  virtual AdbcStatusCode GetStatistics(const char* catalog, const char* db_schema,
+                                       const char* table_name, bool approximate,
+                                       struct ArrowArrayStream* out,
+                                       struct AdbcError* error);
+  virtual AdbcStatusCode GetStatisticNames(struct ArrowArrayStream* out,
+                                           struct AdbcError* error);
+  virtual AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
+                                        const char* table_name,
+                                        struct ArrowSchema* schema,
+                                        struct AdbcError* error);
+  virtual AdbcStatusCode GetTableTypes(struct AdbcConnection* connection,
+                                       struct ArrowArrayStream* out,
+                                       struct AdbcError* error);
   AdbcStatusCode Init(struct AdbcDatabase* database, struct AdbcError* error);
   AdbcStatusCode Release(struct AdbcError* error);
   AdbcStatusCode Rollback(struct AdbcError* error);
@@ -90,6 +99,9 @@ class PostgresConnection {
   bool use_copy() const { return use_copy_; }
   std::string_view VendorName();
   const std::array<int, 3>& VendorVersion();
+
+ protected:
+  virtual std::unique_ptr<adbc::driver::GetObjectsHelper> MakeGetObjectsHelper();
 
  private:
   friend class PostgresStatement;
