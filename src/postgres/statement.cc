@@ -994,6 +994,7 @@ AdbcStatusCode PostgresStatement::SetOption(const char* key, const char* value,
     prepared_ = false;
   } else if (std::strcmp(key, ADBC_INGEST_OPTION_TEMPORARY) == 0) {
     if (std::strcmp(value, ADBC_OPTION_VALUE_ENABLED) == 0) {
+      RAISE_STATUS(error, CheckTemporaryIngest());
       // https://github.com/apache/arrow-adbc/issues/1109: only clear the
       // schema if enabling since Python always sets the flag explicitly
       ingest_.temporary = true;

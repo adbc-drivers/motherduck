@@ -3052,6 +3052,15 @@ TEST_F(PostgresStatementTest, SqlIngestAppendTargetLookupErrors) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&create.value, nullptr, nullptr, &error),
                 IsOkStatus(&error));
   }
+  // Drop the table however the test exits, including through a failed ASSERT.
+  struct OnExit {
+    std::function<void()> run;
+    ~OnExit() { run(); }
+  } drop_on_exit{[this]() {
+    struct AdbcError drop_error = {};
+    EXPECT_THAT(quirks()->DropTable(&connection, "ingest_lookup", &drop_error),
+                IsOkStatus(&drop_error));
+  }};
 
   auto append = [&](const char* db_schema, const char* target,
                     const char* column) -> AdbcStatusCode {
@@ -3101,9 +3110,6 @@ TEST_F(PostgresStatementTest, SqlIngestAppendTargetLookupErrors) {
                 ::testing::HasSubstr("COPY query failed"));
   }
   if (error.release) error.release(&error);
-
-  ASSERT_THAT(quirks()->DropTable(&connection, "ingest_lookup", &error),
-              IsOkStatus(&error));
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendIntegerIntoNumeric) {

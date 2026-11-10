@@ -73,6 +73,7 @@ class MotherduckStatement : public PostgresStatement {
   std::string ResultColumnName(std::string name) const override;
   bool SameColumnName(std::string_view table_column,
                       std::string_view source_column) const override;
+  Status CheckTemporaryIngest() const override;
 
  private:
   // The casts the last query was prepared with, if any
