@@ -1114,6 +1114,52 @@ TEST(PostgresCopyUtilsTest, PostgresCopyReadJsonbEmptyField) {
                     "Expected JSONB field with at least 1 byte");
 }
 
+TEST(PostgresCopyUtilsTest, PostgresCopyReadArrayInvalidDimensions) {
+  PostgresType input_type(PostgresTypeId::kInt4);
+  input_type = input_type.Array();
+  PostgresCopyArrayFieldReader reader;
+  reader.Init(input_type);
+  reader.InitChild(std::make_unique<PostgresCopyNetworkEndianFieldReader<int32_t>>());
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_EQ(ArrowSchemaInitFromType(schema.get(), NANOARROW_TYPE_LIST), NANOARROW_OK);
+  ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT32), NANOARROW_OK);
+  ASSERT_EQ(reader.InitSchema(schema.get()), NANOARROW_OK);
+
+  // n_dim, flags, element oid, then (dim_size, lower_bound) pairs
+  auto be32 = [](std::vector<uint8_t>* v, uint32_t x) {
+    for (int shift = 24; shift >= 0; shift -= 8) v->push_back((x >> shift) & 0xff);
+  };
+
+  // Three dimensions of INT32_MAX multiply past INT64_MAX; negative dim_size
+  for (std::vector<int32_t> dims : {std::vector<int32_t>{INT32_MAX, INT32_MAX, INT32_MAX},
+                                    std::vector<int32_t>{-1}}) {
+    nanoarrow::UniqueArray array;
+    ASSERT_EQ(ArrowArrayInitFromSchema(array.get(), schema.get(), nullptr), NANOARROW_OK);
+    ASSERT_EQ(ArrowArrayStartAppending(array.get()), NANOARROW_OK);
+    ASSERT_EQ(reader.InitArray(array.get()), NANOARROW_OK);
+
+    std::vector<uint8_t> buf;
+    be32(&buf, static_cast<uint32_t>(dims.size()));
+    be32(&buf, 0);
+    be32(&buf, 23);
+    for (int32_t d : dims) {
+      be32(&buf, static_cast<uint32_t>(d));
+      be32(&buf, 1);
+    }
+
+    ArrowBufferView data;
+    data.data.as_uint8 = buf.data();
+    data.size_bytes = buf.size();
+    ArrowError error;
+    ASSERT_EQ(reader.Read(&data, static_cast<int32_t>(buf.size()), array.get(), &error),
+              EINVAL);
+    ASSERT_NE(std::string(error.message).find("Invalid array dimension"),
+              std::string::npos)
+        << error.message;
+  }
+}
+
 // N.B. unfortunately testing with NUMERIC is difficult since we can't add all
 // that much to the buffer on each iteration, so the unit test takes too long
 

@@ -536,7 +536,8 @@ class PostgresCopyJsonbFieldReader : public PostgresCopyFieldReader {
     // The version byte is part of the field; without it the payload size
     // below would be negative
     if (field_size_bytes < 1) {
-      ArrowErrorSet(error, "Expected JSONB field with at least 1 byte but found 0 bytes");
+      ArrowErrorSet(error, "Expected JSONB field with at least 1 byte but found %d bytes",
+                    static_cast<int>(field_size_bytes));  // NOLINT(runtime/int)
       return EINVAL;
     }
 
@@ -552,7 +553,7 @@ class PostgresCopyJsonbFieldReader : public PostgresCopyFieldReader {
     if (version != 1) {
       ArrowErrorSet(error, "Expected JSONB binary version 0x01 but got %d",
                     static_cast<int>(version));
-      return NANOARROW_OK;
+      return EINVAL;
     }
 
     field_size_bytes -= 1;
@@ -627,7 +628,11 @@ class PostgresCopyArrayFieldReader : public PostgresCopyFieldReader {
     for (int32_t i = 0; i < n_dim; i++) {
       int32_t dim_size;
       NANOARROW_RETURN_NOT_OK(ReadChecked<int32_t>(data, &dim_size, error));
-      n_items *= dim_size;
+      if (dim_size < 0 || !psnip_safe_int64_mul(&n_items, n_items, dim_size)) {
+        ArrowErrorSet(error, "Invalid array dimension size %d",
+                      static_cast<int>(dim_size));  // NOLINT(runtime/int)
+        return EINVAL;
+      }
 
       int32_t lower_bound;
       NANOARROW_RETURN_NOT_OK(ReadChecked<int32_t>(data, &lower_bound, error));
