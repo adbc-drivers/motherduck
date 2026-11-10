@@ -871,12 +871,9 @@ class PostgresCopyJsonbFieldWriter : public PostgresCopyFieldWriter {
  public:
   ArrowErrorCode Write(ArrowBuffer* buffer, int64_t index, ArrowError* error) override {
     struct ArrowBufferView buffer_view = ArrowArrayViewGetBytesUnsafe(array_view_, index);
+    // The wire length is the value plus the one-byte jsonb version
     NANOARROW_RETURN_NOT_OK(
-        CheckWireLength(buffer_view.size_bytes, "JSON value", index, error));
-    if (buffer_view.size_bytes >= (std::numeric_limits<int32_t>::max)()) {
-      ArrowErrorSet(error, "[libpq] JSON value at row %" PRId64 " is too large", index);
-      return EOVERFLOW;
-    }
+        CheckWireLength(buffer_view.size_bytes + 1, "JSON value", index, error));
 
     const int32_t field_size_bytes = static_cast<int32_t>(buffer_view.size_bytes) + 1;
     constexpr int8_t kJsonbVersion = 1;
@@ -971,6 +968,8 @@ class PostgresCopyListFieldWriter : public PostgresCopyFieldWriter {
       } else {
         NANOARROW_RETURN_NOT_OK(child_->Write(tmp.get(), i, error));
       }
+      // Fail early rather than buffering a payload that can't be sent
+      NANOARROW_RETURN_NOT_OK(CheckWireLength(tmp->size_bytes, "List", index, error));
     }
     const int64_t field_size_bytes = sizeof(ndim) + sizeof(has_null_flags) +
                                      sizeof(child_oid_) + sizeof(dim) * ndim +

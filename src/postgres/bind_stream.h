@@ -23,6 +23,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
@@ -350,10 +351,15 @@ struct BindStream {
     if (!write_status.ok()) {
       // End the COPY so the connection leaves COPY_IN and can run more queries;
       // the server discards the rows sent so far.
-      if (PQputCopyEnd(pg_conn, "ADBC bulk ingest failed") > 0) {
-        while (PGresult* result = PQgetResult(pg_conn)) PQclear(result);
-      }
       if (rows_affected) *rows_affected = 0;
+      if (PQputCopyEnd(pg_conn, "ADBC bulk ingest failed") <= 0) {
+        // The connection is still in COPY_IN; say so rather than hiding it
+        // behind a confusing error on the next statement.
+        return Status::IO(write_status.message(),
+                          " (additionally, failed to end COPY: ", PQerrorMessage(pg_conn),
+                          ")");
+      }
+      while (PGresult* result = PQgetResult(pg_conn)) PQclear(result);
       return write_status;
     }
 
@@ -387,6 +393,7 @@ struct BindStream {
 
     UNWRAP_NANOARROW(na_error, Internal, writer.WriteHeader(&na_error));
 
+    na_error.message[0] = '\0';
     while (true) {
       UNWRAP_STATUS(PullNextArray());
       if (!current->release) break;
@@ -401,7 +408,9 @@ struct BindStream {
 
       // check if not ENODATA at exit
       if (write_result != ENODATA) {
-        return Status::IO("Error occurred writing COPY data: ", na_error.message);
+        return Status::IO("Error occurred writing COPY data: ",
+                          na_error.message[0] != '\0' ? na_error.message
+                                                      : std::strerror(write_result));
       }
 
       UNWRAP_STATUS(FlushCopyWriterToConn(pg_conn, writer));
