@@ -1498,6 +1498,73 @@ TEST_F(PostgresConnectionTest, MetadataGetSchemaCaseSensitiveTable) {
   // Do we have to release the connection here?
 }
 
+// Names with dots, quotes and spaces resolve however they're cased, and the
+// endpoint's ::regclass, which can't parse them, isn't involved (#13).
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaQuotedNames) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+
+  auto execute = [&](const char* query) {
+    adbc_validation::Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcStatementNew(&connection, &statement.value, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, query, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  };
+  constexpr const char* kDropSchema =
+      "DROP SCHEMA IF EXISTS \"Odd.Schema \"\"x\"\"\" CASCADE";
+  ASSERT_NO_FATAL_FAILURE(execute(kDropSchema));
+  ASSERT_NO_FATAL_FAILURE(execute("CREATE SCHEMA \"Odd.Schema \"\"x\"\"\""));
+  ASSERT_NO_FATAL_FAILURE(
+      execute("CREATE TABLE \"Odd.Schema \"\"x\"\"\".\"Odd.Table \"\"y\"\"\" "
+              "(ints INT, \"str col\" TEXT)"));
+
+  // DuckDB identifiers are case-insensitive, so other cases find the table too.
+  const std::string catalog = quirks()->catalog();
+  std::string upper_catalog = catalog;
+  for (char& c : upper_catalog) c = static_cast<char>(std::toupper(c));
+  struct Name {
+    const char* catalog;
+    const char* db_schema;
+    const char* table;
+  };
+  for (const Name& name : {
+           Name{nullptr, "Odd.Schema \"x\"", "Odd.Table \"y\""},
+           Name{catalog.c_str(), "Odd.Schema \"x\"", "Odd.Table \"y\""},
+           Name{upper_catalog.c_str(), "ODD.SCHEMA \"X\"", "odd.table \"Y\""},
+       }) {
+    SCOPED_TRACE(std::string(name.db_schema) + " / " + name.table);
+    nanoarrow::UniqueSchema schema;
+    ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, name.catalog, name.db_schema,
+                                             name.table, schema.get(), &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(schema->n_children, 2);
+    ASSERT_STREQ(schema->children[0]->format, "i");
+    ASSERT_STREQ(schema->children[0]->name, "ints");
+    ASSERT_STREQ(schema->children[1]->format, "u");
+    ASSERT_STREQ(schema->children[1]->name, "str col");
+  }
+
+  for (const Name& name : {
+           // Not in the current schema.
+           Name{nullptr, nullptr, "Odd.Table \"y\""},
+           // Not in another catalog.
+           Name{"no_such_catalog", "Odd.Schema \"x\"", "Odd.Table \"y\""},
+           // Not a relation at all.
+           Name{nullptr, nullptr, "(SELECT CURRENT_TIME)"},
+       }) {
+    SCOPED_TRACE(name.table);
+    nanoarrow::UniqueSchema schema;
+    ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, name.catalog, name.db_schema,
+                                             name.table, schema.get(), &error),
+                IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  }
+
+  ASSERT_NO_FATAL_FAILURE(execute(kDropSchema));
+}
+
 // DuckDB identifiers are case-insensitive, even quoted ones, so a lookup in
 // another case finds the table.
 TEST_F(PostgresConnectionTest, MetadataGetTableSchemaIgnoresCase) {
@@ -2969,7 +3036,84 @@ TEST_F(PostgresStatementTest, SqlIngestTemporaryTable) {
   }
 }
 
+// Appending looks up the target's column types before COPY, so these errors
+// surface even without COPY FROM STDIN (#13).
+TEST_F(PostgresStatementTest, SqlIngestAppendTargetLookupErrors) {
+  ASSERT_THAT(quirks()->DropTable(&connection, "no_such_ingest_table", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "ingest_lookup", &error),
+              IsOkStatus(&error));
+  {
+    adbc_validation::Handle<struct AdbcStatement> create;
+    ASSERT_THAT(AdbcStatementNew(&connection, &create.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(
+                    &create.value, "CREATE TABLE ingest_lookup (amount BIGINT)", &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&create.value, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
+  // Drop the table however the test exits, including through a failed ASSERT.
+  struct OnExit {
+    std::function<void()> run;
+    ~OnExit() { run(); }
+  } drop_on_exit{[this]() {
+    struct AdbcError drop_error = {};
+    EXPECT_THAT(quirks()->DropTable(&connection, "ingest_lookup", &drop_error),
+                IsOkStatus(&drop_error));
+  }};
+
+  auto append = [&](const char* db_schema, const char* target,
+                    const char* column) -> AdbcStatusCode {
+    adbc_validation::Handle<struct ArrowSchema> schema;
+    adbc_validation::Handle<struct ArrowArray> batch;
+    ArrowSchemaInit(&schema.value);
+    EXPECT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
+    EXPECT_THAT(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64),
+                adbc_validation::IsOkErrno());
+    EXPECT_THAT(ArrowSchemaSetName(schema->children[0], column),
+                adbc_validation::IsOkErrno());
+    EXPECT_THAT(
+        (adbc_validation::MakeBatch<int64_t>(
+            &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr), {1})),
+        adbc_validation::IsOkErrno());
+
+    adbc_validation::Handle<struct AdbcStatement> stmt;
+    EXPECT_THAT(AdbcStatementNew(&connection, &stmt.value, &error), IsOkStatus(&error));
+    EXPECT_THAT(AdbcStatementSetOption(&stmt.value, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                       target, &error),
+                IsOkStatus(&error));
+    if (db_schema != nullptr) {
+      EXPECT_THAT(AdbcStatementSetOption(&stmt.value, ADBC_INGEST_OPTION_TARGET_DB_SCHEMA,
+                                         db_schema, &error),
+                  IsOkStatus(&error));
+    }
+    EXPECT_THAT(AdbcStatementSetOption(&stmt.value, ADBC_INGEST_OPTION_MODE,
+                                       ADBC_INGEST_OPTION_MODE_APPEND, &error),
+                IsOkStatus(&error));
+    EXPECT_THAT(AdbcStatementBind(&stmt.value, &batch.value, &schema.value, &error),
+                IsOkStatus(&error));
+    return AdbcStatementExecuteQuery(&stmt.value, nullptr, nullptr, &error);
+  };
+
+  ASSERT_THAT(append(nullptr, "no_such_ingest_table", "amount"),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  ASSERT_THAT(append("no_such_ingest_schema", "ingest_lookup", "amount"),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  ASSERT_THAT(append(nullptr, "ingest_lookup", "not_a_column"),
+              IsStatus(ADBC_STATUS_ALREADY_EXISTS, &error));
+
+  // DuckDB column names ignore case, so a differently cased column passes the
+  // lookup; if the append still fails, it's at COPY FROM STDIN, which the
+  // endpoint lacks (#31).
+  if (append(nullptr, "INGEST_LOOKUP", "AMOUNT") != ADBC_STATUS_OK) {
+    EXPECT_THAT(error.message ? error.message : "",
+                ::testing::HasSubstr("COPY query failed"));
+  }
+  if (error.release) error.release(&error);
+}
+
 TEST_F(PostgresStatementTest, SqlIngestAppendIntegerIntoNumeric) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->DropTable(&connection, "numeric_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -3026,6 +3170,7 @@ TEST_F(PostgresStatementTest, SqlIngestAppendIntegerIntoNumeric) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendIntegerListIntoNumericArray) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->DropTable(&connection, "numeric_array_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -3080,6 +3225,7 @@ TEST_F(PostgresStatementTest, SqlIngestAppendIntegerListIntoNumericArray) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendIntegerBoundsIntoNumeric) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->DropTable(&connection, "numeric_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));

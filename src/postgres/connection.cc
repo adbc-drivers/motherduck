@@ -1125,6 +1125,15 @@ AdbcStatusCode PostgresConnection::GetTableSchema(const char* catalog,
   return final_status;
 }
 
+Status PostgresConnection::DescribeTable(const std::string& qualified_name,
+                                         PostgresType* columns) {
+  // Without parameters, Execute sends one simple query, whose result still
+  // describes the columns.
+  PqResultHelper helper{conn_, "SELECT * FROM " + qualified_name + " LIMIT 0"};
+  UNWRAP_STATUS(helper.Execute());
+  return helper.ResolveOutputTypes(*type_resolver_, columns);
+}
+
 AdbcStatusCode PostgresConnection::GetTableTypes(struct AdbcConnection* connection,
                                                  struct ArrowArrayStream* out,
                                                  struct AdbcError* error) {
