@@ -342,17 +342,22 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   }
   PQconninfoFree(conninfo);
 
+  bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
   // On Windows the driver reads the process environment, but libpq reads its
   // own C runtime copy, which can be stale. Pass the TLS settings the driver
-  // acts on, so libpq uses the same ones.
-  if (uri_sslmode.empty()) {
-    if (std::string env = GetEnv("PGSSLMODE"); !env.empty()) {
-      params->emplace_back("sslmode", std::move(env));
+  // acts on, so libpq uses the same ones. With a named service the driver
+  // doesn't act on them, and passing them would make them override the
+  // service file's, which libpq ranks above the environment.
+  if (!names_service) {
+    if (uri_sslmode.empty()) {
+      if (std::string env = GetEnv("PGSSLMODE"); !env.empty()) {
+        params->emplace_back("sslmode", std::move(env));
+      }
     }
-  }
-  if (uri_sslrootcert.empty()) {
-    if (std::string env = GetEnv("PGSSLROOTCERT"); !env.empty()) {
-      params->emplace_back("sslrootcert", std::move(env));
+    if (uri_sslrootcert.empty()) {
+      if (std::string env = GetEnv("PGSSLROOTCERT"); !env.empty()) {
+        params->emplace_back("sslrootcert", std::move(env));
+      }
     }
   }
 
@@ -369,7 +374,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
     // libpq fills unset settings, including hostaddr, from a connection service.
-    if (!uri_service.empty() || !GetEnv("PGSERVICE").empty()) {
+    if (names_service) {
       InternalAdbcSetError(error,
                            "[libpq] Database option '%s' can't be used with a "
                            "connection service (service in the URI, or PGSERVICE)",
@@ -384,7 +389,6 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   // Certificate verification still needs sslmode=verify-full (#34). A named
   // service may set sslmode itself, which this would override; with a region,
   // a service is already an error.
-  bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
   if (!names_service && DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
     params->emplace_back("sslmode", "require");
   }

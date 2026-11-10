@@ -436,6 +436,20 @@ TEST_F(MotherDuckConnectParamsTest, KeepsServiceSslmode) {
   EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
 }
 
+TEST_F(MotherDuckConnectParamsTest, ServiceOutranksTlsEnv) {
+  // libpq ranks a service file above PGSSLMODE and PGSSLROOTCERT, so passing
+  // them explicitly would override the service's settings.
+  ScopedEnv pgsslmode("PGSSLMODE", "prefer");
+  ScopedEnv pgsslrootcert("PGSSLROOTCERT", "/tmp/root.crt");
+  SetOption("uri", "service=md dbname=db");
+  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+  EXPECT_THAT(Values("sslrootcert"), ::testing::IsEmpty());
+  ScopedEnv pgservice("PGSERVICE", "md");
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+  EXPECT_THAT(Values("sslrootcert"), ::testing::IsEmpty());
+}
+
 // Every combination of region, sslmode (URI and PGSSLMODE) and sslrootcert
 // source. The URI's sslmode passes through unchanged. The driver adds
 // sslmode=require, with or without a region, only when nothing else sets
