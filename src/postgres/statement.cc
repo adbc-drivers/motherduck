@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <cstring>
@@ -406,8 +407,14 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
     return ADBC_STATUS_INVALID_STATE;
   }
 
+  // The unescaped catalog and schema of the target table, to look up the types
+  // of its existing columns.
+  const char* lookup_catalog = nullptr;
+  std::string lookup_schema;
+
   {
     if (!ingest_.db_schema.empty()) {
+      lookup_schema = ingest_.db_schema;
       char* escaped =
           PQescapeIdentifier(conn, ingest_.db_schema.c_str(), ingest_.db_schema.size());
       if (escaped == nullptr) {
@@ -420,9 +427,13 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
       *escaped_table += " . ";
       PQfreemem(escaped);
     } else if (ingest_.temporary) {
+      // DuckDB keeps temporary tables in temp.main.
+      lookup_catalog = "temp";
+      lookup_schema = "main";
       // OK to be redundant (CREATE TEMPORARY TABLE pg_temp.foo)
       *escaped_table += "pg_temp . ";
     } else {
+      lookup_schema = current_schema;
       // Explicitly specify the current schema to avoid any temporary tables
       // shadowing this table
       char* escaped =
@@ -513,8 +524,9 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
   }
 
   if (ingest_.mode == IngestMode::kAppend) {
-    AdbcStatusCode status = ResolveCopyTargetTypes(*escaped_table, source_field_names,
-                                                   copy_target_types, error);
+    AdbcStatusCode status =
+        ResolveCopyTargetTypes(lookup_catalog, lookup_schema, ingest_.target,
+                               source_field_names, copy_target_types, error);
     if (status != ADBC_STATUS_OK) {
       return status;
     }
@@ -538,8 +550,9 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
   }
   PQclear(result);
   if (ingest_.mode == IngestMode::kCreateAppend) {
-    AdbcStatusCode status = ResolveCopyTargetTypes(*escaped_table, source_field_names,
-                                                   copy_target_types, error);
+    AdbcStatusCode status =
+        ResolveCopyTargetTypes(lookup_catalog, lookup_schema, ingest_.target,
+                               source_field_names, copy_target_types, error);
     if (status != ADBC_STATUS_OK) {
       return status;
     }
@@ -549,31 +562,31 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
 }
 
 AdbcStatusCode PostgresStatement::ResolveCopyTargetTypes(
-    const std::string& escaped_table, const std::vector<std::string>& source_field_names,
-    PostgresType* copy_target_types, struct AdbcError* error) {
-  PqResultHelper result_helper{connection_->conn(),
-                               "SELECT attr.attname, attr.atttypid "
-                               "FROM pg_catalog.pg_attribute AS attr "
-                               "WHERE attr.attrelid = $1::regclass::oid "
-                               "AND attr.attnum > 0 AND NOT attr.attisdropped"};
-  RAISE_STATUS(error, result_helper.Execute({escaped_table}));
+    const char* catalog, const std::string& db_schema, const std::string& table,
+    const std::vector<std::string>& source_field_names, PostgresType* copy_target_types,
+    struct AdbcError* error) {
+  std::vector<std::pair<std::string, Oid>> table_fields;
+  RAISE_STATUS(error, connection_->GetTableColumns(catalog, db_schema.c_str(),
+                                                   table.c_str(), &table_fields));
 
-  std::vector<std::pair<std::string, uint32_t>> table_fields;
-  table_fields.reserve(result_helper.NumRows());
-  for (auto row : result_helper) {
-    table_fields.emplace_back(
-        row[0].data, static_cast<uint32_t>(std::strtol(row[1].data, /*str_end=*/nullptr,
-                                                       /*base=*/10)));
-  }
+  // DuckDB column names are case-insensitive, as GetTableColumns' table lookup is.
+  auto same_name = [](std::string_view a, std::string_view b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+             return std::tolower(static_cast<unsigned char>(x)) ==
+                    std::tolower(static_cast<unsigned char>(y));
+           });
+  };
 
   *copy_target_types = PostgresType(PostgresTypeId::kRecord);
   for (const auto& field_name : source_field_names) {
-    auto it = std::find_if(table_fields.begin(), table_fields.end(),
-                           [&](const auto& item) { return item.first == field_name; });
+    auto it =
+        std::find_if(table_fields.begin(), table_fields.end(),
+                     [&](const auto& item) { return same_name(item.first, field_name); });
     if (it == table_fields.end()) {
       InternalAdbcSetError(error,
-                           "[libpq] Column \"%s\" does not exist in target table %s",
-                           field_name.c_str(), escaped_table.c_str());
+                           "[libpq] Column \"%s\" does not exist in target table \"%s\"",
+                           field_name.c_str(), table.c_str());
       return ADBC_STATUS_ALREADY_EXISTS;
     }
 

@@ -27,10 +27,12 @@ from pathlib import Path
 
 from adbc_drivers_validation import model, quirks
 
-# MotherDuck says `Table with name foo does not exist!`, or for a failed
-# `::regclass` cast, `relation "foo" does not exist`.
+# MotherDuck says `Table with name foo does not exist!`, or
+# `relation "foo" does not exist`; the driver's own table lookups say
+# `Table not found: "main"."foo"`, with each name quoted.
 _TABLE_NOT_FOUND = re.compile(
-    r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
+    r'(?:(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
+    r'|table not found: ((?:"(?:[^"]|"")*"\.?)+))'
 )
 
 _database_args = {
@@ -111,7 +113,8 @@ class PostgreSQLQuirks(model.DriverQuirks):
         # into the error, which may mention "table" and the table's name.
         match = _TABLE_NOT_FOUND.search(str(error).lower())
         return match is not None and (
-            table_name is None or table_name.lower() in match.group(1)
+            table_name is None
+            or table_name.lower() in (match.group(1) or match.group(2))
         )
 
     def quote_one_identifier(self, identifier: str) -> str:

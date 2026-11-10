@@ -1062,40 +1062,18 @@ AdbcStatusCode PostgresConnection::GetTableSchema(const char* catalog,
 
   AdbcStatusCode final_status = ADBC_STATUS_OK;
 
-  char* quoted = PQescapeIdentifier(conn_, table_name, strlen(table_name));
-  std::string table_name_str(quoted);
-  PQfreemem(quoted);
-
-  if (db_schema != nullptr) {
-    quoted = PQescapeIdentifier(conn_, db_schema, strlen(db_schema));
-    table_name_str = std::string(quoted) + "." + table_name_str;
-    PQfreemem(quoted);
-  }
-
-  std::string query =
-      "SELECT attname, atttypid "
-      "FROM pg_catalog.pg_class AS cls "
-      "INNER JOIN pg_catalog.pg_attribute AS attr ON cls.oid = attr.attrelid "
-      "INNER JOIN pg_catalog.pg_type AS typ ON attr.atttypid = typ.oid "
-      "WHERE attr.attnum >= 0 AND cls.oid = $1::regclass::oid "
-      "ORDER BY attr.attnum";
-
-  std::vector<std::string> params = {table_name_str};
-
-  PqResultHelper result_helper = PqResultHelper{conn_, std::string(query.c_str())};
-
-  RAISE_STATUS(error, result_helper.Execute(params));
+  std::vector<std::pair<std::string, Oid>> columns;
+  RAISE_STATUS(error, GetTableColumns(catalog, db_schema, table_name, &columns));
 
   auto uschema = nanoarrow::UniqueSchema();
   ArrowSchemaInit(uschema.get());
-  CHECK_NA(INTERNAL, ArrowSchemaSetTypeStruct(uschema.get(), result_helper.NumRows()),
+  CHECK_NA(INTERNAL,
+           ArrowSchemaSetTypeStruct(uschema.get(), static_cast<int64_t>(columns.size())),
            error);
 
   int row_counter = 0;
-  for (auto row : result_helper) {
-    const char* colname = row[0].data;
-    const Oid pg_oid =
-        static_cast<uint32_t>(std::strtol(row[1].data, /*str_end=*/nullptr, /*base=*/10));
+  for (const auto& [colname_str, pg_oid] : columns) {
+    const char* colname = colname_str.c_str();
 
     PostgresType pg_type;
     if (type_resolver_->FindWithDefault(pg_oid, &pg_type) != NANOARROW_OK) {
@@ -1114,6 +1092,86 @@ AdbcStatusCode PostgresConnection::GetTableSchema(const char* catalog,
   uschema.move(schema);
 
   return final_status;
+}
+
+namespace {
+// Quote an identifier for messages, doubling embedded quotes.
+std::string QuoteForMessage(std::string_view identifier) {
+  std::string quoted = "\"";
+  for (char c : identifier) {
+    if (c == '"') quoted += '"';
+    quoted += c;
+  }
+  quoted += '"';
+  return quoted;
+}
+}  // namespace
+
+Status PostgresConnection::GetTableColumns(
+    const char* catalog, const char* db_schema, const char* table_name,
+    std::vector<std::pair<std::string, Oid>>* columns) {
+  if (table_name == nullptr) {
+    return Status::InvalidArgument("[libpq] Must provide a table name");
+  }
+
+  // Match on names rather than casting a qualified name with ::regclass:
+  // MotherDuck's regclass can't parse quoted, qualified names (#13). pg_catalog
+  // OIDs are only stable within a query, so this resolves them in one query.
+  // pg_namespace doesn't say which database a schema belongs to, so join
+  // duckdb_schemas() for that.
+  //
+  // DuckDB identifiers are case-insensitive, even quoted ones, and two names
+  // can't differ only by case, so compare them case-insensitively as regclass
+  // did.
+  std::vector<std::string> params = {table_name};
+  std::string query =
+      "SELECT attr.attname, attr.atttypid "
+      "FROM pg_catalog.pg_attribute AS attr "
+      "INNER JOIN pg_catalog.pg_class AS cls ON cls.oid = attr.attrelid "
+      "INNER JOIN pg_catalog.pg_namespace AS nsp ON nsp.oid = cls.relnamespace "
+      "INNER JOIN duckdb_schemas() AS sch ON sch.oid = nsp.oid "
+      "WHERE lower(cls.relname) = lower($1) ";
+  if (db_schema != nullptr) {
+    params.emplace_back(db_schema);
+    query += fmt::format("AND lower(nsp.nspname) = lower(${}) ", params.size());
+  } else {
+    query += "AND nsp.nspname = current_schema() ";
+  }
+  if (catalog != nullptr) {
+    params.emplace_back(catalog);
+    query += fmt::format("AND lower(sch.database_name) = lower(${}) ", params.size());
+  } else {
+    query += "AND sch.database_name = current_database() ";
+  }
+  query +=
+      "AND attr.attnum > 0 AND NOT attr.attisdropped "
+      "ORDER BY attr.attnum";
+
+  PqResultHelper result_helper{conn_, std::move(query)};
+  UNWRAP_STATUS(result_helper.Execute(params));
+
+  columns->clear();
+  columns->reserve(result_helper.NumRows());
+  for (auto row : result_helper) {
+    columns->emplace_back(
+        row[0].data,
+        static_cast<Oid>(std::strtoul(row[1].data, /*str_end=*/nullptr, /*base=*/10)));
+  }
+
+  if (columns->empty()) {
+    std::string name = QuoteForMessage(table_name);
+    if (db_schema != nullptr) name = QuoteForMessage(db_schema) + "." + name;
+    if (catalog != nullptr) {
+      // MotherDuck's pg_catalog only covers the database the connection is
+      // attached to, so tables in other databases can't be looked up.
+      return Status::NotFound("[libpq] Table not found: ", QuoteForMessage(catalog), ".",
+                              name,
+                              " (only tables in the connected database can be "
+                              "looked up)");
+    }
+    return Status::NotFound("[libpq] Table not found: ", name);
+  }
+  return Status::Ok();
 }
 
 AdbcStatusCode PostgresConnection::GetTableTypes(struct AdbcConnection* connection,

@@ -32,6 +32,7 @@
 #include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
 
+#include "driver/framework/status.h"
 #include "postgres_type.h"
 
 namespace adbcpq {
@@ -90,6 +91,18 @@ class PostgresConnection {
   bool use_copy() const { return use_copy_; }
   std::string_view VendorName();
   const std::array<int, 3>& VendorVersion();
+
+  /// \brief Look up the columns of a table or view by name.
+  ///
+  /// Matches the catalog, schema and table names exactly, rather than parsing a
+  /// qualified name with ::regclass, which MotherDuck can't do for quoted names.
+  /// A null catalog or db_schema means the current one.
+  ///
+  /// \param[out] columns The (name, type OID) of each column, in column order.
+  /// \return NOT_FOUND if there is no such table or view.
+  adbc::driver::Status GetTableColumns(const char* catalog, const char* db_schema,
+                                       const char* table_name,
+                                       std::vector<std::pair<std::string, Oid>>* columns);
 
  private:
   friend class PostgresStatement;
