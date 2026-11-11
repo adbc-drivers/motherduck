@@ -73,7 +73,7 @@ AdbcStatusCode ClassifySqlState(const char* sqlstate);
 using QueryRedactor = std::string (*)(std::string_view query);
 
 /// Longest SQL text kept in an error message; the rest is cut before redaction.
-constexpr size_t kMaxQueryBytes = 64 * 1024;
+constexpr size_t kMaxQueryBytes = 512 * 1024;
 /// Longest server text (messages and diagnostic fields) kept in an error.
 constexpr size_t kMaxMessageBytes = 8192;
 

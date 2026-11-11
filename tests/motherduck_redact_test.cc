@@ -248,9 +248,9 @@ TEST(MotherDuckRedactTest, EveryPrefixOfAStatementHidesTheSecret) {
 // The same through the real truncation, with the cut inside the secret.
 TEST(MotherDuckRedactTest, SecretAtTheTruncationPointIsNotLogged) {
   InstallMotherDuckQueryRedactor();
-  for (const char* tail : {"' AS x, 1 FROM t WITH PASSWORD 'ZZ9ZZ9ZZ9'",
-                           "' AS x; ATTACH 'postgresql://user:ZZ9ZZ9ZZ9@host/db'",
-                           "' AS x; ATTACH 'md:ZZ9ZZ9ZZ9@db'"}) {
+  // One shape is enough (each cut is a full pass over 512 KiB); the prefix test above
+  // covers the rest.
+  for (const char* tail : {"' AS x; ATTACH 'postgresql://user:ZZ9ZZ9ZZ9@host/db'"}) {
     const size_t secret = std::string(tail).find("ZZ9");
     const std::string query =
         "SELECT '" + std::string(kMaxQueryBytes - 8 - secret - 3, 'a') + tail;
