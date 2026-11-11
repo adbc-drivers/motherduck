@@ -131,15 +131,10 @@ AdbcStatusCode MotherduckConnection::GetTableSchema(const char* catalog,
   std::string name;
   for (const char* part : {catalog, db_schema, table_name}) {
     if (part == nullptr) continue;
-    char* quoted = PQescapeIdentifier(conn(), part, std::strlen(part));
-    if (quoted == nullptr) {
-      InternalAdbcSetError(error, "[motherduck] Failed to quote '%s': %s", part,
-                           PqErrorText(nullptr, conn()).c_str());
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
+    std::string quoted;
+    RAISE_ADBC(EscapeIdentifier(conn(), part, &quoted, error));
     if (!name.empty()) name += ".";
     name += quoted;
-    PQfreemem(quoted);
   }
 
   // The name resolves as in any query: ignoring case and through the search
