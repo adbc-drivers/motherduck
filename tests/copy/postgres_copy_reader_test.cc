@@ -977,7 +977,99 @@ TEST(PostgresCopyUtilsTest, JsonbOverflow) {
   ArrowBufferView data;
   data.size_bytes = static_cast<int64_t>(buffer.size());
   data.data.data = buffer.data();
-  ASSERT_EQ(EOVERFLOW, reader.Read(&data, field_size_bytes, array.get(), nullptr));
+  ArrowError error;
+  error.message[0] = '\0';
+  ASSERT_EQ(EOVERFLOW, reader.Read(&data, field_size_bytes, array.get(), &error));
+  ASSERT_STRNE(error.message, "");
+}
+
+class PostgresCopyJsonbFieldReaderTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ASSERT_EQ(NANOARROW_OK,
+              ArrowSchemaInitFromType(schema_.get(), NANOARROW_TYPE_STRING));
+    ASSERT_EQ(NANOARROW_OK, ArrowArrayInitFromType(array_.get(), NANOARROW_TYPE_STRING));
+    ASSERT_EQ(NANOARROW_OK, ArrowArrayStartAppending(array_.get()));
+    ASSERT_EQ(NANOARROW_OK, reader_.InitSchema(schema_.get()));
+    ASSERT_EQ(NANOARROW_OK, reader_.InitArray(array_.get()));
+  }
+
+  // Reads one field of field_size_bytes from the first input_size bytes of
+  // buffer and expects EINVAL with a non-empty message and no value appended.
+  void ExpectInvalid(const uint8_t* buffer, int64_t input_size, int32_t field_size_bytes,
+                     const char* expected_message) {
+    ArrowBufferView data;
+    data.data.as_uint8 = buffer;
+    data.size_bytes = input_size;
+
+    ArrowError error;
+    error.message[0] = '\0';
+    EXPECT_EQ(EINVAL, reader_.Read(&data, field_size_bytes, array_.get(), &error));
+    EXPECT_STRNE(error.message, "");
+    EXPECT_STREQ(error.message, expected_message);
+    EXPECT_EQ(array_->length, 0);
+  }
+
+  nanoarrow::UniqueSchema schema_;
+  nanoarrow::UniqueArray array_;
+  PostgresCopyJsonbFieldReader reader_;
+};
+
+TEST_F(PostgresCopyJsonbFieldReaderTest, EmptyField) {
+  // A zero-length (non-NULL) value has no room for the version byte. The bytes
+  // after it belong to the next field and must not be consumed.
+  const uint8_t buffer[] = {0x01, '{', '}'};
+  ArrowBufferView data;
+  data.data.as_uint8 = buffer;
+  data.size_bytes = sizeof(buffer);
+
+  ArrowError error;
+  error.message[0] = '\0';
+  ASSERT_EQ(EINVAL, reader_.Read(&data, 0, array_.get(), &error));
+  ASSERT_STREQ(error.message,
+               "Expected JSONB field with at least 1 byte but found 0 bytes");
+  ASSERT_EQ(data.data.as_uint8, buffer);
+  ASSERT_EQ(data.size_bytes, static_cast<int64_t>(sizeof(buffer)));
+  ASSERT_EQ(array_->length, 0);
+}
+
+TEST_F(PostgresCopyJsonbFieldReaderTest, MissingVersionByte) {
+  const uint8_t buffer[] = {0x00};
+  ExpectInvalid(buffer, 0, 1, "Expected 1 bytes of field data but got 0 bytes of input");
+}
+
+TEST_F(PostgresCopyJsonbFieldReaderTest, WrongVersion) {
+  const uint8_t buffer[] = {0x02, '{', '}'};
+  ExpectInvalid(buffer, sizeof(buffer), sizeof(buffer),
+                "Expected JSONB binary version 0x01 but got 2");
+}
+
+TEST_F(PostgresCopyJsonbFieldReaderTest, LengthPastBuffer) {
+  const uint8_t buffer[] = {0x01, '[', '1'};
+  ExpectInvalid(buffer, sizeof(buffer), 10,
+                "Expected 10 bytes of field data but got 3 bytes of input");
+}
+
+TEST_F(PostgresCopyJsonbFieldReaderTest, ValidJsonb) {
+  // The trailing byte belongs to the next field and must be left in the input
+  const uint8_t buffer[] = {0x01, '{', '}', 0xff};
+  ArrowBufferView data;
+  data.data.as_uint8 = buffer;
+  data.size_bytes = sizeof(buffer);
+
+  ArrowError error;
+  ASSERT_EQ(NANOARROW_OK, reader_.Read(&data, 3, array_.get(), &error));
+  ASSERT_EQ(data.data.as_uint8, buffer + 3);
+  ASSERT_EQ(data.size_bytes, 1);
+  ASSERT_EQ(NANOARROW_OK, ArrowArrayFinishBuildingDefault(array_.get(), &error));
+
+  nanoarrow::UniqueArrayView view;
+  ASSERT_EQ(NANOARROW_OK,
+            ArrowArrayViewInitFromSchema(view.get(), schema_.get(), &error));
+  ASSERT_EQ(NANOARROW_OK, ArrowArrayViewSetArray(view.get(), array_.get(), &error));
+  ASSERT_EQ(view->length, 1);
+  ArrowStringView value = ArrowArrayViewGetStringUnsafe(view.get(), 0);
+  ASSERT_EQ(std::string(value.data, value.size_bytes), "{}");
 }
 
 // N.B. unfortunately testing with NUMERIC is difficult since we can't add all
