@@ -1259,23 +1259,6 @@ AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
     // PostgreSQL doesn't accept a parameter here
     std::string value_esc;
     RAISE_ADBC(EscapeIdentifier(conn_, value, &value_esc, error));
-
-    // DuckDB/MotherDuck resolves a bare search_path entry as a catalog name, so
-    // qualify a bare schema with the current database. A value that already
-    // contains a dot is passed through as before.
-    if (std::strchr(value, '.') == nullptr) {
-      PqResultHelper db_helper{conn_, "SELECT current_database()"};
-      RAISE_STATUS(error, db_helper.Execute());
-      auto it = db_helper.begin();
-      if (it == db_helper.end()) {
-        InternalAdbcSetError(
-            error, "[libpq] PostgreSQL returned no rows for 'SELECT current_database()'");
-        return ADBC_STATUS_INTERNAL;
-      }
-      std::string db_esc;
-      RAISE_ADBC(EscapeIdentifier(conn_, (*it)[0].data, &db_esc, error));
-      value_esc = db_esc + "." + value_esc;
-    }
     std::string query = fmt::format("SET search_path TO {}", value_esc);
 
     PqResultHelper result_helper{conn_, query};

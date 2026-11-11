@@ -55,6 +55,11 @@ class MotherduckConnection : public PostgresConnection {
   AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
                                 const char* table_name, struct ArrowSchema* schema,
                                 struct AdbcError* error) override;
+  /// Sets the current schema with SET search_path. MotherDuck resolves a bare
+  /// search_path entry as a catalog, so a db_schema without a dot is qualified
+  /// with the current database. A value with a dot is passed to the base as is.
+  AdbcStatusCode SetOption(const char* key, const char* value,
+                           struct AdbcError* error) override;
   /// The table types MotherDuck's GetObjects reports: table and view.
   AdbcStatusCode GetTableTypes(struct AdbcConnection* connection,
                                struct ArrowArrayStream* out,
