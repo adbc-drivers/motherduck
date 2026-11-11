@@ -5255,7 +5255,8 @@ TEST_F(PostgresStatementTest, SetUseCopyFalse) {
                                         &reader.rows_affected, &error),
               IsOkStatus(&error));
 
-  ASSERT_EQ(reader.rows_affected, 3);
+  // The result is streamed, so the count is not known when ExecuteQuery returns.
+  ASSERT_EQ(reader.rows_affected, -1);
 
   reader.GetSchema();
   ASSERT_EQ(reader.schema->n_children, 1);

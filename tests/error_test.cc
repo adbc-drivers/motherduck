@@ -122,9 +122,9 @@ TEST(PostgresConnectionUnitTest, GetTableSchemaNullTableName) {
 TEST(PostgresConnectionUnitTest, SetCurrentSchemaNull) {
   PostgresConnection connection;
   struct AdbcError error = ADBC_ERROR_INIT;
-  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
-            connection.SetOption(ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA, nullptr,
-                                 &error));
+  EXPECT_EQ(
+      ADBC_STATUS_INVALID_ARGUMENT,
+      connection.SetOption(ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA, nullptr, &error));
   ASSERT_NE(nullptr, error.message);
   EXPECT_NE(nullptr, std::strstr(error.message, "requires a value")) << error.message;
   if (error.release) error.release(&error);
