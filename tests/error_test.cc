@@ -41,8 +41,11 @@ TEST(PostgresErrorTest, RedactQueryTruncates) {
   const std::string long_query = "SELECT '" + std::string(kMaxQueryBytes, 'a') + "'";
   const std::string out = RedactQuery(long_query);
   EXPECT_EQ(out, long_query.substr(0, kMaxQueryBytes) + "... [truncated]");
-  // Server text gets a larger cap.
-  EXPECT_EQ(RedactMessage(long_query), long_query);
+  // Server text has its own cap.
+  const std::string long_message(kMaxMessageBytes + 1, 'a');
+  EXPECT_EQ(RedactMessage(long_message),
+            long_message.substr(0, kMaxMessageBytes) + "... [truncated]");
+  EXPECT_EQ(RedactMessage("short"), "short");
 }
 
 TEST(PostgresErrorTest, RedactQueryKeepsUtf8Intact) {

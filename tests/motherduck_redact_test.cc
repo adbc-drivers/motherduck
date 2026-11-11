@@ -89,6 +89,9 @@ TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
       "SELECT '{\"password\": \"ZZ9\"}'",
       // DuckDB: Parquet and database file encryption.
       "PRAGMA add_parquet_key('key128', 'ZZ9')",
+      "SET key = 'ZZ9'",
+      "SELECT '{\"key\": \"ZZ9\"}'",
+      "COPY t TO 'f' (KEY 'ZZ9')",
       "CALL add_parquet_key('key128', 'ZZ9')",
       "ATTACH 'enc.db' AS e (ENCRYPTION_KEY 'ZZ9')",
       // Scanner connection strings.
@@ -170,6 +173,10 @@ TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
       "SELECT author, designation FROM t",
       "DROP SECRET s",
       "SELECT count(*) FROM t GROUP BY key ORDER BY key",
+      "SELECT keyboard, key FROM t ORDER BY id",
+      "CREATE TABLE t (id INT, PRIMARY KEY (id))",
+      "Constraint Error: Duplicate key \"id: 1\" violates primary key constraint",
+      "DETAIL: Key (id)=(1) already exists.",
       // Server messages that quote a credential-looking name keep their reason.
       "Binder Error: Referenced column \"api_key\" not found in FROM clause!",
       "Catalog Error: Table with name \"tokens\" does not exist!",
@@ -190,10 +197,6 @@ TEST(MotherDuckRedactTest, OverMasksCredentialLookingSql) {
   const std::pair<const char*, const char*> kCases[] = {
       {"SELECT * FROM t WHERE key = 5 ORDER BY id", "SELECT * FROM t WHERE key ..."},
       {"SELECT * FROM t WHERE monkey = 1", "SELECT * FROM t WHERE monkey ..."},
-      {"SELECT keyboard, key FROM t ORDER BY id", "SELECT keyboard ..."},
-      {"CREATE TABLE t (id INT, PRIMARY KEY (id))",
-       "CREATE TABLE t (id INT, PRIMARY KEY ..."},
-      {"DETAIL: Key (id)=(1) already exists.", "DETAIL: Key ..."},
       {"SELECT * FROM duckdb_secrets()", "SELECT * FROM duckdb_secrets ..."},
       {"CREATE TABLE secrets (id INT)", "CREATE TABLE secrets ..."},
       {"UPDATE settings SET config = 'x' WHERE id = 1", "UPDATE settings SET config ..."},
@@ -225,15 +228,35 @@ TEST(MotherDuckRedactTest, InstalledRedactorAppliesToErrors) {
   SetQueryRedactor(nullptr);
 }
 
-// A secret at the truncation point must not get through, whether the cut falls before
-// the name, inside it or inside the value.
-TEST(MotherDuckRedactTest, SecretNearTheTruncationPointIsNotLogged) {
+// Text cut anywhere inside a secret must not leak the part that is left, including a
+// URL or md: token cut before its @.
+TEST(MotherDuckRedactTest, EveryPrefixOfAStatementHidesTheSecret) {
+  for (const char* query :
+       {"SELECT 1 FROM t WITH PASSWORD 'ZZZZZZZZ'",
+        "ATTACH 'postgresql://user:ZZZZZZZZ@host/db'", "ATTACH 'md:ZZZZZZZZ@db'",
+        "SET s3_secret_access_key = 'ZZZZZZZZ'", "ATTACH 'host=h password=ZZZZZZZZ'",
+        "COPY t TO 'f' (KEY 'ZZZZZZZZ')", "SET key = ZZZZZZZZ",
+        "CREATE SECRET s (SECRET 'ZZZZZZZZ')"}) {
+    const std::string text = query;
+    for (size_t n = 0; n <= text.size(); n++) {
+      const std::string out = RedactSecretStatements(text.substr(0, n));
+      EXPECT_EQ(out.find('Z'), std::string::npos) << out;
+    }
+  }
+}
+
+// The same through the real truncation, with the cut inside the secret.
+TEST(MotherDuckRedactTest, SecretAtTheTruncationPointIsNotLogged) {
   InstallMotherDuckQueryRedactor();
-  for (size_t pad = kMaxQueryBytes - 50; pad < kMaxQueryBytes + 5; pad++) {
+  for (const char* tail : {"' AS x, 1 FROM t WITH PASSWORD 'ZZ9ZZ9ZZ9'",
+                           "' AS x; ATTACH 'postgresql://user:ZZ9ZZ9ZZ9@host/db'",
+                           "' AS x; ATTACH 'md:ZZ9ZZ9ZZ9@db'"}) {
+    const size_t secret = std::string(tail).find("ZZ9");
     const std::string query =
-        "SELECT '" + std::string(pad, 'a') + "' AS x, 1 FROM t WITH PASSWORD 'ZZ9ZZ9ZZ9'";
+        "SELECT '" + std::string(kMaxQueryBytes - 8 - secret - 3, 'a') + tail;
     const std::string out = RedactQuery(query);
-    EXPECT_EQ(out.find("ZZ9"), std::string::npos) << "pad " << pad;
+    EXPECT_NE(out.find("[truncated]"), std::string::npos);
+    EXPECT_EQ(out.find("ZZ9"), std::string::npos) << tail;
   }
   SetQueryRedactor(nullptr);
 }

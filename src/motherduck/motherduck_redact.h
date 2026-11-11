@@ -26,10 +26,11 @@ namespace adbcpq {
 /// A few regexes over the raw text, ignoring quoting and comments. At the earliest match
 /// the rest is dropped and " ..." appended. Triggers:
 ///  - CREATE/ALTER ... SECRET.
-///  - A credential-like name (secret, token, pass, key, ...) followed by '=', ':', TO, a
-///    quote, '(', ')', ',' or a comment, which also masks column lists like (id,
-///    password).
-///  - user:password@ in a URL, and md:<token>@db.
+///  - A credential-like name (secret, token, pass, api_key, ...) followed by '=', ':',
+///  TO,
+///    a quote, '(', ')', ',' or a comment, which also masks column lists like
+///    (id, password). A bare "key" counts only before '=', ':', TO or a quote.
+///  - user:password@ in a URL, and md:<token>@db, also when the text ends before the @.
 ///  - source_code and config arguments of md_create_flight.
 /// Over-masking is accepted (`WHERE key = 5` is masked), but a lone quoted name
 /// ("api_key" not found) stays readable. If the patterns fail, the text becomes

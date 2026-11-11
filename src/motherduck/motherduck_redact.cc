@@ -35,9 +35,11 @@ namespace {
 std::vector<std::regex> BuildPatterns() {
   constexpr auto kFlags = std::regex::ECMAScript | std::regex::icase;
   // Words that mark a name as a credential. The short ones must be a whole part of the
-  // name, so "author" and "design" don't count.
+  // name, so "author" and "design" don't count. "key" must end a longer name (api_key,
+  // sslkey); a bare key is handled below.
   const std::string credential =
-      "(?:(?:secret|token|pass|key|signature|bearer|jwt|cookie|connection_string)"
+      "(?:(?:secret|token|pass|signature|bearer|jwt|cookie|connection_string|"
+      "[a-z0-9_-]key)"
       "|(?:^|[^a-z])(?:pwd|pw|sig|sas|auth|authorization|credentials?|slt|dsn)(?![a-z])"
       ")";
   // What may follow the name: '=', ':' or TO, or straight away a string, '(', ')', ','
@@ -50,10 +52,12 @@ std::vector<std::regex> BuildPatterns() {
       std::regex(R"((\b(?:create|alter)\b[\s\S]{0,200}?\bsecret\b))", kFlags),
       // name = v, name TO v, name: v, PASSWORD 'v', name(v), (name) VALUES (v).
       std::regex("(" + credential + R"([\w.$]{0,64}))" + value, kFlags),
-      // scheme://user:password@host
-      std::regex(R"((://[^\s'"@/]{0,128}:\s*)[^\s'"@]{0,1024}@)", kFlags),
+      // A bare key, only when a value follows directly: key = v, "key": v, KEY 'v'.
+      std::regex(R"((\bkey)(?:["']?\s*(?:=|:(?!:)|\bto\b)|\s*'))", kFlags),
+      // scheme://user:password@host. Text may end inside the password, once truncated.
+      std::regex(R"((://[^\s'"@/]{0,128}:\s*)[^\s'"@]{0,1024}(?:@|$))", kFlags),
       // md:<token>@database, motherduck:<token>@database
-      std::regex(R"((\b(?:md|motherduck):)[^'"@]{0,1024}@)", kFlags),
+      std::regex(R"((\b(?:md|motherduck):)[^'"@]{0,1024}(?:@|$))", kFlags),
       // md_create_flight(source_code := ..., config => ...)
       std::regex(R"((\b(?:source_code|config))\s*(?::=|=>?|/\*|--))", kFlags),
   };
