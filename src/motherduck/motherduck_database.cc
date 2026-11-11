@@ -35,6 +35,7 @@
 
 #include "adbc_driver_motherduck_config.h"
 #include "driver/common/utils.h"
+#include "error.h"
 #include "motherduck_ascii.h"
 #include "motherduck_type_resolver.h"
 
@@ -191,6 +192,8 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
     optional = &session_name_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     optional = &region_;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
+    optional = &db_schema_;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     // The user the driver connects as.
     output = username_;
@@ -264,6 +267,9 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
     region_ = std::move(region);
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
+    // An empty value unsets it.
+    db_schema_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
     username_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0 ||
@@ -442,6 +448,30 @@ AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* erro
     PQfinish(*conn);
     *conn = nullptr;
     return ADBC_STATUS_IO;
+  }
+
+  // The endpoint rejects search_path as a startup option, so set it once
+  // connected. A bare name is a schema in the connection's database.
+  if (!db_schema_.empty()) {
+    std::string schema;
+    AdbcStatusCode status = EscapeIdentifier(*conn, db_schema_, &schema, error);
+    if (status == ADBC_STATUS_OK) {
+      PGresult* result = PQexec(*conn, ("SET search_path TO " + schema).c_str());
+      // MotherDuck answers SET with an empty Success result set.
+      ExecStatusType result_status = PQresultStatus(result);
+      if (result_status != PGRES_COMMAND_OK && result_status != PGRES_TUPLES_OK) {
+        InternalAdbcSetError(error, "[motherduck] Failed to set %s=%s: %s",
+                             ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, db_schema_.c_str(),
+                             PQerrorMessage(*conn));
+        status = ADBC_STATUS_IO;
+      }
+      PQclear(result);
+    }
+    if (status != ADBC_STATUS_OK) {
+      PQfinish(*conn);
+      *conn = nullptr;
+      return status;
+    }
   }
   open_connections_++;
   return ADBC_STATUS_OK;

@@ -33,9 +33,15 @@ _TABLE_NOT_FOUND = re.compile(
     r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
 )
 
+# The run's own schema in the shared test database (see ci/scripts/pre-test.sh),
+# which every connection starts in, or main.
+_test_schema = os.environ.get("MOTHERDUCK_TEST_SCHEMA")
+
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
 }
+if _test_schema:
+    _database_args["adbc.motherduck.db_schema"] = _test_schema
 
 
 class PostgreSQLQuirks(model.DriverQuirks):
@@ -74,8 +80,9 @@ class PostgreSQLQuirks(model.DriverQuirks):
         statement_rows_affected_ddl=False,
         # The database ci/scripts/pre-test.sh picks.
         current_catalog=os.environ.get("MOTHERDUCK_TEST_CATALOG", "my_db"),
-        current_schema="main",
-        secondary_schema="secondary",
+        current_schema=_test_schema or "main",
+        # Named after the run's schema, so concurrent runs don't share it.
+        secondary_schema=f"{_test_schema}_secondary" if _test_schema else "secondary",
         supported_xdbc_fields=["xdbc_type_name"],
     )
     setup = model.DriverSetup(

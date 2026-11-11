@@ -53,8 +53,9 @@ Then run the suite from the repository root:
 $ pixi run validate
 ```
 
-The suite creates a fresh database before it starts and drops it when it
-finishes. To use an existing database instead, which the suite leaves in place,
-set `MOTHERDUCK_TEST_DATABASE` before running `pre-test.sh`.
+The suite works in a schema of its own in the shared `adbc_driver_tests`
+database, which it creates before it starts and drops, with the schemas named
+after it, when it finishes (see the main README). To use another database, set
+`MOTHERDUCK_TEST_DATABASE` before running `pre-test.sh`.
 `MOTHERDUCK_PG_HOST` overrides the default endpoint,
 `pg.us-east-1-aws.motherduck.com`.

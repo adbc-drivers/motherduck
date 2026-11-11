@@ -62,39 +62,63 @@ def driver_path(driver: adbc_drivers_validation.model.DriverQuirks) -> str:
 
 @pytest.fixture(scope="session")
 def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
-    """Give the session a fresh database (see ci/scripts/pre-test.sh) and drop it
+    """Give the session a schema of its own in the shared test database (see
+    ci/scripts/pre-test.sh), and drop it and every schema named after it
     afterwards, so concurrent jobs and earlier runs can't leave tables behind."""
     setup_uri = os.environ.get("MOTHERDUCK_TEST_SETUP_URI")
     catalog = os.environ.get("MOTHERDUCK_TEST_CATALOG")
-    if not setup_uri or not catalog:
+    schema = os.environ.get("MOTHERDUCK_TEST_SCHEMA")
+    if not setup_uri or not catalog or not schema:
         yield
         return
 
-    name = driver.quote_one_identifier(catalog)
+    database = driver.quote_one_identifier(catalog)
+    # The setup connection is to md:, where the run's schema doesn't resolve.
+    setup_kwargs = {
+        key: value
+        for key, value in db_kwargs.items()
+        if key != "adbc.motherduck.db_schema"
+    }
 
-    def execute(*queries: str) -> None:
-        with (
-            adbc_driver_manager.dbapi.connect(
-                driver=driver_path,
-                # Single attach mode can't connect to md:.
-                db_kwargs={
-                    **db_kwargs,
-                    "uri": setup_uri,
-                    "adbc.motherduck.attach_mode": "workspace",
-                },
-                autocommit=True,
-            ) as c,
-            c.cursor() as cursor,
-        ):
-            for query in queries:
-                cursor.execute(query)
+    def connect():
+        return adbc_driver_manager.dbapi.connect(
+            driver=driver_path,
+            # Single attach mode can't connect to md:.
+            db_kwargs={
+                **setup_kwargs,
+                "uri": setup_uri,
+                "adbc.motherduck.attach_mode": "workspace",
+            },
+            autocommit=True,
+        )
 
-    execute(f"DROP DATABASE IF EXISTS {name}", f"CREATE DATABASE {name}")
+    def drop_run_schemas() -> None:
+        with connect() as c, c.cursor() as cursor:
+            cursor.execute(
+                "SELECT schema_name FROM duckdb_schemas() WHERE database_name = $1 "
+                "AND (schema_name = $2 OR starts_with(schema_name, $3))",
+                (catalog, schema, schema + "_"),
+            )
+            names = [row[0] for row in cursor.fetchall()]
+            for name in names:
+                cursor.execute(
+                    f"DROP SCHEMA IF EXISTS {database}."
+                    f"{driver.quote_one_identifier(name)} CASCADE"
+                )
+
+    with connect() as c, c.cursor() as cursor:
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
+    drop_run_schemas()
+    with connect() as c, c.cursor() as cursor:
+        cursor.execute(
+            f"CREATE SCHEMA {database}.{driver.quote_one_identifier(schema)}"
+        )
     yield
-    execute(f"DROP DATABASE IF EXISTS {name}")
+    drop_run_schemas()
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _setup_backend(request, _motherduck_database, conn_factory) -> None:  # noqa: F811
+def _setup_backend(request, driver, _motherduck_database, conn_factory) -> None:  # noqa: F811
+    secondary = driver.quote_one_identifier(driver.features.secondary_schema)
     with conn_factory() as c, c.cursor() as cursor:
-        cursor.execute("CREATE SCHEMA IF NOT EXISTS secondary")
+        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {secondary}")

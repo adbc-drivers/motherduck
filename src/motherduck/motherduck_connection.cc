@@ -150,33 +150,6 @@ AdbcStatusCode MotherduckConnection::GetTableSchema(const char* catalog,
   return ADBC_STATUS_OK;
 }
 
-AdbcStatusCode MotherduckConnection::SetOption(const char* key, const char* value,
-                                               struct AdbcError* error) {
-  // Before Init the base defers the option and replays it through this
-  // override once connected. A value with a dot is already qualified.
-  if (std::strcmp(key, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA) != 0 ||
-      conn() == nullptr || value == nullptr || std::strchr(value, '.') != nullptr) {
-    return PostgresConnection::SetOption(key, value, error);
-  }
-
-  PqResultHelper db_helper(conn(), "SELECT current_database()");
-  RAISE_STATUS(error, db_helper.Execute());
-  if (db_helper.NumRows() != 1) {
-    InternalAdbcSetError(error, "[motherduck] Failed to look up the current database");
-    return ADBC_STATUS_INTERNAL;
-  }
-  std::string database_esc;
-  RAISE_ADBC(EscapeIdentifier(conn(), Text(db_helper.Row(0)[0]), &database_esc, error));
-  std::string schema_esc;
-  RAISE_ADBC(EscapeIdentifier(conn(), value, &schema_esc, error));
-
-  // MotherDuck doesn't accept a parameter here
-  PqResultHelper set_helper(conn(),
-                            "SET search_path TO " + database_esc + "." + schema_esc);
-  RAISE_STATUS(error, set_helper.Execute());
-  return ADBC_STATUS_OK;
-}
-
 AdbcStatusCode MotherduckConnection::GetTableTypes(struct AdbcConnection* connection,
                                                    struct ArrowArrayStream* out,
                                                    struct AdbcError* error) {

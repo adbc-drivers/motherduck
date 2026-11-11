@@ -36,6 +36,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -69,6 +70,29 @@ using std::string_literals::operator""s;
 // Bulk ingest needs COPY FROM STDIN, which the Postgres endpoint lacks (#31).
 #define SKIP_WITHOUT_COPY_FROM_STDIN() GTEST_SKIP() << "Needs COPY FROM STDIN (#31)"
 
+namespace {
+
+// The schema this run works in (see ci/scripts/pre-test.sh), or main.
+std::string TestSchema() {
+  const char* schema = std::getenv("MOTHERDUCK_TEST_SCHEMA");
+  return schema && *schema ? schema : "main";
+}
+
+// Another schema of this run's own, named after the run's schema, so
+// concurrent runs never share it. MotherDuckTestDatabase drops it at the end.
+std::string TestSchema(std::string_view suffix) {
+  const char* schema = std::getenv("MOTHERDUCK_TEST_SCHEMA");
+  if (!schema || !*schema) return std::string(suffix);
+  return std::string(schema) + "_" + std::string(suffix);
+}
+
+std::string Upper(std::string value) {
+  for (char& c : value) c = static_cast<char>(std::toupper(c));
+  return value;
+}
+
+}  // namespace
+
 class PostgresQuirks : public adbc_validation::DriverQuirks {
  public:
   // Leaves every other option at the driver's default.
@@ -88,7 +112,13 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
       ADD_FAILURE() << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    return SetupDatabase(database, uri, error);
+    RAISE_ADBC(SetupDatabase(database, uri, error));
+    // Every connection starts in this run's schema.
+    if (std::getenv("MOTHERDUCK_TEST_SCHEMA")) {
+      RAISE_ADBC(AdbcDatabaseSetOption(database, "adbc.motherduck.db_schema",
+                                       TestSchema().c_str(), error));
+    }
+    return ADBC_STATUS_OK;
   }
 
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database, const char* uri,
@@ -273,7 +303,8 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     }
     return catalog;
   }
-  std::string db_schema() const override { return "main"; }
+  std::string db_schema() const override { return TestSchema(); }
+  std::string secondary_db_schema() const override { return TestSchema("other"); }
 
   // No COPY FROM STDIN yet (#31).
   bool supports_bulk_ingest(const char* mode) const override { return false; }
@@ -305,32 +336,61 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   bool supports_statistics() const override { return false; }
 };
 
-// Gives the test run a fresh database (see ci/scripts/pre-test.sh) and drops it
+// Gives the test run a schema of its own in the shared test database (see
+// ci/scripts/pre-test.sh), and drops it and every other schema named after it
 // afterwards, so concurrent jobs and earlier runs can't leave tables behind.
 class MotherDuckTestDatabase : public ::testing::Environment {
  public:
   void SetUp() override {
     if (!Configured()) return;
-    ASSERT_NO_FATAL_FAILURE(Execute("DROP DATABASE IF EXISTS " + catalog_));
-    ASSERT_NO_FATAL_FAILURE(Execute("CREATE DATABASE " + catalog_));
+    ASSERT_NO_FATAL_FAILURE(Execute("CREATE DATABASE IF NOT EXISTS " + catalog_));
+    ASSERT_NO_FATAL_FAILURE(DropRunSchemas());
+    ASSERT_NO_FATAL_FAILURE(
+        Execute("CREATE SCHEMA " + catalog_ + "." + quirks_.QuoteIdentifier(schema_)));
   }
 
   void TearDown() override {
     if (!Configured()) return;
-    ASSERT_NO_FATAL_FAILURE(Execute("DROP DATABASE IF EXISTS " + catalog_));
+    ASSERT_NO_FATAL_FAILURE(DropRunSchemas());
   }
 
  private:
   bool Configured() {
     const char* setup_uri = std::getenv("MOTHERDUCK_TEST_SETUP_URI");
     const char* catalog = std::getenv("MOTHERDUCK_TEST_CATALOG");
-    if (!setup_uri || !catalog) return false;
+    const char* schema = std::getenv("MOTHERDUCK_TEST_SCHEMA");
+    if (!setup_uri || !catalog || !schema || !*schema) return false;
     setup_uri_ = setup_uri;
+    catalog_name_ = catalog;
     catalog_ = quirks_.QuoteIdentifier(catalog);
+    schema_ = schema;
     return true;
   }
 
-  void Execute(const std::string& query) {
+  // The run's schema and those TestSchema(suffix) names.
+  void DropRunSchemas() {
+    auto literal = [](const std::string& value) {
+      std::string quoted = "'";
+      for (char c : value) {
+        if (c == '\'') quoted += '\'';
+        quoted += c;
+      }
+      return quoted + "'";
+    };
+    std::vector<std::string> schemas;
+    ASSERT_NO_FATAL_FAILURE(
+        Execute("SELECT schema_name FROM duckdb_schemas() WHERE database_name = " +
+                    literal(catalog_name_) + " AND (schema_name = " + literal(schema_) +
+                    " OR starts_with(schema_name, " + literal(schema_ + "_") + "))",
+                &schemas));
+    for (const std::string& schema : schemas) {
+      ASSERT_NO_FATAL_FAILURE(Execute("DROP SCHEMA IF EXISTS " + catalog_ + "." +
+                                      quirks_.QuoteIdentifier(schema) + " CASCADE"));
+    }
+  }
+
+  // Runs the query, collecting its first column's values into rows if given.
+  void Execute(const std::string& query, std::vector<std::string>* rows = nullptr) {
     Handle<struct AdbcError> error;
     Handle<struct AdbcDatabase> database;
     Handle<struct AdbcConnection> connection;
@@ -352,14 +412,33 @@ class MotherDuckTestDatabase : public ::testing::Environment {
                 IsOkStatus(&error.value));
     ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), &error.value),
                 IsOkStatus(&error.value));
-    ASSERT_THAT(
-        AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error.value),
-        IsOkStatus(&error.value));
+    if (rows == nullptr) {
+      ASSERT_THAT(
+          AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error.value),
+          IsOkStatus(&error.value));
+      return;
+    }
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, &reader.stream.value, nullptr,
+                                          &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    while (true) {
+      ASSERT_NO_FATAL_FAILURE(reader.Next());
+      if (reader.array->release == nullptr) break;
+      for (int64_t i = 0; i < reader.array->length; i++) {
+        const struct ArrowStringView value =
+            ArrowArrayViewGetStringUnsafe(reader.array_view->children[0], i);
+        rows->emplace_back(value.data, value.size_bytes);
+      }
+    }
   }
 
   PostgresQuirks quirks_;
   std::string setup_uri_;
+  std::string catalog_name_;
   std::string catalog_;
+  std::string schema_;
 };
 
 [[maybe_unused]] static const auto* kMotherDuckTestDatabase =
@@ -1033,7 +1112,7 @@ TEST_F(PostgresConnectionTest, GetObjectsSchemaFilterFindsTablesOutsideSearchPat
   ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
 
-  const std::string schema_name = "adbc_get_objects_test";
+  const std::string schema_name = TestSchema("adbc_get_objects_test");
   const std::string table_name = "schema_filter_table";
 
   // Ensure the schema is not part of the current search_path.
@@ -1355,6 +1434,8 @@ TEST_F(PostgresConnectionTest, GetObjectsTableTypesFilter) {
 TEST_F(PostgresConnectionTest, MetadataSetCurrentDbSchema) {
   ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  const std::string schema_name = TestSchema("testschema");
+  const std::string quoted_schema = quirks()->QuoteIdentifier(schema_name);
 
   {
     adbc_validation::Handle<struct AdbcStatement> statement;
@@ -1362,16 +1443,18 @@ TEST_F(PostgresConnectionTest, MetadataSetCurrentDbSchema) {
                 IsOkStatus(&error));
 
     ASSERT_THAT(AdbcStatementSetSqlQuery(
-                    &statement.value, "CREATE SCHEMA IF NOT EXISTS testschema", &error),
+                    &statement.value,
+                    ("CREATE SCHEMA IF NOT EXISTS " + quoted_schema).c_str(), &error),
                 IsOkStatus(&error));
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
                 IsOkStatus(&error));
 
-    ASSERT_THAT(
-        AdbcStatementSetSqlQuery(
-            &statement.value,
-            "CREATE TABLE IF NOT EXISTS testschema.schematable (ints INT)", &error),
-        IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value,
+                                         ("CREATE TABLE IF NOT EXISTS " + quoted_schema +
+                                          ".schematable (ints INT)")
+                                             .c_str(),
+                                         &error),
+                IsOkStatus(&error));
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
                 IsOkStatus(&error));
 
@@ -1407,7 +1490,7 @@ TEST_F(PostgresConnectionTest, MetadataSetCurrentDbSchema) {
 
   ASSERT_THAT(
       AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
-                              "testschema", &error),
+                              schema_name.c_str(), &error),
       IsOkStatus(&error));
 
   ASSERT_THAT(
@@ -1421,6 +1504,7 @@ TEST_F(PostgresConnectionTest, MetadataSetCurrentDbSchema) {
 
 TEST_F(PostgresConnectionTest, MetadataSetCurrentDbSchemaInit) {
   // Regression test: setting the schema before Init (which Python does)
+  const std::string schema_name = TestSchema("regtestschema");
 
   // 1. Create the schema
   {
@@ -1431,10 +1515,12 @@ TEST_F(PostgresConnectionTest, MetadataSetCurrentDbSchemaInit) {
     ASSERT_THAT(AdbcStatementNew(&connection, &statement.value, &error),
                 IsOkStatus(&error));
 
-    ASSERT_THAT(
-        AdbcStatementSetSqlQuery(&statement.value,
-                                 "CREATE SCHEMA IF NOT EXISTS regtestschema", &error),
-        IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value,
+                                         ("CREATE SCHEMA IF NOT EXISTS " +
+                                          quirks()->QuoteIdentifier(schema_name))
+                                             .c_str(),
+                                         &error),
+                IsOkStatus(&error));
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
                 IsOkStatus(&error));
 
@@ -1447,13 +1533,13 @@ TEST_F(PostgresConnectionTest, MetadataSetCurrentDbSchemaInit) {
     ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
     ASSERT_THAT(
         AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
-                                "regtestschema", &error),
+                                schema_name.c_str(), &error),
         IsOkStatus(&error));
     ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
 
     ASSERT_THAT(adbc_validation::ConnectionGetOption(
                     &connection, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA, &error),
-                ::testing::Optional("regtestschema"s));
+                ::testing::Optional(schema_name));
   }
 }
 
@@ -1513,13 +1599,16 @@ TEST_F(PostgresConnectionTest, MetadataGetTableSchemaQuotedNames) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
                 IsOkStatus(&error));
   };
-  constexpr const char* kDropSchema =
-      "DROP SCHEMA IF EXISTS \"Odd.Schema \"\"x\"\"\" CASCADE";
-  ASSERT_NO_FATAL_FAILURE(execute(kDropSchema));
-  ASSERT_NO_FATAL_FAILURE(execute("CREATE SCHEMA \"Odd.Schema \"\"x\"\"\""));
+  const std::string odd_schema = TestSchema("Odd.Schema \"x\"");
+  const std::string upper_odd_schema = Upper(odd_schema);
+  const std::string quoted_odd_schema = quirks()->QuoteIdentifier(odd_schema);
   ASSERT_NO_FATAL_FAILURE(
-      execute("CREATE TABLE \"Odd.Schema \"\"x\"\"\".\"Odd.Table \"\"y\"\"\" "
-              "(ints INT, \"str col\" TEXT)"));
+      execute(("DROP SCHEMA IF EXISTS " + quoted_odd_schema + " CASCADE").c_str()));
+  ASSERT_NO_FATAL_FAILURE(execute(("CREATE SCHEMA " + quoted_odd_schema).c_str()));
+  ASSERT_NO_FATAL_FAILURE(
+      execute(("CREATE TABLE " + quoted_odd_schema +
+               ".\"Odd.Table \"\"y\"\"\" (ints INT, \"str col\" TEXT)")
+                  .c_str()));
 
   // DuckDB identifiers are case-insensitive, so other cases find the table too.
   const std::string catalog = quirks()->catalog();
@@ -1531,9 +1620,9 @@ TEST_F(PostgresConnectionTest, MetadataGetTableSchemaQuotedNames) {
     const char* table;
   };
   for (const Name& name : {
-           Name{nullptr, "Odd.Schema \"x\"", "Odd.Table \"y\""},
-           Name{catalog.c_str(), "Odd.Schema \"x\"", "Odd.Table \"y\""},
-           Name{upper_catalog.c_str(), "ODD.SCHEMA \"X\"", "odd.table \"Y\""},
+           Name{nullptr, odd_schema.c_str(), "Odd.Table \"y\""},
+           Name{catalog.c_str(), odd_schema.c_str(), "Odd.Table \"y\""},
+           Name{upper_catalog.c_str(), upper_odd_schema.c_str(), "odd.table \"Y\""},
        }) {
     SCOPED_TRACE(std::string(name.db_schema) + " / " + name.table);
     nanoarrow::UniqueSchema schema;
@@ -1551,7 +1640,7 @@ TEST_F(PostgresConnectionTest, MetadataGetTableSchemaQuotedNames) {
            // Not in the current schema.
            Name{nullptr, nullptr, "Odd.Table \"y\""},
            // Not in another catalog.
-           Name{"no_such_catalog", "Odd.Schema \"x\"", "Odd.Table \"y\""},
+           Name{"no_such_catalog", odd_schema.c_str(), "Odd.Table \"y\""},
            // Not a relation at all.
            Name{nullptr, nullptr, "(SELECT CURRENT_TIME)"},
        }) {
@@ -1562,7 +1651,8 @@ TEST_F(PostgresConnectionTest, MetadataGetTableSchemaQuotedNames) {
                 IsStatus(ADBC_STATUS_NOT_FOUND, &error));
   }
 
-  ASSERT_NO_FATAL_FAILURE(execute(kDropSchema));
+  ASSERT_NO_FATAL_FAILURE(
+      execute(("DROP SCHEMA IF EXISTS " + quoted_odd_schema + " CASCADE").c_str()));
 }
 
 // DuckDB identifiers are case-insensitive, even quoted ones, so a lookup in
@@ -1574,7 +1664,9 @@ TEST_F(PostgresConnectionTest, MetadataGetTableSchemaIgnoresCase) {
   ASSERT_THAT(ExecuteSql(&database, "CREATE TABLE \"MixedCase\" (ints INT)", &error),
               IsOkStatus(&error));
 
-  for (const char* db_schema : {static_cast<const char*>(nullptr), "MAIN"}) {
+  const std::string upper_schema = Upper(TestSchema());
+  for (const char* db_schema :
+       {static_cast<const char*>(nullptr), upper_schema.c_str()}) {
     SCOPED_TRACE(db_schema ? db_schema : "(no schema)");
     nanoarrow::UniqueSchema schema;
     ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, nullptr, db_schema, "mixedcase",
@@ -1620,7 +1712,8 @@ TEST_F(PostgresConnectionTest, MetadataGetTableSchemaCatalog) {
               IsOkStatus(&error));
 
   const std::string catalog = quirks()->catalog();
-  for (const char* db_schema : {static_cast<const char*>(nullptr), "main"}) {
+  const std::string test_schema = TestSchema();
+  for (const char* db_schema : {static_cast<const char*>(nullptr), test_schema.c_str()}) {
     SCOPED_TRACE(db_schema ? db_schema : "(no schema)");
     nanoarrow::UniqueSchema schema;
     ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, catalog.c_str(), db_schema,
@@ -1640,15 +1733,17 @@ TEST_F(PostgresConnectionTest, MetadataGetTableSchemaCatalog) {
 TEST_F(PostgresConnectionTest, MetadataGetTableSchemaCatalogCurrentSchema) {
   ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  const std::string schema_name = TestSchema("adbc_current_schema_test");
+  const std::string quoted_schema = quirks()->QuoteIdentifier(schema_name);
   ASSERT_THAT(ExecuteSql(&database,
-                         "CREATE SCHEMA IF NOT EXISTS adbc_current_schema_test; "
-                         "CREATE OR REPLACE TABLE adbc_current_schema_test.only_here "
-                         "(ints INT)",
+                         "CREATE SCHEMA IF NOT EXISTS " + quoted_schema +
+                             "; CREATE OR REPLACE TABLE " + quoted_schema +
+                             ".only_here (ints INT)",
                          &error),
               IsOkStatus(&error));
   ASSERT_THAT(
       AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
-                              "adbc_current_schema_test", &error),
+                              schema_name.c_str(), &error),
       IsOkStatus(&error));
 
   std::string catalog = quirks()->catalog();
@@ -1684,11 +1779,11 @@ TEST_F(PostgresConnectionTest, GetObjectsFiltersIgnoreCase) {
   for (const Case& test_case : {Case{"ID", "id", 1}, Case{"INTS", "ints", 0}}) {
     SCOPED_TRACE(test_case.column_filter);
     adbc_validation::StreamReader reader;
-    ASSERT_THAT(
-        AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL,
-                                 upper_catalog.c_str(), "MAIN", "mixedcase", nullptr,
-                                 test_case.column_filter, &reader.stream.value, &error),
-        IsOkStatus(&error));
+    ASSERT_THAT(AdbcConnectionGetObjects(
+                    &connection, ADBC_OBJECT_DEPTH_ALL, upper_catalog.c_str(),
+                    Upper(TestSchema()).c_str(), "mixedcase", nullptr,
+                    test_case.column_filter, &reader.stream.value, &error),
+                IsOkStatus(&error));
     ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
     ASSERT_NO_FATAL_FAILURE(reader.Next());
     ASSERT_NE(nullptr, reader.array->release);
@@ -1698,8 +1793,9 @@ TEST_F(PostgresConnectionTest, GetObjectsFiltersIgnoreCase) {
         << "could not initialize the AdbcGetObjectsData object";
     // GetObjects reports the names as stored.
     struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
-        *get_objects_data, catalog.c_str(), "main", "MixedCase");
-    ASSERT_NE(table, nullptr) << "could not find main.MixedCase via GetObjects";
+        *get_objects_data, catalog.c_str(), TestSchema().c_str(), "MixedCase");
+    ASSERT_NE(table, nullptr) << "could not find " << TestSchema()
+                              << ".MixedCase via GetObjects";
     ASSERT_EQ(table->n_table_columns, 1);
     const struct ArrowStringView name = table->table_columns[0]->column_name;
     EXPECT_EQ(std::string(name.data, name.size_bytes), test_case.column);
@@ -1905,9 +2001,11 @@ TEST_F(PostgresConnectionTest, MetadataGetTableSchemaMdCatalog) {
     ASSERT_THAT(AdbcStatementNew(&md_connection.value, &statement.value, &error),
                 IsOkStatus(&error));
     ASSERT_THAT(
-        AdbcStatementSetSqlQuery(
-            &statement.value,
-            ("USE " + quirks_.QuoteIdentifier(quirks()->catalog())).c_str(), &error),
+        AdbcStatementSetSqlQuery(&statement.value,
+                                 ("USE " + quirks_.QuoteIdentifier(quirks()->catalog()) +
+                                  "." + quirks_.QuoteIdentifier(quirks()->db_schema()))
+                                     .c_str(),
+                                 &error),
         IsOkStatus(&error));
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
                 IsOkStatus(&error));
@@ -2849,17 +2947,19 @@ TEST_F(PostgresStatementTest, IsolationLevels) {
 
 TEST_F(PostgresStatementTest, SqlIngestSchema) {
   SKIP_WITHOUT_COPY_FROM_STDIN();
-  const std::string schema_name = "testschema";
+  const std::string schema_name = TestSchema("testschema");
+  const std::string quoted_schema = quirks()->QuoteIdentifier(schema_name);
 
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
-  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
-                                       "CREATE SCHEMA IF NOT EXISTS testschema", &error),
-              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, ("CREATE SCHEMA IF NOT EXISTS " + quoted_schema).c_str(), &error),
+      IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
               IsOkStatus(&error));
 
-  std::string drop = "DROP TABLE IF EXISTS testschema.schematable";
+  std::string drop = "DROP TABLE IF EXISTS " + quoted_schema + ".schematable";
   ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, drop.c_str(), &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),

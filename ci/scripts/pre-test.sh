@@ -30,21 +30,24 @@ if [[ -z "${MOTHERDUCK_TOKEN:-}" ]]; then
 fi
 
 host="${MOTHERDUCK_PG_HOST:-pg.us-east-1-aws.motherduck.com}"
-# By default each job gets a fresh database, which the tests create and drop, so
-# concurrent jobs and runs don't share tables. An explicit database is left as is.
-if [[ -n "${MOTHERDUCK_TEST_DATABASE:-}" ]]; then
-  database="$MOTHERDUCK_TEST_DATABASE"
-  # The driver's default single attach mode needs a named database.
-  if [[ "$database" == "md:" ]]; then
-    printf 'MOTHERDUCK_TEST_DATABASE must name a database, not md:\n' >&2
-    exit 1
-  fi
-  manage_database=false
-else
-  run="${GITHUB_RUN_ID:-local}_${GITHUB_RUN_ATTEMPT:-1}"
-  database="adbc_ci_${run}_${GITHUB_JOB:-test}_${1}_${2}"
-  manage_database=true
+# Runs share one database, which is created if missing and never dropped, and
+# each run gets its own schema in it, which the tests create and drop. Creating
+# and dropping a database per run would leave a database (and its retained
+# storage) behind for every interrupted run, and every workspace-mode
+# connection in the account attaches each one.
+database="${MOTHERDUCK_TEST_DATABASE:-adbc_driver_tests}"
+# The driver's default single attach mode needs a named database.
+if [[ "$database" == "md:" ]]; then
+  printf 'MOTHERDUCK_TEST_DATABASE must name a database, not md:\n' >&2
+  exit 1
 fi
+if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+  run="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT:-1}_${GITHUB_JOB:-test}"
+else
+  # Local runs need their own schema too, so concurrent runs don't collide.
+  run="local_$(date +%s)_$$"
+fi
+schema="adbc_${run}_${1}_${2}"
 
 # vcpkg's libpq can't see the OS trust store, so use the pixi env's CA bundle.
 # The generated test job doesn't install the env itself.
@@ -78,8 +81,7 @@ uri_for() {
 {
   printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$(uri_for "$database")"
   printf 'MOTHERDUCK_TEST_CATALOG=%q\n' "$database"
-  if [[ "$manage_database" == true ]]; then
-    # The tests create and drop the database through this connection.
-    printf 'MOTHERDUCK_TEST_SETUP_URI=%q\n' "$(uri_for md:)"
-  fi
+  printf 'MOTHERDUCK_TEST_SCHEMA=%q\n' "$schema"
+  # The tests create the database and their schema through this connection.
+  printf 'MOTHERDUCK_TEST_SETUP_URI=%q\n' "$(uri_for md:)"
 } > "${repo_root}/.env.override"
