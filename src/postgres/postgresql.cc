@@ -32,6 +32,7 @@
 
 #include <arrow-adbc/adbc.h>
 
+#include "adbc_driver_motherduck.h"
 #include "connection.h"
 #include "database.h"
 #include "driver/common/utils.h"
@@ -973,7 +974,7 @@ AdbcStatusCode AdbcDriverPostgresqlInit(int version, void* raw_driver,
 #if !defined(ADBC_NO_COMMON_ENTRYPOINTS)
 ADBC_EXPORT
 AdbcStatusCode AdbcDriverInit(int version, void* raw_driver, struct AdbcError* error) {
-  return AdbcDriverPostgresqlInit(version, raw_driver, error);
+  return AdbcDriverMotherduckInit(version, raw_driver, error);
 }
 #endif  // ADBC_NO_COMMON_ENTRYPOINTS
 }

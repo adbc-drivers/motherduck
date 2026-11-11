@@ -26,12 +26,80 @@
 #include <gtest/gtest.h>
 #include <libpq-fe.h>
 
+#include <gtest/gtest.h>
+#include <libpq-fe.h>
+
 #include "connection.h"
 #include "error.h"
 #include "postgres_type.h"
 #include "statement.h"
 
 namespace adbcpq {
+
+TEST(PostgresErrorTest, RedactQueryTruncates) {
+  EXPECT_EQ(RedactQuery("SELECT 1"), "SELECT 1");
+  const std::string long_query = "SELECT '" + std::string(kMaxQueryBytes, 'a') + "'";
+  const std::string out = RedactQuery(long_query);
+  EXPECT_EQ(out, long_query.substr(0, kMaxQueryBytes) + "... [truncated]");
+  // Server text has its own cap.
+  const std::string long_message(kMaxMessageBytes + 1, 'a');
+  EXPECT_EQ(RedactMessage(long_message),
+            long_message.substr(0, kMaxMessageBytes) + "... [truncated]");
+  EXPECT_EQ(RedactMessage("short"), "short");
+}
+
+TEST(PostgresErrorTest, RedactQueryKeepsUtf8Intact) {
+  // U+00E9 is two bytes; put its lead byte last in the kept prefix.
+  std::string query(kMaxQueryBytes - 1, 'a');
+  query += "\xC3\xA9 tail";
+  const std::string out = RedactQuery(query);
+  EXPECT_EQ(out, std::string(kMaxQueryBytes - 1, 'a') + "... [truncated]");
+}
+
+TEST(PostgresErrorTest, RedactorSeesOnlyThePrefix) {
+  SetQueryRedactor([](std::string_view text) { return std::to_string(text.size()); });
+  const std::string long_query(kMaxQueryBytes + 500, 'x');
+  EXPECT_EQ(RedactQuery(long_query), std::to_string(kMaxQueryBytes) + "... [truncated]");
+  SetQueryRedactor(nullptr);
+}
+
+// Results libpq makes itself (lost connection) have a message but no fields. A failed
+// connection gives one without a server.
+TEST(PostgresErrorTest, PqErrorTextKeepsClientSideMessages) {
+  PGconn* conn = PQconnectdb("host=127.0.0.1 port=1 connect_timeout=2");
+  ASSERT_NE(conn, nullptr);
+  ASSERT_EQ(PQstatus(conn), CONNECTION_BAD);
+  const std::string conn_message = PQerrorMessage(conn);
+  ASSERT_FALSE(conn_message.empty());
+
+  PGresult* result = PQmakeEmptyPGresult(conn, PGRES_FATAL_ERROR);
+  ASSERT_NE(result, nullptr);
+  ASSERT_EQ(PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY), nullptr);
+  const std::string text = PqErrorText(result, conn);
+  EXPECT_EQ(text, conn_message);
+  EXPECT_EQ(text.find("missing error text"), std::string::npos) << text;
+  PQclear(result);
+
+  // Not an error result: use the connection's message.
+  result = PQmakeEmptyPGresult(conn, PGRES_COMMAND_OK);
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PqErrorText(result, conn), conn_message);
+  PQclear(result);
+
+  // No result: the connection's message, or nothing.
+  EXPECT_EQ(PqErrorText(nullptr, conn), conn_message);
+  EXPECT_EQ(PqErrorText(nullptr, nullptr), "");
+  PQfinish(conn);
+}
+
+// MakeStatus takes only numbers and RedactedText (a static_assert rejects the rest).
+TEST(PostgresErrorTest, MakeStatusFormatsRedactedText) {
+  const std::string message =
+      MakeStatus(nullptr, "failed '{}' [{}] {}", RedactQuery("SELECT 1"),
+                 PqStatusName(PGRES_FATAL_ERROR), 7)
+          .message();
+  EXPECT_EQ(message, "failed 'SELECT 1' [PGRES_FATAL_ERROR] 7");
+}
 
 TEST(PostgresErrorTest, ClassifySqlState) {
   struct Case {
@@ -122,9 +190,9 @@ TEST(PostgresConnectionUnitTest, GetTableSchemaNullTableName) {
 TEST(PostgresConnectionUnitTest, SetCurrentSchemaNull) {
   PostgresConnection connection;
   struct AdbcError error = ADBC_ERROR_INIT;
-  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
-            connection.SetOption(ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA, nullptr,
-                                 &error));
+  EXPECT_EQ(
+      ADBC_STATUS_INVALID_ARGUMENT,
+      connection.SetOption(ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA, nullptr, &error));
   ASSERT_NE(nullptr, error.message);
   EXPECT_NE(nullptr, std::strstr(error.message, "requires a value")) << error.message;
   if (error.release) error.release(&error);
