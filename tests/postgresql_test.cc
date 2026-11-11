@@ -2737,10 +2737,16 @@ TEST_F(PostgresStatementTest, TransactionStatus) {
 
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
+  // One row finishes before ExecuteQuery returns, so the connection is already
+  // idle in the transaction. More than one 1024-row chunk is still arriving.
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  const bool motherduck = uri != nullptr && std::strstr(uri, "motherduck.com") != nullptr;
+  const char* query = motherduck ? "SELECT i FROM range(3000) t(i)"
+                                 : "SELECT g FROM generate_series(1, 3000) t(g)";
+
   {
     adbc_validation::StreamReader reader;
-    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error),
-                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
                 IsOkStatus(&error));
@@ -2753,8 +2759,7 @@ TEST_F(PostgresStatementTest, TransactionStatus) {
   }
   {
     adbc_validation::StreamReader reader;
-    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT 1", &error),
-                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
                 IsOkStatus(&error));
