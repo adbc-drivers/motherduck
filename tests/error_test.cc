@@ -20,9 +20,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
+#include <cstring>
+#include <string>
 
+#include <gtest/gtest.h>
+#include <libpq-fe.h>
+
+#include "connection.h"
 #include "error.h"
+#include "postgres_type.h"
+#include "statement.h"
 
 namespace adbcpq {
 
@@ -69,6 +76,102 @@ TEST(PostgresErrorTest, ClassifySqlState) {
     EXPECT_EQ(test_case.status, ClassifySqlState(test_case.sqlstate))
         << (test_case.sqlstate ? test_case.sqlstate : "null");
   }
+}
+
+TEST(PostgresErrorTest, EscapeIdentifier) {
+  // A connection that never reached a server still carries a client encoding,
+  // which is all PQescapeIdentifier needs.
+  PGconn* conn = PQconnectdb("host=/nonexistent-adbc-motherduck-test-socket-dir");
+  ASSERT_NE(nullptr, conn);
+
+  struct AdbcError error = ADBC_ERROR_INIT;
+  std::string escaped;
+  EXPECT_EQ(ADBC_STATUS_OK, EscapeIdentifier(conn, "my\"table", &escaped, &error));
+  EXPECT_EQ("\"my\"\"table\"", escaped);
+  if (error.release) error.release(&error);
+  PQfinish(conn);
+}
+
+TEST(PostgresErrorTest, EscapeIdentifierFailure) {
+  // PQescapeIdentifier fails without a connection, the same way it fails for
+  // input that is invalid in the client encoding.
+  struct AdbcError error = ADBC_ERROR_INIT;
+  std::string escaped = "unchanged";
+  EXPECT_EQ(ADBC_STATUS_INTERNAL,
+            EscapeIdentifier(nullptr, "my_table", &escaped, &error));
+  EXPECT_EQ("unchanged", escaped);
+  ASSERT_NE(nullptr, error.message);
+  EXPECT_NE(nullptr, std::strstr(error.message, "Could not escape identifier my_table"))
+      << error.message;
+  if (error.release) error.release(&error);
+}
+
+TEST(PostgresConnectionUnitTest, GetTableSchemaNullTableName) {
+  PostgresConnection connection;
+  struct ArrowSchema schema = {};
+  struct AdbcError error = ADBC_ERROR_INIT;
+  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+            connection.GetTableSchema(nullptr, nullptr, nullptr, &schema, &error));
+  ASSERT_NE(nullptr, error.message);
+  EXPECT_NE(nullptr, std::strstr(error.message, "table_name must not be NULL"))
+      << error.message;
+  EXPECT_EQ(nullptr, schema.release);
+  if (error.release) error.release(&error);
+}
+
+TEST(PostgresConnectionUnitTest, SetCurrentSchemaNull) {
+  PostgresConnection connection;
+  struct AdbcError error = ADBC_ERROR_INIT;
+  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+            connection.SetOption(ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA, nullptr,
+                                 &error));
+  ASSERT_NE(nullptr, error.message);
+  EXPECT_NE(nullptr, std::strstr(error.message, "requires a value")) << error.message;
+  if (error.release) error.release(&error);
+}
+
+// The statement has no connection: the name checks must run before touching it.
+static void ExpectCreateBulkTableRejects(const char* name0, const char* name1,
+                                         const char* expected_message) {
+  struct ArrowSchema child0 = {};
+  child0.format = "i";
+  child0.name = name0;
+  struct ArrowSchema child1 = {};
+  child1.format = "i";
+  child1.name = name1;
+  struct ArrowSchema* children[] = {&child0, &child1};
+  struct ArrowSchema source_schema = {};
+  source_schema.format = "+s";
+  source_schema.n_children = 2;
+  source_schema.children = children;
+
+  PostgresStatement statement;
+  std::string escaped_table;
+  std::string escaped_field_list;
+  PostgresType copy_target_types;
+  bool has_copy_target_types = true;
+  struct AdbcError error = ADBC_ERROR_INIT;
+  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+            statement.CreateBulkTable("public", source_schema, &escaped_table,
+                                      &escaped_field_list, &copy_target_types,
+                                      &has_copy_target_types, &error));
+  ASSERT_NE(nullptr, error.message);
+  EXPECT_NE(nullptr, std::strstr(error.message, expected_message)) << error.message;
+  EXPECT_TRUE(escaped_table.empty());
+  EXPECT_TRUE(escaped_field_list.empty());
+  if (error.release) error.release(&error);
+}
+
+TEST(PostgresStatementUnitTest, CreateBulkTableNullColumnName) {
+  ExpectCreateBulkTableRejects("ok", nullptr, "column 1: column name must not be NULL");
+}
+
+TEST(PostgresStatementUnitTest, CreateBulkTableEmptyColumnName) {
+  ExpectCreateBulkTableRejects("ok", "", "column 1: column name must not be empty");
+}
+
+TEST(PostgresStatementUnitTest, CreateBulkTableDuplicateColumnName) {
+  ExpectCreateBulkTableRejects("id", "id", "column 1: duplicate column name id");
 }
 
 }  // namespace adbcpq

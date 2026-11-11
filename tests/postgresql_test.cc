@@ -4770,6 +4770,47 @@ TEST_F(PostgresStatementTest, BindStreamErrorRestoresTimeZoneWithoutAutocommit) 
   ASSERT_THAT(AdbcConnectionCommit(&connection, &error), IsOkStatus(&error));
 }
 
+TEST_F(PostgresStatementTest, IngestReplaceKeepsTableOnBadColumnName) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(&statement,
+                                      {"DROP TABLE IF EXISTS test_ingest_bad_name",
+                                       "CREATE TABLE test_ingest_bad_name (ints BIGINT)",
+                                       "INSERT INTO test_ingest_bad_name VALUES (1)"},
+                                      &error));
+
+  // A column name that isn't valid UTF-8 can't be escaped. Replace mode must
+  // fail on it before dropping the existing table.
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ArrowSchemaInit(&schema.value);
+  ASSERT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(schema->children[0], "\xff"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(
+      (adbc_validation::MakeBatch<int64_t>(
+          &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr), {2})),
+      adbc_validation::IsOkErrno());
+  adbc_validation::Handle<struct AdbcStatement> ingest;
+  ASSERT_THAT(AdbcStatementNew(&connection, &ingest.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetOption(&ingest.value, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                     "test_ingest_bad_name", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetOption(&ingest.value, ADBC_INGEST_OPTION_MODE,
+                                     ADBC_INGEST_OPTION_MODE_REPLACE, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&ingest.value, &batch.value, &schema.value, &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+            AdbcStatementExecuteQuery(&ingest.value, nullptr, nullptr, &error));
+  error.release(&error);
+
+  std::string rows;
+  ASSERT_NO_FATAL_FAILURE(CountRows(&statement, "test_ingest_bad_name", &rows, &error));
+  ASSERT_EQ("1", rows);
+}
+
 TEST_F(PostgresStatementTest, SetUseCopyFalse) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
