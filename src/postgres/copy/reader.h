@@ -533,14 +533,14 @@ class PostgresCopyJsonbFieldReader : public PostgresCopyFieldReader {
       return ArrowArrayAppendNull(array, 1);
     }
 
-    // The version byte is part of the field; without it the payload size
-    // below would be negative
+    // A non-NULL value must at least contain the 1-byte version header
     if (field_size_bytes < 1) {
       ArrowErrorSet(error, "Expected JSONB field with at least 1 byte but found %d bytes",
                     static_cast<int>(field_size_bytes));  // NOLINT(runtime/int)
       return EINVAL;
     }
 
+    // Together with the check above, this guarantees the version byte is in bounds
     if (field_size_bytes > data->size_bytes) {
       ArrowErrorSet(error, "Expected %d bytes of field data but got %d bytes of input",
                     static_cast<int>(field_size_bytes),
@@ -548,8 +548,7 @@ class PostgresCopyJsonbFieldReader : public PostgresCopyFieldReader {
       return EINVAL;
     }
 
-    int8_t version;
-    NANOARROW_RETURN_NOT_OK(ReadChecked<int8_t>(data, &version, error));
+    const int8_t version = ReadUnsafe<int8_t>(data);
     if (version != 1) {
       ArrowErrorSet(error, "Expected JSONB binary version 0x01 but got %d",
                     static_cast<int>(version));
@@ -561,6 +560,11 @@ class PostgresCopyJsonbFieldReader : public PostgresCopyFieldReader {
     int32_t* offsets = reinterpret_cast<int32_t*>(offsets_->data);
     int32_t next_offset = 0;
     if (!psnip_safe_int32_add(&next_offset, offsets[array->length], field_size_bytes)) {
+      ArrowErrorSet(error,
+                    "JSONB field of %d bytes would overflow the 32-bit string offset "
+                    "(current offset %d)",
+                    static_cast<int>(field_size_bytes),
+                    static_cast<int>(offsets[array->length]));  // NOLINT(runtime/int)
       return EOVERFLOW;
     }
     NANOARROW_RETURN_NOT_OK(ArrowBufferAppendInt32(offsets_, next_offset));
