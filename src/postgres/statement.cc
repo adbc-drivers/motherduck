@@ -35,6 +35,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cinttypes>
+#include <unordered_set>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -419,6 +420,25 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
                                                   PostgresType* copy_target_types,
                                                   bool* has_copy_target_types,
                                                   struct AdbcError* error) {
+  // Reject names the server would refuse before any DDL runs: replace mode drops
+  // the target table in its own statement, so a later CREATE failure loses it.
+  std::unordered_set<std::string> seen_names;
+  for (int64_t i = 0; i < source_schema.n_children; i++) {
+    const char* name = source_schema.children[i]->name;
+    if (name == nullptr || name[0] == '\0') {
+      InternalAdbcSetError(
+          error, "[libpq] Cannot ingest column %" PRId64 ": column name must not be %s",
+          i, name == nullptr ? "NULL" : "empty");
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    if (!seen_names.insert(name).second) {
+      InternalAdbcSetError(
+          error, "[libpq] Cannot ingest column %" PRId64 ": duplicate column name %s", i,
+          name);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+  }
+
   PGconn* conn = connection_->conn();
   *has_copy_target_types = false;
 
@@ -431,42 +451,54 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
 
   {
     if (!ingest_.db_schema.empty()) {
-      char* escaped =
-          PQescapeIdentifier(conn, ingest_.db_schema.c_str(), ingest_.db_schema.size());
-      if (escaped == nullptr) {
-        InternalAdbcSetError(
-            error, "[libpq] Failed to escape target schema %s for ingestion: %s",
-            ingest_.db_schema.c_str(), PQerrorMessage(conn));
-        return ADBC_STATUS_INTERNAL;
-      }
+      std::string escaped;
+      RAISE_ADBC(EscapeIdentifier(conn, ingest_.db_schema, &escaped, error));
       *escaped_table += escaped;
       *escaped_table += " . ";
-      PQfreemem(escaped);
     } else if (ingest_.temporary) {
       // OK to be redundant (CREATE TEMPORARY TABLE pg_temp.foo)
       *escaped_table += "pg_temp . ";
     } else {
       // Explicitly specify the current schema to avoid any temporary tables
       // shadowing this table
-      char* escaped =
-          PQescapeIdentifier(conn, current_schema.c_str(), current_schema.size());
+      std::string escaped;
+      RAISE_ADBC(EscapeIdentifier(conn, current_schema, &escaped, error));
       *escaped_table += escaped;
       *escaped_table += " . ";
-      PQfreemem(escaped);
     }
 
     if (!ingest_.target.empty()) {
-      char* escaped =
-          PQescapeIdentifier(conn, ingest_.target.c_str(), ingest_.target.size());
-      if (escaped == nullptr) {
-        InternalAdbcSetError(error,
-                             "[libpq] Failed to escape target table %s for ingestion: %s",
-                             ingest_.target.c_str(), PQerrorMessage(conn));
-        return ADBC_STATUS_INTERNAL;
-      }
+      std::string escaped;
+      RAISE_ADBC(EscapeIdentifier(conn, ingest_.target, &escaped, error));
       *escaped_table += escaped;
-      PQfreemem(escaped);
     }
+  }
+
+  // Escape every column name and resolve every type before running any DDL,
+  // so a bad schema fails before replace mode drops the target table.
+  std::string columns;
+  std::vector<std::string> source_field_names;
+  source_field_names.reserve(source_schema.n_children);
+  for (int64_t i = 0; i < source_schema.n_children; i++) {
+    if (i > 0) {
+      columns += ", ";
+      *escaped_field_list += ", ";
+    }
+
+    const char* unescaped = source_schema.children[i]->name;
+    std::string escaped;
+    RAISE_ADBC(EscapeIdentifier(conn, unescaped, &escaped, error));
+    columns += escaped;
+    *escaped_field_list += escaped;
+    source_field_names.emplace_back(unescaped);
+
+    PostgresType pg_type;
+    struct ArrowError na_error;
+    CHECK_NA_DETAIL(INTERNAL,
+                    PostgresType::FromSchema(*type_resolver_, source_schema.children[i],
+                                             &pg_type, &na_error),
+                    &na_error, error);
+    columns += " " + pg_type.sql_type_name();
   }
 
   std::string create;
@@ -505,35 +537,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
   }
   create += *escaped_table;
   create += " (";
-  std::vector<std::string> source_field_names;
-  source_field_names.reserve(source_schema.n_children);
-
-  for (int64_t i = 0; i < source_schema.n_children; i++) {
-    if (i > 0) {
-      create += ", ";
-      *escaped_field_list += ", ";
-    }
-
-    const char* unescaped = source_schema.children[i]->name;
-    char* escaped = PQescapeIdentifier(conn, unescaped, std::strlen(unescaped));
-    if (escaped == nullptr) {
-      InternalAdbcSetError(error, "[libpq] Failed to escape column %s for ingestion: %s",
-                           unescaped, PQerrorMessage(conn));
-      return ADBC_STATUS_INTERNAL;
-    }
-    create += escaped;
-    *escaped_field_list += escaped;
-    source_field_names.emplace_back(unescaped);
-    PQfreemem(escaped);
-
-    PostgresType pg_type;
-    struct ArrowError na_error;
-    CHECK_NA_DETAIL(INTERNAL,
-                    PostgresType::FromSchema(*type_resolver_, source_schema.children[i],
-                                             &pg_type, &na_error),
-                    &na_error, error);
-    create += " " + pg_type.sql_type_name();
-  }
+  create += columns;
 
   if (ingest_.mode == IngestMode::kAppend) {
     AdbcStatusCode status = ResolveCopyTargetTypes(*escaped_table, source_field_names,

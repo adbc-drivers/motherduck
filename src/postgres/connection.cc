@@ -1069,19 +1069,23 @@ AdbcStatusCode PostgresConnection::GetTableSchema(const char* catalog,
                                                   const char* table_name,
                                                   struct ArrowSchema* schema,
                                                   struct AdbcError* error) {
+  if (table_name == nullptr) {
+    InternalAdbcSetError(error, "[libpq] GetTableSchema: table_name must not be NULL");
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  }
+
   FinishActiveReader();
   RAISE_ADBC(EnsureTransaction(error));
 
   AdbcStatusCode final_status = ADBC_STATUS_OK;
 
-  char* quoted = PQescapeIdentifier(conn_, table_name, strlen(table_name));
-  std::string table_name_str(quoted);
-  PQfreemem(quoted);
+  std::string table_name_str;
+  RAISE_ADBC(EscapeIdentifier(conn_, table_name, &table_name_str, error));
 
   if (db_schema != nullptr) {
-    quoted = PQescapeIdentifier(conn_, db_schema, strlen(db_schema));
-    table_name_str = std::string(quoted) + "." + table_name_str;
-    PQfreemem(quoted);
+    std::string db_schema_str;
+    RAISE_ADBC(EscapeIdentifier(conn_, db_schema, &db_schema_str, error));
+    table_name_str = db_schema_str + "." + table_name_str;
   }
 
   std::string query =
@@ -1307,14 +1311,9 @@ AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
     }
 
     // PostgreSQL doesn't accept a parameter here
-    char* value_esc = PQescapeIdentifier(conn_, value, strlen(value));
-    if (!value_esc) {
-      InternalAdbcSetError(error, "[libpq] Could not escape identifier: %s",
-                           PQerrorMessage(conn_));
-      return ADBC_STATUS_INTERNAL;
-    }
+    std::string value_esc;
+    RAISE_ADBC(EscapeIdentifier(conn_, value, &value_esc, error));
     std::string query = fmt::format("SET search_path TO {}", value_esc);
-    PQfreemem(value_esc);
 
     FinishActiveReader();
     PqResultHelper result_helper{conn_, query};
