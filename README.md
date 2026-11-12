@@ -31,8 +31,7 @@ The upstream PostgreSQL driver's approach credits [pgeon](https://github.com/0x0
 
 ## Build
 
-Requires CMake 3.24+, a C++20 compiler, and PostgreSQL's client library and
-headers (libpq). The driver bundles the Apache common/framework code, nanoarrow,
+Requires CMake 3.24+, a C++20 compiler, and libpq 15 or newer. The driver bundles the Apache common/framework code, nanoarrow,
 fmt, portable-snippets, and boost.int128 it needs. Test builds also require
 GoogleTest/GoogleMock; CMake downloads GoogleTest 1.15.2 if it is not installed.
 
@@ -185,10 +184,11 @@ to fail.
   aren't available because the endpoint rejects `CREATE TEMP TABLE`.
 - **COPY result reads** fail: the endpoint rejects binary
   `COPY ... TO STDOUT`, so the driver defaults `adbc.postgresql.use_copy` to
-  `false` (#11); setting it to `true` fails. The non-COPY path fetches the
-  whole result at once, so it ignores `adbc.postgresql.batch_size_hint_bytes`,
-  the connection reports idle in a transaction rather than active while you
-  read (#11), and a running query can't be cancelled (#48).
+  `false` (#11); setting it to `true` fails. Results are read from libpq
+  instead. A multi-statement script such as `INSERT ...; SELECT 1` stays
+  uncommitted, and invisible to other connections, until its rows are read,
+  its stream is released, or another command runs on the same connection.
+  That wait lets a row that cannot be converted roll the script back.
 - **Parameter types:** the endpoint can't prepare a query whose result
   column types depend on its parameters, as in `SELECT $1`, and ignores the
   parameter types sent with the prepare (#17). When that happens with

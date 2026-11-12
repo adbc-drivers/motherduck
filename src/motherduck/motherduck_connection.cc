@@ -138,6 +138,8 @@ AdbcStatusCode MotherduckConnection::GetTableSchema(const char* catalog,
     InternalAdbcSetError(error, "[motherduck] GetTableSchema requires a table name");
     return ADBC_STATUS_INVALID_ARGUMENT;
   }
+  // Like the base, detach any open result reader before querying.
+  RAISE_ADBC(FinishActiveReader(error));
   // A catalog without a schema means the session's schema in the current
   // database, as an unqualified name does, and main in any other. The current
   // database may be named as itself or as the connection's current catalog,
