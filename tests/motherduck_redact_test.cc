@@ -261,7 +261,45 @@ TEST(MotherDuckRedactTest, SecretAtTheTruncationPointIsNotLogged) {
   SetQueryRedactor(nullptr);
 }
 
+// DuckDB writes the statement into the primary message, after a blank line.
+TEST(MotherDuckRedactTest, StripStatementEcho) {
+  const std::pair<const char*, const char*> kCases[] = {
+      // As libpq's terse form returns it from MotherDuck.
+      {"ERROR:  Parser Error: syntax error at or near \"WHERE\"\n\n"
+       "LINE 1: SELECT FROM WHERE 'ZZ9' +\n                    ^\n",
+       "ERROR:  Parser Error: syntax error at or near \"WHERE\""},
+      {"Binder Error: column \"x\" not found\nCandidate bindings: \"y\"\n\n"
+       "LINE 12: SELECT x FROM t WHERE k = 'ZZ9'\n               ^",
+       "Binder Error: column \"x\" not found\nCandidate bindings: \"y\""},
+      {"err\r\n\r\nLINE 1: 'ZZ9'", "err"},
+      {"LINE 1: SELECT 'ZZ9'", ""},
+      // Cut short by truncation.
+      {"err\n\nLINE 1: SELECT 'ZZ", "err"},
+      {"err\n\nLINE 1:", "err"},
+      {"err\n\nLINE 1", "err\n\nLINE 1"},
+      // Not an echo.
+      {"syntax error at LINE 1: x", "syntax error at LINE 1: x"},
+      {"err\nLINES: 3", "err\nLINES: 3"},
+      {"err\nLINE x: 3", "err\nLINE x: 3"},
+      {"", ""},
+  };
+  for (const auto& [text, expected] : kCases) {
+    EXPECT_EQ(StripStatementEcho(text), expected) << text;
+  }
+}
+
+TEST(MotherDuckRedactTest, InstalledRedactorStripsStatementEcho) {
+  const std::string message =
+      "ERROR:  Parser Error: syntax error at or near \"(\"\n\n"
+      "LINE 1: CREATE SECRET s (SECRET 'ZZ9'\n                        ^\n";
+  InstallMotherDuckQueryRedactor();
+  EXPECT_EQ(RedactMessage(message),
+            "ERROR:  Parser Error: syntax error at or near \"(\"");
+  SetQueryRedactor(nullptr);
+}
+
 // libpq's default error message echoes the statement ("LINE 1: ..."); ours must not.
+// MotherDuck also writes the echo into the primary message, which the redactor drops.
 TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   if (!uri) GTEST_SKIP() << "ADBC_POSTGRESQL_TEST_URI not set";
@@ -282,7 +320,10 @@ TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
     PQfinish(conn);
     GTEST_SKIP() << "server did not echo the statement; nothing to check";
   }
+  InstallMotherDuckQueryRedactor();
   const std::string text = PqErrorText(result, conn);
+  SetQueryRedactor(nullptr);
+  EXPECT_NE(text.find("syntax error"), std::string::npos) << text;
   EXPECT_EQ(text.find("UNIQUEMARKER"), std::string::npos) << text;
   EXPECT_EQ(text.find("LINE"), std::string::npos) << text;
   PQclear(result);

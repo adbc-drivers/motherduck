@@ -37,7 +37,20 @@ namespace adbcpq {
 /// "(redacted)".
 std::string RedactSecretStatements(std::string_view query);
 
-/// \brief Install RedactSecretStatements as the driver's error-message query redactor.
+/// \brief Drop the statement echo DuckDB appends to its error messages.
+///
+/// MotherDuck puts it in the primary message itself, so libpq's terse verbosity does
+/// not remove it: "Parser Error: ...\n\nLINE 1: SELECT ...\n       ^". Everything from
+/// the first line that starts with "LINE <n>:" to the end is removed, along with the
+/// blank lines before it. Text without such a line is returned unchanged.
+std::string StripStatementEcho(std::string_view text);
+
+/// \brief StripStatementEcho, then RedactSecretStatements.
+///
+/// The redactor the driver installs; it sees SQL as well as server text.
+std::string RedactMotherDuckErrorText(std::string_view text);
+
+/// \brief Install RedactMotherDuckErrorText as the driver's error-message redactor.
 void InstallMotherDuckQueryRedactor();
 
 }  // namespace adbcpq
