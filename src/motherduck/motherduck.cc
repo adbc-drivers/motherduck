@@ -20,6 +20,6 @@
 
 extern "C" AdbcStatusCode AdbcDriverMotherduckInit(int version, void* raw_driver,
                                                    struct AdbcError* error) {
-  adbcpq::InstallMotherDuckQueryRedactor();
+  adbcpq::InstallMotherDuckRedactors();
   return AdbcDriverPostgresqlInit(version, raw_driver, error);
 }
