@@ -88,12 +88,12 @@ nothing are rejected, since it would escape the space before the driver's
 options. Single mode needs a named database; to connect to `md:`, set
 `workspace`.
 
-The driver also adds `--return_pg_command_tags=on` before the URI's session
-options, so the endpoint answers DML and DDL with a PostgreSQL command tag that
-carries the affected-row count (`INSERT 0 2`, `UPDATE 3`, `DELETE 0`,
-`CREATE TABLE`) instead of DuckDB's `Count` or `Success` result set. Set
-`return_pg_command_tags=off` in the URI's `options` or `PGOPTIONS` to get those
-result sets back.
+The driver also adds `--return_pg_command_tags=on`, so the endpoint answers
+DML and DDL with a PostgreSQL command tag that carries the affected-row count
+(`INSERT 0 2`, `UPDATE 3`, `DELETE 0`, `CREATE TABLE`) instead of DuckDB's
+`Count` or `Success` result set. `ExecuteQuery` on such a statement therefore
+returns an empty stream, and `rows_affected` for `UPDATE` and `DELETE` is the
+number of rows changed rather than 1.
 
 `adbc.motherduck.session_name` (database option) sets MotherDuck's
 [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name),
@@ -180,8 +180,8 @@ to fail.
   bound parameters, `GetParameterSchema` and `ExecuteSchema` return
   `NOT_IMPLEMENTED` for them. An all-null parameter whose type the endpoint
   can't infer is cast to `TEXT`, so `SELECT 1 + $1` with a null fails.
-- **Rows affected** is the row count rather than -1 for a `SELECT` on the
-  non-COPY path (#49).
+- **Rows affected** is the number of rows returned rather than -1 for a
+  `SELECT` or a statement with `RETURNING` on the non-COPY path (#49).
 - **Metadata:** the current catalog reports `md:` rather than the current
   database when you connect to `md:` (#14), and `GetStatistics` and
   `GetStatisticNames` aren't supported, since MotherDuck has no `pg_stats`.
