@@ -48,9 +48,10 @@ std::string CastParameters(std::string_view query, const std::vector<std::string
 std::string UncastParameters(std::string_view name,
                              const std::vector<std::string>& types);
 
-// Whether a statement that isn't a COPY succeeded. MotherDuck answers DDL with
-// an empty result set (a Count or Success column) instead of a command tag, so
-// PGRES_TUPLES_OK counts as success alongside PGRES_COMMAND_OK.
+// Whether a statement that isn't a COPY succeeded. Without
+// return_pg_command_tags, MotherDuck answers DDL with an empty result set (a
+// Count or Success column) instead of a command tag, so PGRES_TUPLES_OK counts
+// as success alongside PGRES_COMMAND_OK.
 inline bool IsResultOk(const PGresult* result) {
   ExecStatusType status = PQresultStatus(result);
   return status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK;
