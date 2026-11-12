@@ -33,19 +33,19 @@
 namespace adbcpq {
 
 namespace {
-std::atomic<QueryRedactor> query_redactor{nullptr};
-std::atomic<QueryRedactor> message_redactor{nullptr};
+std::atomic<TextRedactor> query_redactor{nullptr};
+std::atomic<TextRedactor> message_redactor{nullptr};
 }  // namespace
 
-void SetQueryRedactor(QueryRedactor redactor) { query_redactor.store(redactor); }
+void SetQueryRedactor(TextRedactor redactor) { query_redactor.store(redactor); }
 
-void SetMessageRedactor(QueryRedactor redactor) { message_redactor.store(redactor); }
+void SetMessageRedactor(TextRedactor redactor) { message_redactor.store(redactor); }
 
 namespace {
 
 // Cut to max_bytes, redact what is kept, and mark the cut.
 RedactedText TruncateAndRedact(std::string_view text, size_t max_bytes,
-                               QueryRedactor redactor) {
+                               TextRedactor redactor) {
   bool truncated = false;
   if (text.size() > max_bytes) {
     size_t cut = max_bytes;
@@ -71,7 +71,7 @@ RedactedText RedactQuery(std::string_view query) {
 }
 
 RedactedText RedactMessage(std::string_view message) {
-  QueryRedactor redactor = message_redactor.load();
+  TextRedactor redactor = message_redactor.load();
   if (redactor == nullptr) redactor = query_redactor.load();
   return TruncateAndRedact(message, kMaxMessageBytes, redactor);
 }

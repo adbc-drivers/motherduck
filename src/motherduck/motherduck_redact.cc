@@ -28,6 +28,9 @@ namespace adbcpq {
 
 namespace {
 
+// Replaces the statement echo that StripStatementEcho removes.
+constexpr char kStatementOmitted[] = "[statement omitted]";
+
 // Deliberately crude: patterns match raw text, ignoring quoting, and the earliest match
 // cuts the text there (group 1 is what's kept). Over-masking is fine; leaking is not.
 // Repeats are bounded because libstdc++'s matcher recurses once per iteration.
@@ -141,9 +144,10 @@ std::string RedactServerMessage(std::string_view text) {
 
 }  // namespace
 
-void InstallMotherDuckQueryRedactor() {
-  SetQueryRedactor(&RedactSecretStatements);
+void InstallMotherDuckRedactors() {
+  // Message first: until it is set, messages fall back to the query redactor.
   SetMessageRedactor(&RedactServerMessage);
+  SetQueryRedactor(&RedactSecretStatements);
 }
 
 }  // namespace adbcpq

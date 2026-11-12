@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include <libpq-fe.h>
@@ -230,7 +231,7 @@ TEST(MotherDuckRedactTest, MalformedInputDoesNotCrash) {
 
 TEST(MotherDuckRedactTest, InstalledRedactorAppliesToErrors) {
   EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET s (SECRET 'x')");
-  InstallMotherDuckQueryRedactor();
+  InstallMotherDuckRedactors();
   EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET ...");
   ResetRedactors();
 }
@@ -254,7 +255,7 @@ TEST(MotherDuckRedactTest, EveryPrefixOfAStatementHidesTheSecret) {
 
 // The same through the real truncation, with the cut inside the secret.
 TEST(MotherDuckRedactTest, SecretAtTheTruncationPointIsNotLogged) {
-  InstallMotherDuckQueryRedactor();
+  InstallMotherDuckRedactors();
   // One shape is enough (each cut is a full pass over 512 KiB); the prefix test above
   // covers the rest.
   for (const char* tail : {"' AS x; ATTACH 'postgresql://user:ZZ9ZZ9ZZ9@host/db'"}) {
@@ -302,7 +303,7 @@ TEST(MotherDuckRedactTest, InstalledRedactorStripsEchoFromMessagesOnly) {
       "ERROR:  Parser Error: syntax error at or near \"(\"\n\n"
       "LINE 1: CREATE SECRET s (SECRET 'ZZ9'\n                        ^\n";
   const std::string query = "SELECT 'a\nLINE 1: b'";
-  InstallMotherDuckQueryRedactor();
+  InstallMotherDuckRedactors();
   EXPECT_EQ(RedactMessage(message),
             "ERROR:  Parser Error: syntax error at or near \"(\" [statement omitted]");
   EXPECT_EQ(RedactQuery(query), query);
@@ -312,7 +313,7 @@ TEST(MotherDuckRedactTest, InstalledRedactorStripsEchoFromMessagesOnly) {
 // A message cut anywhere, by hand or by the real truncation, must not leak the echo.
 TEST(MotherDuckRedactTest, EveryPrefixOfAnEchoHidesTheStatement) {
   const std::string echo = "\n\nLINE 1: SELECT FROM WHERE 'ZZ9' +\n                ^\n";
-  InstallMotherDuckQueryRedactor();
+  InstallMotherDuckRedactors();
   const std::string head = "ERROR:  Parser Error: syntax error";
   const std::string message = head + echo;
   for (size_t n = 0; n <= message.size(); n++) {
@@ -339,17 +340,20 @@ TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
   const char* keywords[] = {"dbname", "password", nullptr, nullptr};
   const char* values[] = {uri, token != nullptr ? token : "", nullptr, nullptr};
   PGconn* conn = PQconnectdbParams(keywords, values, /*expand_dbname=*/1);
-  if (PQstatus(conn) != CONNECTION_OK) {
+  if (PQstatus(conn) != CONNECTION_OK &&
+      std::string(PQerrorMessage(conn)).find("no database") != std::string::npos) {
     // The URI's database may not exist yet (CI creates it in a later suite). Any
     // database will do, so try the workspace; a later dbname overrides the URI's.
+    // Other failures, like a bad token, must fail the test rather than skip it.
     PQfinish(conn);
     keywords[2] = "dbname";
     values[2] = "md:";
     conn = PQconnectdbParams(keywords, values, /*expand_dbname=*/1);
   }
   if (PQstatus(conn) != CONNECTION_OK) {
+    const std::string message = PqErrorText(nullptr, conn);
     PQfinish(conn);
-    GTEST_SKIP() << "cannot connect with libpq directly";
+    FAIL() << "cannot connect with libpq directly: " << message;
   }
   PGresult* result = PQexec(conn, "SELECT FROM WHERE 'UNIQUEMARKER' +");
   ASSERT_EQ(PQresultStatus(result), PGRES_FATAL_ERROR);
@@ -359,12 +363,21 @@ TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
     PQfinish(conn);
     GTEST_SKIP() << "server did not echo the statement; nothing to check";
   }
-  InstallMotherDuckQueryRedactor();
-  const std::string text = PqErrorText(result, conn);
+  InstallMotherDuckRedactors();
+  // Every way the driver puts this error into an AdbcError: the result's text, the
+  // connection's (pipeline paths, default verbosity), and MakeStatus's detail fields.
+  std::vector<std::string> texts = {PqErrorText(result, conn),
+                                    PqErrorText(nullptr, conn)};
+  for (const auto& field : kDetailFields) {
+    const char* value = PQresultErrorField(result, field.code);
+    if (value != nullptr) texts.push_back(RedactMessage(value));
+  }
   ResetRedactors();
-  EXPECT_NE(text.find("syntax error"), std::string::npos) << text;
-  EXPECT_EQ(text.find("UNIQUEMARKER"), std::string::npos) << text;
-  EXPECT_EQ(text.find("LINE"), std::string::npos) << text;
+  EXPECT_NE(texts[0].find("syntax error"), std::string::npos) << texts[0];
+  for (const std::string& text : texts) {
+    EXPECT_EQ(text.find("UNIQUEMARKER"), std::string::npos) << text;
+    EXPECT_EQ(text.find("LINE"), std::string::npos) << text;
+  }
   PQclear(result);
   PQfinish(conn);
 }

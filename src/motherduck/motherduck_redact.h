@@ -37,9 +37,6 @@ namespace adbcpq {
 /// "(redacted)".
 std::string RedactSecretStatements(std::string_view query);
 
-/// Replaces the statement echo that StripStatementEcho removes.
-inline constexpr char kStatementOmitted[] = "[statement omitted]";
-
 /// \brief Replace the statement echo DuckDB appends to its error messages.
 ///
 /// MotherDuck puts it in the primary message itself, so libpq's terse verbosity does
@@ -52,6 +49,6 @@ std::string StripStatementEcho(std::string_view text);
 ///
 /// SQL text goes through RedactSecretStatements. Server text goes through
 /// StripStatementEcho first, so only messages lose a "LINE <n>:" line.
-void InstallMotherDuckQueryRedactor();
+void InstallMotherDuckRedactors();
 
 }  // namespace adbcpq

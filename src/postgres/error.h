@@ -67,10 +67,12 @@ static const std::vector<DetailField> kDetailFields = {
 
 AdbcStatusCode ClassifySqlState(const char* sqlstate);
 
-/// \brief Hook that masks sensitive text in SQL before it goes into an error message.
+/// \brief Hook that masks sensitive text before it goes into an error message.
 ///
-/// It only sees text already cut to kMaxQueryBytes or kMaxMessageBytes.
-using QueryRedactor = std::string (*)(std::string_view query);
+/// One is installed for SQL (SetQueryRedactor) and optionally another for text the
+/// server wrote (SetMessageRedactor). It only sees text already cut to kMaxQueryBytes
+/// or kMaxMessageBytes.
+using TextRedactor = std::string (*)(std::string_view text);
 
 /// Longest SQL text kept in an error message; the rest is cut before redaction.
 constexpr size_t kMaxQueryBytes = 512 * 1024;
@@ -103,19 +105,21 @@ struct fmt::formatter<adbcpq::RedactedText> : fmt::formatter<std::string_view> {
 namespace adbcpq {
 
 /// \brief Install the redactor used by RedactQuery (nullptr: none). Call at init.
-void SetQueryRedactor(QueryRedactor redactor);
+void SetQueryRedactor(TextRedactor redactor);
 
 /// \brief Install the redactor used by RedactMessage, for text the server wrote.
 ///
-/// nullptr (the default) means RedactMessage uses the query redactor. Call at init.
-void SetMessageRedactor(QueryRedactor redactor);
+/// nullptr (the default) means RedactMessage uses the query redactor. Call at init,
+/// before SetQueryRedactor, so a message is never redacted with only the query one.
+void SetMessageRedactor(TextRedactor redactor);
 
-/// \brief Truncate SQL text to kMaxQueryBytes, then apply the installed redactor.
+/// \brief Truncate SQL text to kMaxQueryBytes, then apply the query redactor.
 ///
 /// Truncation comes first, so the redactor never sees text past the cut.
 RedactedText RedactQuery(std::string_view query);
 
-/// \brief As RedactQuery, for text the server wrote (kMaxMessageBytes).
+/// \brief Truncate server text to kMaxMessageBytes, then apply the message redactor,
+/// or the query redactor if no message redactor is installed.
 RedactedText RedactMessage(std::string_view message);
 
 /// \brief The server's error text without the echoed statement.
