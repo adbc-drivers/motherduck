@@ -636,7 +636,7 @@ AdbcStatusCode PostgresStatement::ExecuteBind(struct ArrowArrayStream* stream,
   reader->SetVendorName(connection_->VendorName());
   if (stream != nullptr) RememberReader(reader);
   RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
-  if (stream != nullptr && reader->server_streaming()) {
+  if (stream != nullptr && (reader->server_streaming() || reader->owns_transaction())) {
     connection_->TrackActiveReader(reader);
   } else if (stream == nullptr) {
     ForgetReader();
@@ -648,7 +648,7 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
                                                int64_t* rows_affected,
                                                struct AdbcError* error) {
   ForgetReader();
-  if (connection_) connection_->FinishActiveReader();
+  if (connection_) RAISE_ADBC(connection_->FinishActiveReader(error));
   ClearResult();
 
   // Use a dedicated path to handle bulk ingest
@@ -679,7 +679,7 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
     reader->SetBatchSizeHint(batch_size_hint_bytes_);
     if (stream != nullptr) RememberReader(reader);
     RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
-    if (stream != nullptr && reader->server_streaming()) {
+    if (stream != nullptr && (reader->server_streaming() || reader->owns_transaction())) {
       connection_->TrackActiveReader(reader);
     } else if (stream == nullptr) {
       ForgetReader();
@@ -708,7 +708,7 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
     reader->SetBatchSizeHint(batch_size_hint_bytes_);
     if (stream != nullptr) RememberReader(reader);
     RAISE_STATUS(error, reader->ToArrayStream(rows_affected, stream));
-    if (stream != nullptr && reader->server_streaming()) {
+    if (stream != nullptr && (reader->server_streaming() || reader->owns_transaction())) {
       connection_->TrackActiveReader(reader);
     } else if (stream == nullptr) {
       ForgetReader();
@@ -742,7 +742,7 @@ AdbcStatusCode PostgresStatement::ExecuteQuery(struct ArrowArrayStream* stream,
 AdbcStatusCode PostgresStatement::ExecuteSchema(struct ArrowSchema* schema,
                                                 struct AdbcError* error) {
   ForgetReader();
-  if (connection_) connection_->FinishActiveReader();
+  if (connection_) RAISE_ADBC(connection_->FinishActiveReader(error));
   ClearResult();
   if (query_.empty()) {
     InternalAdbcSetError(error, "%s", "[libpq] Must SetSqlQuery before ExecuteQuery");
@@ -941,7 +941,7 @@ AdbcStatusCode PostgresStatement::GetOptionInt(const char* key, int64_t* value,
 
 AdbcStatusCode PostgresStatement::GetParameterSchema(struct ArrowSchema* schema,
                                                      struct AdbcError* error) {
-  if (connection_) connection_->FinishActiveReader();
+  if (connection_) RAISE_ADBC(connection_->FinishActiveReader(error));
   if (query_.empty()) {
     InternalAdbcSetError(error, "[libpq] Must SetSqlQuery before GetParameterSchema");
     return ADBC_STATUS_INVALID_STATE;
@@ -982,7 +982,7 @@ Status PostgresStatement::PrepareQuery(PGconn* conn, const std::string& query,
 }
 
 AdbcStatusCode PostgresStatement::Prepare(struct AdbcError* error) {
-  if (connection_) connection_->FinishActiveReader();
+  if (connection_) RAISE_ADBC(connection_->FinishActiveReader(error));
   if (query_.empty()) {
     InternalAdbcSetError(error, "%s", "[libpq] Must SetSqlQuery() before Prepare()");
     return ADBC_STATUS_INVALID_STATE;

@@ -75,11 +75,14 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   bool streaming_rows() const { return streaming_rows_; }
   // True while the server still owes this reader a packet.
   bool server_streaming() const { return helper_.streaming(); }
+  // True until the transaction this reader opened is committed or rolled back.
+  bool owns_transaction() const { return own_txn_; }
   // Drop a server read so the connection can run another command. A result
-  // that is already fully buffered stays readable.
-  void ReleaseConnection();
+  // that is already fully buffered stays readable. Failure means the script
+  // was not committed.
+  Status ReleaseConnection();
   // Finish an open read on this thread. Safe to call more than once.
-  void Close();
+  Status Close();
   // Thread-safe. Sets the cancel flag. The reading thread sends the cancel.
   AdbcStatusCode RequestCancel(struct AdbcError* error);
   void SetConnection(std::shared_ptr<PostgresConnection> connection) {

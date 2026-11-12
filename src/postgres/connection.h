@@ -99,8 +99,10 @@ class PostgresConnection {
   // connection has to finish that read first, whichever statement starts it.
   void TrackActiveReader(const std::shared_ptr<PqResultArrayReader>& reader);
   std::shared_ptr<PqResultArrayReader> ActiveReader() const;
-  void FinishActiveReader();
-  bool disconnected() const { return disconnected_.load(std::memory_order_acquire); }
+  AdbcStatusCode FinishActiveReader(struct AdbcError* error);
+  // The reader that opened a transaction could not commit or roll it back.
+  void NoteAbandonedTransaction() { abandoned_txn_ = true; }
+  bool disconnected() const { return disconnected_.load(); }
   const std::shared_ptr<PostgresTypeResolver>& type_resolver() const {
     return type_resolver_;
   }
@@ -125,6 +127,7 @@ class PostgresConnection {
   friend class PostgresStatement;
 
   AdbcStatusCode EnsureTransaction(struct AdbcError* error);
+  AdbcStatusCode RollbackAbandonedTransaction(struct AdbcError* error);
 
   std::shared_ptr<PostgresDatabase> database_;
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
@@ -135,6 +138,8 @@ class PostgresConnection {
   std::weak_ptr<PqResultArrayReader> active_reader_;
   // Set before PQfinish. A reader destroyed after that only frees results.
   std::atomic<bool> disconnected_{false};
+  // A reader gave up a transaction it could not commit or roll back.
+  bool abandoned_txn_ = false;
   bool autocommit_;
   bool use_copy_;
   std::vector<std::pair<std::string, std::string>> post_init_options_;

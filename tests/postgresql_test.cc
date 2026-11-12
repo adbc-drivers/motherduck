@@ -4788,6 +4788,52 @@ TEST_F(PostgresStatementTest, BufferedResultSurvivesConnectionRelease) {
   ASSERT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[0], 0), 5);
 }
 
+TEST_F(PostgresStatementTest, NextCommandDoesNotJoinUnfinishedScript) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  for (const char* query : {"DROP TABLE IF EXISTS test_stream_held_txn",
+                            "CREATE TABLE test_stream_held_txn (ints INT)"}) {
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "INSERT INTO test_stream_held_txn VALUES (1); "
+                                       "SELECT 1",
+                                       &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader unread;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&statement, &unread.stream.value, nullptr, &error),
+      IsOkStatus(&error));
+
+  adbc_validation::Handle<struct AdbcStatement> other;
+  ASSERT_THAT(AdbcStatementNew(&connection, &other.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&other.value,
+                                       "SELECT * FROM test_stream_held_missing", &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader failed;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&other.value, &failed.stream.value, nullptr, &error),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release != nullptr) error.release(&error);
+
+  ASSERT_NO_FATAL_FAILURE(unread.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(unread.Next());
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(unread.array_view->children[0], 0), 1);
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &other.value, "SELECT COUNT(*) FROM test_stream_held_txn", &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader count;
+  ASSERT_THAT(
+      AdbcStatementExecuteQuery(&other.value, &count.stream.value, nullptr, &error),
+      IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(count.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(count.Next());
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(count.array_view->children[0], 0), 1);
+}
+
 TEST_F(PostgresStatementTest, MultipleStatementsDmlVisibleBeforeRead) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,

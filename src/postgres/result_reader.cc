@@ -38,12 +38,12 @@
 
 namespace adbcpq {
 
-void PqResultArrayReader::Close() {
-  if (closed_) return;
+Status PqResultArrayReader::Close() {
+  if (closed_) return Status::Ok();
   if (connection_ != nullptr && connection_->disconnected()) {
     helper_.DiscardLocal();
     closed_ = true;
-    return;
+    return Status::Ok();
   }
   closed_ = true;
   const bool user_cancel = cancel_requested_.load();
@@ -60,16 +60,17 @@ void PqResultArrayReader::Close() {
     const bool rolled_back = result != nullptr && CommandSucceeded(result);
     PQclear(result);
     savepoint_ = false;
-    if (!rolled_back) {
-      EndOwnedTransaction(false);
-      return;
-    }
+    if (!rolled_back) return EndOwnedTransaction(false);
   }
-  if (fast_close && !failed) {
-    EndOwnedTransaction(true);
-    return;
+  if (fast_close && !failed) return EndOwnedTransaction(true);
+  Status ended = EndOwnedTransaction(!(failed || user_cancel));
+  // Both COMMIT and ROLLBACK failed. The connection rolls this back before
+  // the next command, since this reader is about to be destroyed.
+  if (own_txn_) {
+    if (connection_ != nullptr) connection_->NoteAbandonedTransaction();
+    own_txn_ = false;
   }
-  EndOwnedTransaction(!(failed || user_cancel));
+  return ended;
 }
 
 PqResultArrayReader::~PqResultArrayReader() {
@@ -448,17 +449,24 @@ Status PqResultArrayReader::OpenRowStream() {
   return status;
 }
 
-void PqResultArrayReader::ReleaseConnection() {
-  if (closed_) return;
+Status PqResultArrayReader::ReleaseConnection() {
+  if (closed_) return Status::Ok();
   if (!helper_.streaming()) {
     // Rows already received stay readable. Commit a script the server finished.
-    EndOwnedTransaction(!script_failed_);
-    return;
+    Status ended = EndOwnedTransaction(!script_failed_);
+    // Commit and the follow-up rollback both failed. This reader is no longer
+    // the active one, so the connection has to finish the transaction.
+    if (own_txn_) {
+      if (connection_ != nullptr) connection_->NoteAbandonedTransaction();
+      own_txn_ = false;
+    }
+    return ended;
   }
-  Close();
+  Status ended = Close();
   status_ = ADBC_STATUS_INVALID_STATE;
   InternalAdbcSetError(&error_, "%s",
                        "[libpq] Reader invalidated (statement or reader was closed)");
+  return ended;
 }
 
 AdbcStatusCode PqResultArrayReader::RequestCancel(struct AdbcError* error) {
