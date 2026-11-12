@@ -58,6 +58,42 @@ constexpr char kNoStatistics[] =
 
 }  // namespace
 
+AdbcStatusCode SetMotherduckSearchPath(PGconn* conn, std::string_view schema,
+                                       std::string_view database, const char* option,
+                                       struct AdbcError* error) {
+  std::string database_name(database);
+  if (database_name.empty()) {
+    PqResultHelper helper(conn, "SELECT current_database()");
+    RAISE_STATUS(error, helper.Execute());
+    if (helper.NumRows() != 1) {
+      InternalAdbcSetError(error, "[motherduck] Failed to look up the current database");
+      return ADBC_STATUS_INTERNAL;
+    }
+    database_name = Text(helper.Row(0)[0]);
+  }
+
+  std::string database_esc;
+  std::string schema_esc;
+  RAISE_ADBC(EscapeIdentifier(conn, database_name, &database_esc, error));
+  RAISE_ADBC(EscapeIdentifier(conn, schema, &schema_esc, error));
+  // The endpoint doesn't accept a parameter here.
+  PGresult* result =
+      PQexec(conn, ("SET search_path TO " + database_esc + "." + schema_esc).c_str());
+  // MotherDuck answers SET with an empty Success result set.
+  const ExecStatusType result_status = PQresultStatus(result);
+  if (result_status == PGRES_COMMAND_OK || result_status == PGRES_TUPLES_OK) {
+    PQclear(result);
+    return ADBC_STATUS_OK;
+  }
+  // Keeps the server's SQLSTATE and details, and classifies the status.
+  adbc::driver::Status status =
+      MakeStatus(result, "[motherduck] Failed to set {}={}: {}", RedactedText(option),
+                 // An identifier the caller chose, not SQL or server text.
+                 RedactedText(std::string(schema)), PqErrorText(result, conn));
+  PQclear(result);
+  return status.ToAdbc(error);
+}
+
 std::vector<uint32_t> MotherduckInfoCodes(const uint32_t* info_codes,
                                           size_t info_codes_length) {
   if (info_codes == nullptr) {
@@ -150,6 +186,19 @@ AdbcStatusCode MotherduckConnection::GetTableSchema(const char* catalog,
            error);
   result.move(schema);
   return ADBC_STATUS_OK;
+}
+
+AdbcStatusCode MotherduckConnection::SetOption(const char* key, const char* value,
+                                               struct AdbcError* error) {
+  // Before Init the base defers the option and replays it through this
+  // override once connected.
+  if (std::strcmp(key, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA) != 0 ||
+      conn() == nullptr || value == nullptr) {
+    return PostgresConnection::SetOption(key, value, error);
+  }
+  // The current database, which a USE may have changed since connecting.
+  return SetMotherduckSearchPath(conn(), value, /*database=*/{},
+                                 ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA, error);
 }
 
 AdbcStatusCode MotherduckConnection::GetTableTypes(struct AdbcConnection* connection,
