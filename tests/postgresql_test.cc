@@ -27,10 +27,13 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -38,17 +41,23 @@
 #include <variant>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #include <arrow-adbc/adbc.h>
 #include <arrow-adbc/driver/postgresql.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
+#include <libpq-fe.h>
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow.hpp>
 
 #include "adbc_driver_motherduck_config.h"
 #include "common/options.h"
 #include "common/utils.h"
-#include "database.h"
+#include "motherduck_database.h"
+#include "motherduck_test_util.h"
 #include "validation/adbc_validation.h"
 #include "validation/adbc_validation_util.h"
 
@@ -56,6 +65,9 @@ using adbc_validation::Handle;
 using adbc_validation::IsOkStatus;
 using adbc_validation::IsStatus;
 using std::string_literals::operator""s;
+
+// Bulk ingest needs COPY FROM STDIN, which the Postgres endpoint lacks (#31).
+#define SKIP_WITHOUT_COPY_FROM_STDIN() GTEST_SKIP() << "Needs COPY FROM STDIN (#31)"
 
 class PostgresQuirks : public adbc_validation::DriverQuirks {
  public:
@@ -79,13 +91,9 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return SetupDatabase(database, uri, error);
   }
 
-  // Works around https://github.com/adbc-drivers/motherduck/issues/11;
-  // MotherDuckDefaultsSelect covers the default.
   AdbcStatusCode SetupDatabase(struct AdbcDatabase* database, const char* uri,
                                struct AdbcError* error) const {
-    AdbcStatusCode status = AdbcDatabaseSetOption(database, "uri", uri, error);
-    if (status != ADBC_STATUS_OK) return status;
-    return AdbcDatabaseSetOption(database, "adbc.postgresql.use_copy", "false", error);
+    return AdbcDatabaseSetOption(database, "uri", uri, error);
   }
 
   std::string QuoteIdentifier(std::string_view name) const override {
@@ -118,6 +126,35 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     RAISE_ADBC(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), error));
     RAISE_ADBC(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, error));
     return AdbcStatementRelease(&statement.value, error);
+  }
+
+  // Bulk ingest isn't available (#31), so build the sample table with SQL.
+  AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
+                                   const std::string& name,
+                                   struct AdbcError* error) const override {
+    return CreateSampleTableSql(connection, QuoteIdentifier(name), error);
+  }
+
+  AdbcStatusCode CreateSampleTable(struct AdbcConnection* connection,
+                                   const std::string& name, const std::string& schema,
+                                   struct AdbcError* error) const override {
+    return CreateSampleTableSql(
+        connection, QuoteIdentifier(schema) + "." + QuoteIdentifier(name), error);
+  }
+
+  AdbcStatusCode CreateSampleTableSql(struct AdbcConnection* connection,
+                                      const std::string& table,
+                                      struct AdbcError* error) const {
+    for (const std::string& query :
+         {"CREATE TABLE " + table + " (int64s BIGINT, strings TEXT)",
+          "INSERT INTO " + table + " VALUES (42, 'foo'), (-42, NULL), (NULL, '')"}) {
+      Handle<struct AdbcStatement> statement;
+      RAISE_ADBC(AdbcStatementNew(connection, &statement.value, error));
+      RAISE_ADBC(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), error));
+      RAISE_ADBC(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, error));
+      RAISE_ADBC(AdbcStatementRelease(&statement.value, error));
+    }
+    return ADBC_STATUS_OK;
   }
 
   AdbcStatusCode DropTempTable(struct AdbcConnection* connection, const std::string& name,
@@ -238,6 +275,8 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   }
   std::string db_schema() const override { return "main"; }
 
+  // No COPY FROM STDIN yet (#31).
+  bool supports_bulk_ingest(const char* mode) const override { return false; }
   // MotherDuck supports database.schema.table names.
   bool supports_bulk_ingest_catalog() const override { return true; }
   bool supports_bulk_ingest_db_schema() const override { return true; }
@@ -348,36 +387,37 @@ TEST_F(PostgresDatabaseTest, UseCopyOption) {
 
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, key, "false", &error),
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, key, "true", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   use_copy = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
 
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::ConnectionGetOption(&connection.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
 
   ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::StatementGetOption(&statement.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 
-  ASSERT_THAT(AdbcConnectionSetOption(&connection.value, key, "true", &error),
+  ASSERT_THAT(AdbcConnectionSetOption(&connection.value, key, "false", &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::ConnectionGetOption(&connection.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
 
   ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::StatementGetOption(&statement.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 }
 
+// The endpoint rejects binary COPY TO STDOUT, so the default is off (#11).
 TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   const char* key = "adbc.postgresql.use_copy";
   std::optional<std::string> use_copy;
@@ -390,18 +430,18 @@ TEST_F(PostgresDatabaseTest, UseCopyOptionDefault) {
   ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
   use_copy = adbc_validation::DatabaseGetOption(&database.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
 
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::ConnectionGetOption(&connection.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
 
   ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
               IsOkStatus(&error));
   use_copy = adbc_validation::StatementGetOption(&statement.value, key, &error);
-  EXPECT_THAT(use_copy, ::testing::Optional("true"s));
+  EXPECT_THAT(use_copy, ::testing::Optional("false"s));
   ASSERT_THAT(AdbcStatementRelease(&statement.value, &error), IsOkStatus(&error));
 }
 
@@ -420,7 +460,7 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
 TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
-  // A password in the URI takes precedence over PGPASSWORD.
+  // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
   std::string bad_uri = uri;
   bad_uri += std::strchr(uri, '?') ? "&password=invalid" : "?password=invalid";
 
@@ -447,7 +487,7 @@ TEST_F(PostgresDatabaseTest, RejectedTokensAreAuthFailures) {
       "DAwMDAwMCJ9.bm90LWEtc2lnbmF0dXJl",
   };
   for (const std::string& token : tokens) {
-    // A password in the URI takes precedence over PGPASSWORD.
+    // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
     std::string bad_uri = uri;
     bad_uri += (std::strchr(uri, '?') ? "&password=" : "?password=") + token;
     adbc_validation::Handle<struct AdbcDatabase> database;
@@ -459,6 +499,223 @@ TEST_F(PostgresDatabaseTest, RejectedTokensAreAuthFailures) {
     ASSERT_NE(error.message, nullptr);
     EXPECT_TRUE(adbcpq::IsAuthFailure(error.message)) << error.message;
     error.release(&error);
+  }
+}
+
+// A uniquely named file in the temp directory, removed when the object is.
+// A uniquely named file in the temp directory holding contents, readable only
+// by its owner from the moment it exists, and removed when the object is. The
+// path is empty if the file couldn't be created and written in full.
+class ScopedTempFile {
+ public:
+  ScopedTempFile(std::string_view prefix, std::string_view contents) {
+#ifdef _WIN32
+    // The temp directory is per user on Windows.
+    std::random_device random;
+    path_ = std::filesystem::temp_directory_path() /
+            (std::string(prefix) + "_" + std::to_string(random()));
+    std::ofstream out(path_, std::ios::binary);
+    out << contents;
+    out.close();
+    if (!out) path_.clear();
+#else
+    // mkstemp creates the file exclusively, with mode 0600.
+    std::string name =
+        (std::filesystem::temp_directory_path() / (std::string(prefix) + "_XXXXXX"))
+            .string();
+    int fd = mkstemp(name.data());
+    if (fd < 0) return;
+    path_ = name;
+    size_t written = 0;
+    while (written < contents.size()) {
+      ssize_t n = write(fd, contents.data() + written, contents.size() - written);
+      if (n <= 0) break;
+      written += static_cast<size_t>(n);
+    }
+    if (close(fd) != 0 || written < contents.size()) {
+      std::filesystem::remove(path_);
+      path_.clear();
+    }
+#endif
+  }
+  ~ScopedTempFile() {
+    std::error_code ec;
+    std::filesystem::remove(path_, ec);
+  }
+  const std::filesystem::path& path() const { return path_; }
+
+ private:
+  std::filesystem::path path_;
+};
+
+TEST_F(PostgresDatabaseTest, PasswordOption) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  const char* token = std::getenv("MOTHERDUCK_TOKEN");
+  ASSERT_NE(token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
+  std::string bad_uri = uri;
+  bad_uri += std::strchr(uri, '?') ? "&password=invalid" : "?password=invalid";
+
+  // The option takes precedence over a password in the URI.
+  {
+    adbc_validation::Handle<struct AdbcDatabase> database;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcDatabaseSetOption(&database.value, ADBC_OPTION_PASSWORD, token, &error),
+        IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  }
+  // And over MOTHERDUCK_TOKEN.
+  {
+    adbc_validation::Handle<struct AdbcDatabase> database;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcDatabaseSetOption(&database.value, ADBC_OPTION_PASSWORD, "invalid", &error),
+        IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error),
+                IsStatus(ADBC_STATUS_IO, &error));
+  }
+}
+
+TEST_F(PostgresDatabaseTest, IgnoresPostgresPasswords) {
+  const char* motherduck_token = std::getenv("MOTHERDUCK_TOKEN");
+  ASSERT_NE(motherduck_token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
+  const std::string token = motherduck_token;
+
+  // A valid token in PGPASSWORD or a password file doesn't rescue a bad one.
+  ScopedTempFile scoped_passfile("adbc_motherduck_pgpass", "*:*:*:*:" + token + "\n");
+  const std::filesystem::path& passfile = scoped_passfile.path();
+  ASSERT_FALSE(passfile.empty()) << "Couldn't create a password file";
+  {
+    ScopedEnv pgpassword("PGPASSWORD", token.c_str());
+    ScopedEnv pgpassfile("PGPASSFILE", passfile.string().c_str());
+    ScopedEnv bad_token("MOTHERDUCK_TOKEN", "invalid");
+    adbc_validation::Handle<struct AdbcDatabase> database;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupUri(&database.value, &error), IsOkStatus(&error));
+    EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
+                IsStatus(ADBC_STATUS_IO, &error));
+  }
+}
+
+TEST_F(PostgresDatabaseTest, RegionOption) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  // Take the region from the test URI's host, then drop the host.
+  std::string hostless = uri;
+  size_t start = hostless.find('@');
+  ASSERT_NE(start, std::string::npos) << "Test URI must be postgresql://user@host...";
+  start++;
+  size_t end = hostless.find_first_of(":/?", start);
+  std::string host = hostless.substr(start, end - start);
+  constexpr std::string_view kPrefix = "pg.";
+  constexpr std::string_view kSuffix = "-aws.motherduck.com";
+  if (host.size() <= kPrefix.size() + kSuffix.size() || host.rfind(kPrefix, 0) != 0 ||
+      host.compare(host.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+    GTEST_SKIP() << "Test host " << host << " isn't a MotherDuck region host";
+  }
+  std::string region =
+      host.substr(kPrefix.size(), host.size() - kPrefix.size() - kSuffix.size());
+  hostless.erase(start, end - start);
+
+  // Only the region can supply the host and port.
+  ScopedEnv pghost("PGHOST", "localhost");
+  ScopedEnv pgport("PGPORT", "1");
+  ScopedEnv pghostaddr("PGHOSTADDR", nullptr);
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&database.value, hostless.c_str(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_REGION,
+                                    region.c_str(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+              IsOkStatus(&error));
+}
+
+TEST_F(PostgresDatabaseTest, SessionNameOption) {
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_SESSION_NAME,
+                                    "adbc session", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+              IsOkStatus(&error));
+}
+
+// Each sslmode against MotherDuck's endpoint, which refuses plaintext: every
+// mode that connects must use TLS. The CA bundle comes from the test URI,
+// since some libpq builds can't read the system trust store.
+TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  char* parse_error = nullptr;
+  PQconninfoOption* conninfo = PQconninfoParse(uri, &parse_error);
+  ASSERT_NE(conninfo, nullptr) << (parse_error ? parse_error : "out of memory");
+  std::string base;
+  std::string rootcert;
+  for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
+    if (option->val == nullptr || *option->val == '\0') continue;
+    std::string_view keyword = option->keyword;
+    if (keyword == "sslrootcert") {
+      rootcert = option->val;
+    } else if (keyword == "host" || keyword == "port" || keyword == "dbname" ||
+               keyword == "user") {
+      base += std::string(keyword) + "='" + option->val + "' ";
+    }
+  }
+  PQconninfoFree(conninfo);
+  ASSERT_FALSE(rootcert.empty()) << "Test URI must set sslrootcert";
+
+  struct Case {
+    const char* sslmode;
+    std::string sslrootcert;
+    bool connects;
+  };
+  const Case kCases[] = {
+      // The endpoint refuses plaintext.
+      {"disable", "", false},
+      // allow and prefer retry with TLS after that refusal.
+      {"allow", "", true},
+      {"prefer", "", true},
+      {"require", "", true},
+      {"verify-ca", rootcert, true},
+      {"verify-full", rootcert, true},
+      // libpq refuses anything but verify-full with the system trust store.
+      {"require", "system", false},
+      {"verify-ca", "system", false},
+  };
+  ScopedEnv pgsslmode("PGSSLMODE", nullptr);
+  ScopedEnv pgsslrootcert("PGSSLROOTCERT", nullptr);
+  for (const Case& test_case : kCases) {
+    std::string conn_uri = base + "sslmode=" + test_case.sslmode;
+    if (!test_case.sslrootcert.empty()) {
+      conn_uri += " sslrootcert='" + test_case.sslrootcert + "'";
+    }
+    SCOPED_TRACE(std::string("sslmode=") + test_case.sslmode +
+                 " sslrootcert=" + test_case.sslrootcert);
+    adbcpq::MotherduckDatabase database;
+    ASSERT_THAT(database.SetOption("uri", conn_uri.c_str(), &error), IsOkStatus(&error));
+    PGconn* conn = nullptr;
+    AdbcStatusCode status = database.Connect(&conn, &error);
+    if (!test_case.connects) {
+      EXPECT_THAT(status, IsStatus(ADBC_STATUS_IO, &error));
+      if (error.release) error.release(&error);
+      continue;
+    }
+    ASSERT_THAT(status, IsOkStatus(&error));
+    EXPECT_EQ(PQsslInUse(conn), 1);
+    ASSERT_THAT(database.Disconnect(&conn, &error), IsOkStatus(&error));
   }
 }
 
@@ -485,8 +742,8 @@ TEST_F(PostgresDatabaseTest, TypeResolverModeOptionIgnored) {
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
 }
 
-// https://github.com/adbc-drivers/motherduck/issues/11: by default, results come
-// through binary COPY TO STDOUT.
+// https://github.com/adbc-drivers/motherduck/issues/11: a query returning rows
+// works with the default options.
 TEST_F(PostgresDatabaseTest, MotherDuckDefaultsSelect) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   adbc_validation::Handle<struct AdbcConnection> connection;
@@ -527,197 +784,6 @@ TEST_F(PostgresDatabaseTest, AdbcDriverBackwardsCompatibility) {
 
   ASSERT_THAT(::AdbcDriverPostgresqlInit(424242, &driver, &error),
               IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
-}
-
-TEST(MotherDuckAttachModeTest, OptionDefault) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
-              ::testing::Optional("single"s));
-}
-
-TEST(MotherDuckAttachModeTest, OptionSetGet) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const std::string value : {"workspace", "single"}) {
-    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
-                                      value.c_str(), &error),
-                IsOkStatus(&error));
-    EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                    &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
-                ::testing::Optional(value));
-  }
-}
-
-TEST(MotherDuckAttachModeTest, OptionInvalid) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* value : {"", "SINGLE", "multi"}) {
-    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
-                                      value, &error),
-                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    if (error.release) error.release(&error);
-  }
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
-              ::testing::Optional("single"s));
-}
-
-TEST(MotherDuckAttachModeTest, AddAttachMode) {
-  EXPECT_EQ("--attach_mode=single", adbcpq::AddAttachMode("", "single"));
-  EXPECT_EQ("--session_name=x --attach_mode=workspace",
-            adbcpq::AddAttachMode("--session_name=x", "workspace"));
-  // Options from the URI win.
-  EXPECT_EQ("--attach_mode=workspace",
-            adbcpq::AddAttachMode("--attach_mode=workspace", "single"));
-  EXPECT_EQ("-c attach_mode=workspace",
-            adbcpq::AddAttachMode("-c attach_mode=workspace", "single"));
-  EXPECT_EQ("-cattach_mode=workspace",
-            adbcpq::AddAttachMode("-cattach_mode=workspace", "single"));
-  EXPECT_EQ("--attach-mode=workspace",
-            adbcpq::AddAttachMode("--attach-mode=workspace", "single"));
-  EXPECT_EQ("-c attach-mode=workspace",
-            adbcpq::AddAttachMode("-c attach-mode=workspace", "single"));
-  // Other options that mention attach_mode don't count.
-  EXPECT_EQ("--session_name=attach_mode=x --attach_mode=single",
-            adbcpq::AddAttachMode("--session_name=attach_mode=x", "single"));
-  EXPECT_EQ("--session_name=attach_mode --attach_mode=single",
-            adbcpq::AddAttachMode("--session_name=attach_mode", "single"));
-}
-
-TEST(MotherDuckAuthTest, OptionDefaults) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, &error),
-              ::testing::Optional("token"s));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID, &error),
-              ::testing::Optional(std::string(adbcpq::auth::kDefaultClientId)));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, &error),
-              ::testing::Optional("120"s));
-}
-
-TEST(MotherDuckAuthTest, OptionSetGet) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const std::string value : {"browser", "token"}) {
-    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE,
-                                      value.c_str(), &error),
-                IsOkStatus(&error));
-    EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                    &database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, &error),
-                ::testing::Optional(value));
-  }
-  ASSERT_THAT(
-      AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID,
-                            "staging-client", &error),
-      IsOkStatus(&error));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID, &error),
-              ::testing::Optional("staging-client"s));
-
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT,
-                                    "30", &error),
-              IsOkStatus(&error));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, &error),
-              ::testing::Optional("30"s));
-  ASSERT_THAT(AdbcDatabaseSetOptionInt(&database.value,
-                                       ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, 45, &error),
-              IsOkStatus(&error));
-  int64_t timeout = 0;
-  ASSERT_THAT(
-      AdbcDatabaseGetOptionInt(&database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT,
-                               &timeout, &error),
-      IsOkStatus(&error));
-  EXPECT_EQ(timeout, 45);
-}
-
-TEST(MotherDuckAuthTest, OptionInvalid) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* value : {"", "BROWSER", "oauth"}) {
-    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE,
-                                      value, &error),
-                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    if (error.release) error.release(&error);
-  }
-  EXPECT_THAT(AdbcDatabaseSetOption(&database.value,
-                                    ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID, "", &error),
-              IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-  if (error.release) error.release(&error);
-  for (const char* value : {"", "-1", "abc", "1.5", "10s"}) {
-    EXPECT_THAT(AdbcDatabaseSetOption(
-                    &database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, value, &error),
-                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    if (error.release) error.release(&error);
-  }
-  EXPECT_THAT(AdbcDatabaseSetOptionInt(&database.value,
-                                       ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, -1, &error),
-              IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-  if (error.release) error.release(&error);
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, &error),
-              ::testing::Optional("token"s));
-  EXPECT_THAT(adbc_validation::DatabaseGetOption(
-                  &database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, &error),
-              ::testing::Optional("120"s));
-}
-
-TEST(MotherDuckAuthTest, BrowserRejectsPasswordInUri) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri",
-                                    "postgresql://postgres:secret@localhost/db", &error),
-              IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE,
-                                    "browser", &error),
-              IsOkStatus(&error));
-  EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
-              IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-  if (error.release) error.release(&error);
-}
-
-TEST(MotherDuckAuthTest, IsAuthFailure) {
-  for (const char* message : {
-           "[libpq] Failed to connect: connection to server at \"pg.example\" "
-           "(1.2.3.4), port 5432 failed: FATAL:  invalid username/password",
-           "[libpq] Failed to connect: FATAL:  Jwt is expired",
-           "FATAL:  Invalid Input Error: Invalid token or user",
-           "FATAL:  user not found",
-       }) {
-    EXPECT_TRUE(adbcpq::IsAuthFailure(message)) << message;
-  }
-  for (const char* message : {
-           "[libpq] Failed to connect: could not translate host name \"pg\"",
-           "FATAL:  no database/share named 'db' found",
-       }) {
-    EXPECT_FALSE(adbcpq::IsAuthFailure(message)) << message;
-  }
-}
-
-TEST(MotherDuckAuthTest, AddCredentials) {
-  const adbcpq::ConnectParams params = {{"dbname", "db"}};
-  adbcpq::auth::Credentials credentials;
-  credentials.token = "token";
-  credentials.host = "pg.example";
-  using ::testing::ElementsAre;
-  using ::testing::Pair;
-  EXPECT_THAT(adbcpq::AddCredentials(params, credentials, /*need_host=*/false),
-              ElementsAre(Pair("dbname", "db"), Pair("password", "token")));
-  EXPECT_THAT(adbcpq::AddCredentials(params, credentials, /*need_host=*/true),
-              ElementsAre(Pair("dbname", "db"), Pair("password", "token"),
-                          Pair("host", "pg.example")));
 }
 
 class PostgresConnectionTest : public ::testing::Test,
@@ -774,22 +840,12 @@ TEST_F(PostgresConnectionTest, GetInfoMetadata) {
         }
         case ADBC_INFO_VENDOR_NAME: {
           ArrowStringView val = ArrowArrayViewGetStringUnsafe(str_child, offset);
-          EXPECT_EQ("PostgreSQL", std::string(val.data, val.size_bytes));
+          EXPECT_EQ("MotherDuck", std::string(val.data, val.size_bytes));
           break;
         }
-        case ADBC_INFO_VENDOR_VERSION: {
-          ArrowStringView val = ArrowArrayViewGetStringUnsafe(str_child, offset);
-// Fall back to a simpler version regex. This only really impacts WIN32/MSVC but
-// this is slightly more correct/portable.
-#if GTEST_USES_SIMPLE_RE
-          const char* pater = "\\d\\d\\d\\d\\d\\d";
-#else
-          const char* pater = "[0-9]{6}";
-#endif
-          EXPECT_THAT(std::string(val.data, val.size_bytes),
-                      ::testing::MatchesRegex(pater));
+        case ADBC_INFO_VENDOR_VERSION:
+          ADD_FAILURE() << "vendor version must not be reported";
           break;
-        }
         case ADBC_INFO_DRIVER_ADBC_VERSION: {
           EXPECT_EQ(ADBC_VERSION_1_1_0, ArrowArrayViewGetIntUnsafe(int_child, offset));
           break;
@@ -800,7 +856,10 @@ TEST_F(PostgresConnectionTest, GetInfoMetadata) {
       }
     }
   }
-  ASSERT_THAT(seen, ::testing::UnorderedElementsAreArray(info));
+  // The PostgreSQL server version is requested but not reported.
+  ASSERT_THAT(seen, ::testing::UnorderedElementsAre(
+                        ADBC_INFO_DRIVER_NAME, ADBC_INFO_DRIVER_VERSION,
+                        ADBC_INFO_DRIVER_ADBC_VERSION, ADBC_INFO_VENDOR_NAME));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetCatalogs) {
@@ -868,9 +927,39 @@ void ListCatalogs(struct AdbcDatabase* database, std::vector<std::string>* catal
     catalogs->emplace_back(name.data, name.size_bytes);
   }
 }
+
+// The schemas GetObjects lists in a catalog on a new connection to the database.
+void ListSchemas(struct AdbcDatabase* database, const std::string& catalog,
+                 std::vector<std::string>* schemas) {
+  Handle<struct AdbcError> error;
+  Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error.value),
+              IsOkStatus(&error.value));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, database, &error.value),
+              IsOkStatus(&error.value));
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcConnectionGetObjects(&connection.value, ADBC_OBJECT_DEPTH_DB_SCHEMAS,
+                                       catalog.c_str(), nullptr, nullptr, nullptr,
+                                       nullptr, &reader.stream.value, &error.value),
+              IsOkStatus(&error.value));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NE(nullptr, reader.array->release);
+  auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+  ASSERT_NE(*get_objects_data, nullptr)
+      << "could not initialize the AdbcGetObjectsData object";
+  struct AdbcGetObjectsCatalog* cat =
+      InternalAdbcGetObjectsDataGetCatalogByName(*get_objects_data, catalog.c_str());
+  ASSERT_NE(cat, nullptr) << "catalog " << catalog << " not found";
+  for (int i = 0; i < cat->n_db_schemas; i++) {
+    const struct ArrowStringView name = cat->catalog_db_schemas[i]->db_schema_name;
+    schemas->emplace_back(name.data, name.size_bytes);
+  }
+}
 }  // namespace
 
-// With the default attach_mode=single, other databases in the account aren't
+// With attach_mode=single (the default), other databases in the account aren't
 // catalogs; with workspace, they are.
 TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
   Handle<struct AdbcDatabase> workspace;
@@ -889,16 +978,47 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
                          "CREATE DATABASE " + quirks_.QuoteIdentifier(other), &error),
               IsOkStatus(&error));
 
+  // attach_mode in the URI overrides the default, and the option overrides the
+  // URI. This relies on MotherDuck keeping the last value of a repeated setting.
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  std::string workspace_uri = uri;
+  workspace_uri += std::strchr(uri, '?') ? "&" : "?";
+  workspace_uri += "options=--attach_mode%3Dworkspace";
+  Handle<struct AdbcDatabase> uri_workspace;
+  Handle<struct AdbcDatabase> option_single;
+  for (struct AdbcDatabase* db : {&uri_workspace.value, &option_single.value}) {
+    ASSERT_THAT(AdbcDatabaseNew(db, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupDatabase(db, workspace_uri.c_str(), &error),
+                IsOkStatus(&error));
+  }
+  ASSERT_THAT(AdbcDatabaseSetOption(&option_single.value,
+                                    ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, "single", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&uri_workspace.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&option_single.value, &error), IsOkStatus(&error));
+
   std::vector<std::string> workspace_catalogs;
   std::vector<std::string> single_catalogs;
+  std::vector<std::string> uri_workspace_catalogs;
+  std::vector<std::string> option_single_catalogs;
   ListCatalogs(&workspace.value, &workspace_catalogs);
   ListCatalogs(&database, &single_catalogs);
+  ListCatalogs(&uri_workspace.value, &uri_workspace_catalogs);
+  ListCatalogs(&option_single.value, &option_single_catalogs);
+  // Schemas are listed for every catalog, not only the connection's database.
+  std::vector<std::string> other_schemas;
+  ListSchemas(&workspace.value, other, &other_schemas);
   EXPECT_THAT(ExecuteSql(&workspace.value, drop, &error), IsOkStatus(&error));
   if (HasFatalFailure()) return;
 
   EXPECT_THAT(workspace_catalogs, ::testing::IsSupersetOf({catalog, other}));
   EXPECT_THAT(single_catalogs, ::testing::Contains(catalog));
   EXPECT_THAT(single_catalogs, ::testing::Not(::testing::Contains(other)));
+  EXPECT_THAT(uri_workspace_catalogs, ::testing::IsSupersetOf({catalog, other}));
+  EXPECT_THAT(option_single_catalogs, ::testing::Contains(catalog));
+  EXPECT_THAT(option_single_catalogs, ::testing::Not(::testing::Contains(other)));
+  EXPECT_THAT(other_schemas, ::testing::Contains("main"));
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
@@ -922,6 +1042,21 @@ TEST_F(PostgresConnectionTest, GetObjectsGetDbSchemas) {
   struct AdbcGetObjectsSchema* schema = InternalAdbcGetObjectsDataGetSchemaByName(
       *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str());
   ASSERT_NE(schema, nullptr) << "schema " << quirks()->db_schema() << " not found";
+
+  // MotherDuck doesn't mark md_information_schema internal, but it isn't a
+  // user database.
+  EXPECT_EQ(InternalAdbcGetObjectsDataGetCatalogByName(*get_objects_data,
+                                                       "md_information_schema"),
+            nullptr);
+
+  // DuckDB marks main internal in every database, so GetObjects filters on the
+  // database. The system schemas live only in the internal system database.
+  for (const char* system_schema : {"pg_catalog", "information_schema"}) {
+    EXPECT_EQ(InternalAdbcGetObjectsDataGetSchemaByName(
+                  *get_objects_data, quirks()->catalog().c_str(), system_schema),
+              nullptr)
+        << "unexpected schema " << system_schema;
+  }
 }
 
 TEST_F(PostgresConnectionTest, GetObjectsSchemaFilterFindsTablesOutsideSearchPath) {
@@ -1031,7 +1166,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsPrimaryKey) {
   ASSERT_NE(column, nullptr) << "could not find id column on adbc_pkey_test table";
   auto xdbc_type_name =
       std::string(column->xdbc_type_name.data, column->xdbc_type_name.size_bytes);
-  ASSERT_EQ(xdbc_type_name, "int4");
+  // GetObjects reports DuckDB's type names, not PostgreSQL's (int4).
+  ASSERT_EQ(xdbc_type_name, "INTEGER");
 
   ASSERT_EQ(table->n_table_constraints, 1)
       << "expected 1 constraint on adbc_pkey_test table, found: "
@@ -1040,14 +1176,15 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsPrimaryKey) {
   struct AdbcGetObjectsConstraint* constraint =
       InternalAdbcGetObjectsDataGetConstraintByName(
           *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
-          "adbc_pkey_test", "adbc_pkey_test_pkey");
-  ASSERT_NE(constraint, nullptr) << "could not find adbc_pkey_test_pkey constraint";
+          "adbc_pkey_test", "adbc_pkey_test_id_pkey");
+  // DuckDB names a primary key <table>_<columns>_pkey.
+  ASSERT_NE(constraint, nullptr) << "could not find adbc_pkey_test_id_pkey constraint";
 
   auto constraint_type = std::string(constraint->constraint_type.data,
                                      constraint->constraint_type.size_bytes);
   ASSERT_EQ(constraint_type, "PRIMARY KEY");
   ASSERT_EQ(constraint->n_column_names, 1)
-      << "expected constraint adbc_pkey_test_pkey to be applied to 1 column, found: "
+      << "expected constraint adbc_pkey_test_id_pkey to be applied to 1 column, found: "
       << constraint->n_column_names;
 
   auto constraint_column_name =
@@ -1126,9 +1263,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
       << "expected 1 constraint on adbc_fkey_test table, found: "
       << table->n_table_constraints;
 
-  const std::string version = adbc_validation::GetDriverVendorVersion(&connection);
-  const std::string search_name =
-      version < "120000" ? "adbc_fkey_test_fid1_fkey" : "adbc_fkey_test_fid1_fid2_fkey";
+  // DuckDB names a foreign key <table>_<columns>_<referenced columns>_fkey.
+  const std::string search_name = "adbc_fkey_test_fid1_fid2_id1_id2_fkey";
   struct AdbcGetObjectsConstraint* constraint =
       InternalAdbcGetObjectsDataGetConstraintByName(
           *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
@@ -1139,7 +1275,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
                                      constraint->constraint_type.size_bytes);
   ASSERT_EQ(constraint_type, "FOREIGN KEY");
   ASSERT_EQ(constraint->n_column_names, 2)
-      << "expected constraint adbc_fkey_test_fid1_fid2_fkey to be applied to 2 columns, "
+      << "expected constraint adbc_fkey_test_fid1_fid2_id1_id2_fkey to be applied to 2 "
+         "columns, "
          "found: "
       << constraint->n_column_names;
 
@@ -1154,7 +1291,8 @@ TEST_F(PostgresConnectionTest, GetObjectsGetAllFindsForeignKey) {
   }
 
   ASSERT_EQ(constraint->n_column_usages, 2)
-      << "expected constraint adbc_fkey_test_fid1_fid2_fkey to have 2 usages, found: "
+      << "expected constraint adbc_fkey_test_fid1_fid2_id1_id2_fkey to have 2 usages, "
+         "found: "
       << constraint->n_column_usages;
 
   for (auto i = 0; i < 2; i++) {
@@ -1390,6 +1528,533 @@ TEST_F(PostgresConnectionTest, MetadataGetSchemaCaseSensitiveTable) {
   // Do we have to release the connection here?
 }
 
+// Names with dots, quotes and spaces resolve however they're cased, and the
+// endpoint's ::regclass, which can't parse them, isn't involved (#13).
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaQuotedNames) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+
+  auto execute = [&](const char* query) {
+    adbc_validation::Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcStatementNew(&connection, &statement.value, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, query, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  };
+  constexpr const char* kDropSchema =
+      "DROP SCHEMA IF EXISTS \"Odd.Schema \"\"x\"\"\" CASCADE";
+  ASSERT_NO_FATAL_FAILURE(execute(kDropSchema));
+  ASSERT_NO_FATAL_FAILURE(execute("CREATE SCHEMA \"Odd.Schema \"\"x\"\"\""));
+  ASSERT_NO_FATAL_FAILURE(
+      execute("CREATE TABLE \"Odd.Schema \"\"x\"\"\".\"Odd.Table \"\"y\"\"\" "
+              "(ints INT, \"str col\" TEXT)"));
+
+  // DuckDB identifiers are case-insensitive, so other cases find the table too.
+  const std::string catalog = quirks()->catalog();
+  std::string upper_catalog = catalog;
+  for (char& c : upper_catalog) c = static_cast<char>(std::toupper(c));
+  struct Name {
+    const char* catalog;
+    const char* db_schema;
+    const char* table;
+  };
+  for (const Name& name : {
+           Name{nullptr, "Odd.Schema \"x\"", "Odd.Table \"y\""},
+           Name{catalog.c_str(), "Odd.Schema \"x\"", "Odd.Table \"y\""},
+           Name{upper_catalog.c_str(), "ODD.SCHEMA \"X\"", "odd.table \"Y\""},
+       }) {
+    SCOPED_TRACE(std::string(name.db_schema) + " / " + name.table);
+    nanoarrow::UniqueSchema schema;
+    ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, name.catalog, name.db_schema,
+                                             name.table, schema.get(), &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(schema->n_children, 2);
+    ASSERT_STREQ(schema->children[0]->format, "i");
+    ASSERT_STREQ(schema->children[0]->name, "ints");
+    ASSERT_STREQ(schema->children[1]->format, "u");
+    ASSERT_STREQ(schema->children[1]->name, "str col");
+  }
+
+  for (const Name& name : {
+           // Not in the current schema.
+           Name{nullptr, nullptr, "Odd.Table \"y\""},
+           // Not in another catalog.
+           Name{"no_such_catalog", "Odd.Schema \"x\"", "Odd.Table \"y\""},
+           // Not a relation at all.
+           Name{nullptr, nullptr, "(SELECT CURRENT_TIME)"},
+       }) {
+    SCOPED_TRACE(name.table);
+    nanoarrow::UniqueSchema schema;
+    ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, name.catalog, name.db_schema,
+                                             name.table, schema.get(), &error),
+                IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  }
+
+  ASSERT_NO_FATAL_FAILURE(execute(kDropSchema));
+}
+
+// DuckDB identifiers are case-insensitive, even quoted ones, so a lookup in
+// another case finds the table.
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaIgnoresCase) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "MixedCase", &error), IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database, "CREATE TABLE \"MixedCase\" (ints INT)", &error),
+              IsOkStatus(&error));
+
+  for (const char* db_schema : {static_cast<const char*>(nullptr), "MAIN"}) {
+    SCOPED_TRACE(db_schema ? db_schema : "(no schema)");
+    nanoarrow::UniqueSchema schema;
+    ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, nullptr, db_schema, "mixedcase",
+                                             schema.get(), &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(schema->n_children, 1);
+    EXPECT_STREQ(schema->children[0]->name, "ints");
+  }
+}
+
+// An unqualified name resolves through the search path, which includes
+// pg_catalog, as in a query.
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaSearchPath) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+
+  for (const char* db_schema : {static_cast<const char*>(nullptr), "pg_catalog"}) {
+    SCOPED_TRACE(db_schema ? db_schema : "(no schema)");
+    nanoarrow::UniqueSchema schema;
+    ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, nullptr, db_schema, "pg_class",
+                                             schema.get(), &error),
+                IsOkStatus(&error));
+    EXPECT_GT(schema->n_children, 0);
+  }
+}
+
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaSchemaNotFound) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, nullptr, "thisschemadoesnotexist",
+                                           "t", schema.get(), &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+}
+
+// GetTableSchema looks the table up in the given catalog.
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaCatalog) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "MixedCase", &error), IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database, "CREATE TABLE \"MixedCase\" (ints INT)", &error),
+              IsOkStatus(&error));
+
+  const std::string catalog = quirks()->catalog();
+  for (const char* db_schema : {static_cast<const char*>(nullptr), "main"}) {
+    SCOPED_TRACE(db_schema ? db_schema : "(no schema)");
+    nanoarrow::UniqueSchema schema;
+    ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, catalog.c_str(), db_schema,
+                                             "MixedCase", schema.get(), &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(schema->n_children, 1);
+  }
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, "thiscatalogdoesnotexist",
+                                           nullptr, "MixedCase", schema.get(), &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+}
+
+// With a catalog and no schema, GetTableSchema looks in the current schema of
+// the current database, as an unqualified name does.
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaCatalogCurrentSchema) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database,
+                         "CREATE SCHEMA IF NOT EXISTS adbc_current_schema_test; "
+                         "CREATE OR REPLACE TABLE adbc_current_schema_test.only_here "
+                         "(ints INT)",
+                         &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+                              "adbc_current_schema_test", &error),
+      IsOkStatus(&error));
+
+  std::string catalog = quirks()->catalog();
+  for (char& c : catalog) c = static_cast<char>(std::toupper(c));
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, catalog.c_str(), nullptr,
+                                           "only_here", schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(schema->n_children, 1);
+  EXPECT_STREQ(schema->children[0]->name, "ints");
+}
+
+// Every GetObjects filter ignores case, as DuckDB identifiers do, and a
+// column filter keeps the constraints on a matching column.
+TEST_F(PostgresConnectionTest, GetObjectsFiltersIgnoreCase) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "MixedCase", &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      ExecuteSql(&database,
+                 "CREATE TABLE \"MixedCase\" (id INTEGER PRIMARY KEY, ints INT)", &error),
+      IsOkStatus(&error));
+
+  const std::string catalog = quirks()->catalog();
+  std::string upper_catalog = catalog;
+  for (char& c : upper_catalog) c = static_cast<char>(std::toupper(c));
+
+  struct Case {
+    const char* column_filter;
+    const char* column;
+    int n_constraints;
+  };
+  for (const Case& test_case : {Case{"ID", "id", 1}, Case{"INTS", "ints", 0}}) {
+    SCOPED_TRACE(test_case.column_filter);
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL,
+                                 upper_catalog.c_str(), "MAIN", "mixedcase", nullptr,
+                                 test_case.column_filter, &reader.stream.value, &error),
+        IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_NE(nullptr, reader.array->release);
+
+    auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+    ASSERT_NE(*get_objects_data, nullptr)
+        << "could not initialize the AdbcGetObjectsData object";
+    // GetObjects reports the names as stored.
+    struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, catalog.c_str(), "main", "MixedCase");
+    ASSERT_NE(table, nullptr) << "could not find main.MixedCase via GetObjects";
+    ASSERT_EQ(table->n_table_columns, 1);
+    const struct ArrowStringView name = table->table_columns[0]->column_name;
+    EXPECT_EQ(std::string(name.data, name.size_bytes), test_case.column);
+    EXPECT_EQ(table->n_table_constraints, test_case.n_constraints);
+  }
+}
+
+// GetObjects reports UNIQUE and CHECK constraints along with keys, including a
+// CHECK on no column.
+TEST_F(PostgresConnectionTest, GetObjectsFindsUniqueAndCheck) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "adbc_unique_check_test", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database,
+                         "CREATE TABLE adbc_unique_check_test (a INT UNIQUE, "
+                         "b INT CHECK (b > 0), c INT, UNIQUE (c, a), "
+                         "CHECK (random() >= 0))",
+                         &error),
+              IsOkStatus(&error));
+
+  using Constraint = std::pair<std::string, std::vector<std::string>>;
+  const Constraint unique_a{"UNIQUE", {"a"}};
+  const Constraint unique_ca{"UNIQUE", {"c", "a"}};
+  const Constraint check_b{"CHECK", {"b"}};
+  // A CHECK on no column applies to the table, so every column filter keeps it.
+  const Constraint check_table{"CHECK", {}};
+  struct Case {
+    const char* column_filter;
+    std::vector<Constraint> expected;
+  };
+  for (const Case& test_case :
+       {Case{nullptr, {unique_a, unique_ca, check_b, check_table}},
+        Case{"%", {unique_a, unique_ca, check_b, check_table}},
+        Case{"B", {check_b, check_table}}, Case{"c", {unique_ca, check_table}}}) {
+    SCOPED_TRACE(test_case.column_filter ? test_case.column_filter : "(none)");
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr, nullptr,
+                                 "adbc_unique_check_test", nullptr,
+                                 test_case.column_filter, &reader.stream.value, &error),
+        IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_NE(nullptr, reader.array->release);
+
+    auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+    ASSERT_NE(*get_objects_data, nullptr)
+        << "could not initialize the AdbcGetObjectsData object";
+    struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_unique_check_test");
+    ASSERT_NE(table, nullptr) << "could not find adbc_unique_check_test table";
+
+    std::vector<Constraint> constraints;
+    for (int i = 0; i < table->n_table_constraints; i++) {
+      const struct AdbcGetObjectsConstraint* constraint = table->table_constraints[i];
+      std::vector<std::string> columns;
+      for (int j = 0; j < constraint->n_column_names; j++) {
+        columns.emplace_back(constraint->constraint_column_names[j].data,
+                             constraint->constraint_column_names[j].size_bytes);
+      }
+      constraints.emplace_back(std::string(constraint->constraint_type.data,
+                                           constraint->constraint_type.size_bytes),
+                               std::move(columns));
+    }
+    EXPECT_THAT(constraints, ::testing::UnorderedElementsAreArray(test_case.expected));
+  }
+}
+
+// The table types filter ignores case, takes "BASE TABLE" for a table, and
+// excludes the other type's tables and columns.
+TEST_F(PostgresConnectionTest, GetObjectsTableTypesIgnoreCase) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropView(&connection, "adbc_types_case_v", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "adbc_types_case_t", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database,
+                         "CREATE TABLE adbc_types_case_t (id INT PRIMARY KEY); "
+                         "CREATE VIEW adbc_types_case_v AS SELECT 1 AS x",
+                         &error),
+              IsOkStatus(&error));
+
+  struct Case {
+    std::vector<const char*> types;
+    bool table;
+    bool view;
+  };
+  for (Case test_case : {Case{{"TABLE"}, true, false}, Case{{"BASE TABLE"}, true, false},
+                         Case{{"View"}, false, true}, Case{{"VIEW", "Table"}, true, true},
+                         Case{{"nosuchtype"}, false, false}}) {
+    std::string trace;
+    for (const char* type : test_case.types) trace += std::string(type) + ";";
+    SCOPED_TRACE(trace);
+    test_case.types.push_back(nullptr);
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr, nullptr,
+                                 "adbc_types_case_%", test_case.types.data(), nullptr,
+                                 &reader.stream.value, &error),
+        IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_NE(nullptr, reader.array->release);
+
+    auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+    ASSERT_NE(*get_objects_data, nullptr)
+        << "could not initialize the AdbcGetObjectsData object";
+    struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_types_case_t");
+    struct AdbcGetObjectsTable* view = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_types_case_v");
+    EXPECT_EQ(table != nullptr, test_case.table);
+    EXPECT_EQ(view != nullptr, test_case.view);
+    if (table) {
+      EXPECT_EQ(table->n_table_columns, 1);
+      EXPECT_EQ(table->n_table_constraints, 1);
+    }
+    if (view) EXPECT_EQ(view->n_table_columns, 1);
+  }
+}
+
+// GetObjects lists the session's temporary objects under the temp catalog,
+// and GetTableSchema finds them there.
+TEST_F(PostgresConnectionTest, GetObjectsListsTempObjects) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  {
+    // Temporary objects belong to the connection that creates them.
+    adbc_validation::Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcStatementNew(&connection, &statement.value, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcStatementSetSqlQuery(
+            &statement.value,
+            "CREATE OR REPLACE TEMP VIEW adbc_temp_view_test AS SELECT 1 AS x", &error),
+        IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
+
+  adbc_validation::StreamReader reader;
+  ASSERT_THAT(AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr,
+                                       nullptr, "adbc_temp_view_test", nullptr, nullptr,
+                                       &reader.stream.value, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_NE(nullptr, reader.array->release);
+  auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+  ASSERT_NE(*get_objects_data, nullptr)
+      << "could not initialize the AdbcGetObjectsData object";
+  struct AdbcGetObjectsTable* view = InternalAdbcGetObjectsDataGetTableByName(
+      *get_objects_data, "temp", "main", "adbc_temp_view_test");
+  ASSERT_NE(view, nullptr) << "could not find temp.main.adbc_temp_view_test";
+  EXPECT_EQ(std::string(view->table_type.data, view->table_type.size_bytes), "view");
+  EXPECT_EQ(view->n_table_columns, 1);
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcConnectionGetTableSchema(&connection, "temp", nullptr,
+                                           "adbc_temp_view_test", schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(schema->n_children, 1);
+}
+
+// Connected to md:, the current catalog option reports md:. Passed back to
+// GetTableSchema without a schema, it means the current database and schema.
+TEST_F(PostgresConnectionTest, MetadataGetTableSchemaMdCatalog) {
+  ASSERT_THAT(
+      ExecuteSql(&database, "CREATE OR REPLACE TABLE adbc_md_catalog_test (ints INT)",
+                 &error),
+      IsOkStatus(&error));
+
+  // The test URI with md: as its database.
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  std::string md_uri = uri;
+  const size_t path = md_uri.find('/', md_uri.find("://") + 3);
+  ASSERT_NE(path, std::string::npos) << "test URI has no database";
+  const size_t query = md_uri.find('?', path);
+  md_uri.replace(
+      path + 1, (query == std::string::npos ? md_uri.size() : query) - path - 1, "md%3A");
+
+  Handle<struct AdbcDatabase> md;
+  ASSERT_THAT(AdbcDatabaseNew(&md.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&md.value, md_uri.c_str(), &error),
+              IsOkStatus(&error));
+  // Single attach mode can't connect to md:.
+  ASSERT_THAT(AdbcDatabaseSetOption(&md.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                    "workspace", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&md.value, &error), IsOkStatus(&error));
+  Handle<struct AdbcConnection> md_connection;
+  ASSERT_THAT(AdbcConnectionNew(&md_connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&md_connection.value, &md.value, &error),
+              IsOkStatus(&error));
+  {
+    adbc_validation::Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcStatementNew(&md_connection.value, &statement.value, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcStatementSetSqlQuery(
+            &statement.value,
+            ("USE " + quirks_.QuoteIdentifier(quirks()->catalog())).c_str(), &error),
+        IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
+
+  char current_catalog[256];
+  size_t length = sizeof(current_catalog);
+  ASSERT_THAT(AdbcConnectionGetOption(&md_connection.value,
+                                      ADBC_CONNECTION_OPTION_CURRENT_CATALOG,
+                                      current_catalog, &length, &error),
+              IsOkStatus(&error));
+  ASSERT_STREQ(current_catalog, "md:");
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcConnectionGetTableSchema(&md_connection.value, current_catalog, nullptr,
+                                           "adbc_md_catalog_test", schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(schema->n_children, 1);
+  EXPECT_STREQ(schema->children[0]->name, "ints");
+}
+
+// GetObjects lists a view's columns, and GetTableSchema describes a view.
+TEST_F(PostgresConnectionTest, MetadataViewColumns) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropView(&connection, "adbc_view_columns_test", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database,
+                         "CREATE VIEW adbc_view_columns_test AS "
+                         "SELECT 1::INTEGER AS id, 'x'::VARCHAR AS name",
+                         &error),
+              IsOkStatus(&error));
+
+  {
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr,
+                                         nullptr, "adbc_view_columns_test", nullptr,
+                                         nullptr, &reader.stream.value, &error),
+                IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_NE(nullptr, reader.array->release);
+
+    auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+    ASSERT_NE(*get_objects_data, nullptr)
+        << "could not initialize the AdbcGetObjectsData object";
+    struct AdbcGetObjectsTable* view = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_view_columns_test");
+    ASSERT_NE(view, nullptr) << "could not find adbc_view_columns_test view";
+    EXPECT_EQ(std::string(view->table_type.data, view->table_type.size_bytes), "view");
+    ASSERT_EQ(view->n_table_columns, 2);
+    struct AdbcGetObjectsColumn* column = InternalAdbcGetObjectsDataGetColumnByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_view_columns_test", "name");
+    ASSERT_NE(column, nullptr) << "could not find name column on the view";
+    EXPECT_EQ(column->ordinal_position, 2);
+    EXPECT_EQ(std::string(column->xdbc_type_name.data, column->xdbc_type_name.size_bytes),
+              "VARCHAR");
+  }
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(
+      AdbcConnectionGetTableSchema(&connection, nullptr, nullptr,
+                                   "adbc_view_columns_test", schema.get(), &error),
+      IsOkStatus(&error));
+  ASSERT_EQ(schema->n_children, 2);
+  EXPECT_STREQ(schema->children[0]->name, "id");
+  EXPECT_STREQ(schema->children[1]->name, "name");
+}
+
+// GetObjects name filters are search patterns: % matches any run of
+// characters and _ any one character.
+TEST_F(PostgresConnectionTest, GetObjectsFilterPatterns) {
+  ASSERT_THAT(AdbcConnectionNew(&connection, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "adbc_pattern_test", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&database, "CREATE TABLE adbc_pattern_test (ints INT)", &error),
+              IsOkStatus(&error));
+
+  // n_columns is -1 when the table shouldn't be found.
+  struct Case {
+    const char* table_filter;
+    const char* column_filter;
+    int n_columns;
+  };
+  for (const Case& test_case :
+       {Case{"adbc_pattern%", "i%", 1}, Case{"adbc_pattern_tes_", "int_", 1},
+        Case{"adbc_pattern_te_", nullptr, -1}, Case{"adbc_pattern_test", "x%", 0}}) {
+    SCOPED_TRACE(std::string(test_case.table_filter) + " / " +
+                 (test_case.column_filter ? test_case.column_filter : "(none)"));
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcConnectionGetObjects(&connection, ADBC_OBJECT_DEPTH_ALL, nullptr, nullptr,
+                                 test_case.table_filter, nullptr, test_case.column_filter,
+                                 &reader.stream.value, &error),
+        IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_NE(nullptr, reader.array->release);
+
+    auto get_objects_data = adbc_validation::GetObjectsReader{&reader.array_view.value};
+    ASSERT_NE(*get_objects_data, nullptr)
+        << "could not initialize the AdbcGetObjectsData object";
+    struct AdbcGetObjectsTable* table = InternalAdbcGetObjectsDataGetTableByName(
+        *get_objects_data, quirks()->catalog().c_str(), quirks()->db_schema().c_str(),
+        "adbc_pattern_test");
+    if (test_case.n_columns < 0) {
+      EXPECT_EQ(table, nullptr);
+    } else {
+      ASSERT_NE(table, nullptr) << "could not find adbc_pattern_test via GetObjects";
+      EXPECT_EQ(table->n_table_columns, test_case.n_columns);
+    }
+  }
+}
+
 TEST_F(PostgresConnectionTest, MetadataGetStatistics) {
   if (!quirks()->supports_statistics()) {
     GTEST_SKIP();
@@ -1565,6 +2230,8 @@ class PostgresStatementTest : public ::testing::Test,
   void TestSqlPrepareErrorParamCountMismatch() { GTEST_SKIP() << "Not yet implemented"; }
 
   void TestSqlPrepareSelectParams() { GTEST_SKIP() << "Not yet implemented"; }
+  void TestSqlIngestColumnEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
+  void TestSqlIngestTableEscaping() { SKIP_WITHOUT_COPY_FROM_STDIN(); }
 
   void TestConcurrentStatements() {
     // TODO: refactor driver so that we read all the data as soon as
@@ -1653,6 +2320,17 @@ class PostgresStatementTest : public ::testing::Test,
 };
 ADBCV_TEST_STATEMENT(PostgresStatementTest)
 
+// The endpoint reports a missing catalog with a generic SQLSTATE; the driver
+// still classifies it as NOT_FOUND.
+TEST_F(PostgresStatementTest, MissingCatalogIsNotFound) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "SELECT * FROM thiscatalogdoesnotexist.main.t", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+}
+
 // Every documented DuckDB type should resolve to a known type, not unnamed<oid:N>
 TEST_F(PostgresStatementTest, MotherDuckTypesResolve) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -1730,6 +2408,348 @@ TEST_F(PostgresStatementTest, MotherDuckTypesResolve) {
   ArrowStringView ls_view = ArrowArrayViewGetStringUnsafe(ls_values, 0);
   EXPECT_EQ(std::string_view(ls_view.data, static_cast<size_t>(ls_view.size_bytes)),
             "{'a': 1}");
+}
+
+// A query that quotes the typing error must still report its own error.
+TEST_F(PostgresStatementTest, MotherDuckPrepareErrorQuotingTypingError) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement, "SELECT missing_col -- ambiguous result column types", &error),
+      IsOkStatus(&error));
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcStatementExecuteSchema(&statement, schema.get(), &error),
+              ::testing::Not(IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error)));
+  ASSERT_THAT(AdbcStatementGetParameterSchema(&statement, schema.get(), &error),
+              ::testing::Not(IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error)));
+}
+
+// The cast retry depends on the endpoint's wording for this error. If this
+// fails, update IsAmbiguousParameterError in motherduck_statement.cc.
+TEST_F(PostgresStatementTest, MotherDuckAmbiguousParameterErrorWording) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
+              IsOkStatus(&error));
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcStatementExecuteSchema(&statement, schema.get(), &error),
+              IsStatus(ADBC_STATUS_NOT_IMPLEMENTED, &error));
+}
+
+// Bind one row of an int32 and a string to query and return the result.
+void ExecuteCastQuery(struct AdbcConnection* connection, struct AdbcStatement* statement,
+                      const char* query, const char* string_value,
+                      adbc_validation::StreamReader* reader,
+                      nanoarrow::UniqueSchema* schema, struct AdbcError* error) {
+  nanoarrow::UniqueSchema bind_schema;
+  nanoarrow::UniqueArray bind;
+  struct ArrowError na_error;
+  ASSERT_THAT(
+      adbc_validation::MakeSchema(
+          bind_schema.get(), {{"a", NANOARROW_TYPE_INT32}, {"b", NANOARROW_TYPE_STRING}}),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT((adbc_validation::MakeBatch<int32_t, std::string>(
+                  bind_schema.get(), bind.get(), &na_error, {1}, {string_value})),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementNew(connection, statement, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(statement, query, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementBind(statement, bind.get(), bind_schema.get(), error),
+              IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementExecuteSchema(statement, schema->get(), error),
+              IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(statement, &reader->stream.value,
+                                        &reader->rows_affected, error),
+              IsOkStatus(error));
+  ASSERT_NO_FATAL_FAILURE(reader->GetSchema());
+}
+
+// Result columns are named as if the parameters weren't cast.
+TEST_F(PostgresStatementTest, MotherDuckCastParameterColumnNames) {
+  adbc_validation::StreamReader reader;
+  nanoarrow::UniqueSchema schema;
+  ASSERT_NO_FATAL_FAILURE(ExecuteCastQuery(
+      &connection, &statement, "SELECT $1, $1 + 1, $2", "x", &reader, &schema, &error));
+  for (const ArrowSchema* result : {schema.get(), &reader.schema.value}) {
+    ASSERT_EQ(result->n_children, 3);
+    EXPECT_STREQ(result->children[0]->name, "$1");
+    EXPECT_STREQ(result->children[1]->name, "($1 + 1)");
+    EXPECT_STREQ(result->children[2]->name, "$2");
+  }
+}
+
+// A string is cast only if the endpoint can't type the query otherwise, since
+// DuckDB won't mix a VARCHAR with, say, a DATE.
+TEST_F(PostgresStatementTest, MotherDuckCastsStringParametersLast) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(
+          &statement,
+          "CREATE OR REPLACE TABLE adbc_cast_test AS SELECT DATE '2020-01-01' AS d",
+          &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementRelease(&statement, &error), IsOkStatus(&error));
+
+  adbc_validation::StreamReader reader;
+  nanoarrow::UniqueSchema schema;
+  ASSERT_NO_FATAL_FAILURE(ExecuteCastQuery(
+      &connection, &statement,
+      "SELECT $1 AS v FROM adbc_cast_test WHERE greatest(d, $2) = DATE '2020-01-05'",
+      "2020-01-05", &reader, &schema, &error));
+  ASSERT_NO_FATAL_FAILURE(reader.Next());
+  ASSERT_EQ(reader.array->length, 1);
+
+  ASSERT_THAT(quirks()->DropTable(&connection, "adbc_cast_test", &error),
+              IsOkStatus(&error));
+}
+
+// If the cast query fails too, the error quotes the query as written.
+TEST_F(PostgresStatementTest, MotherDuckCastRetryErrorQuotesQuery) {
+  nanoarrow::UniqueSchema bind_schema;
+  nanoarrow::UniqueArray bind;
+  struct ArrowError na_error;
+  ASSERT_THAT(
+      adbc_validation::MakeSchema(
+          bind_schema.get(), {{"a", NANOARROW_TYPE_INT32}, {"b", NANOARROW_TYPE_INT64}}),
+      adbc_validation::IsOkErrno());
+  ASSERT_THAT((adbc_validation::MakeBatch<int32_t, int64_t>(bind_schema.get(), bind.get(),
+                                                            &na_error, {1}, {3})),
+              adbc_validation::IsOkErrno());
+
+  // A table function's arguments can't be parameters, cast or not.
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(&statement, "SELECT $1 AS v FROM range($2)", &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), bind_schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              ::testing::Not(IsOkStatus(&error)));
+  ASSERT_NE(error.message, nullptr);
+  EXPECT_THAT(error.message,
+              ::testing::HasSubstr("Query was: SELECT $1 AS v FROM range($2)"));
+  EXPECT_THAT(error.message,
+              ::testing::Not(::testing::HasSubstr("Query was: SELECT CAST(")));
+}
+
+// ExecuteUpdate resolves all-null parameters through the cast retry too.
+TEST_F(PostgresStatementTest, MotherDuckCastsNullParametersOnUpdate) {
+  nanoarrow::UniqueSchema bind_schema;
+  ArrowSchemaInit(bind_schema.get());
+  ASSERT_THAT(ArrowSchemaSetTypeStruct(bind_schema.get(), 2),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetType(bind_schema->children[0], NANOARROW_TYPE_INT32),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(bind_schema->children[0], "a"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetType(bind_schema->children[1], NANOARROW_TYPE_NA),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(bind_schema->children[1], "b"),
+              adbc_validation::IsOkErrno());
+
+  nanoarrow::UniqueArray bind;
+  ASSERT_THAT(ArrowArrayInitFromSchema(bind.get(), bind_schema.get(), nullptr),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowArrayStartAppending(bind.get()), adbc_validation::IsOkErrno());
+  for (int i = 0; i < 2; i++) {
+    ASSERT_THAT(ArrowArrayAppendInt(bind->children[0], i), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayAppendNull(bind->children[1], 1), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayFinishElement(bind.get()), adbc_validation::IsOkErrno());
+  }
+  ASSERT_THAT(ArrowArrayFinishBuildingDefault(bind.get(), nullptr),
+              adbc_validation::IsOkErrno());
+
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1, $2", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), bind_schema.get(), &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              IsOkStatus(&error));
+}
+
+// Parameters must be bound as a struct, as for ExecuteSchema.
+TEST_F(PostgresStatementTest, MotherDuckGetParameterSchemaRejectsNonStruct) {
+  nanoarrow::UniqueSchema bind_schema;
+  ArrowSchemaInit(bind_schema.get());
+  ASSERT_THAT(ArrowSchemaSetType(bind_schema.get(), NANOARROW_TYPE_INT32),
+              adbc_validation::IsOkErrno());
+  nanoarrow::UniqueArrayStream bind;
+  nanoarrow::EmptyArrayStream(bind_schema.get()).ToArrayStream(bind.get());
+
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, "SELECT $1", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBindStream(&statement, bind.get(), &error),
+              IsOkStatus(&error));
+  nanoarrow::UniqueSchema schema;
+  ASSERT_THAT(AdbcStatementGetParameterSchema(&statement, schema.get(), &error),
+              IsStatus(ADBC_STATUS_INVALID_STATE, &error));
+}
+
+// The endpoint can't type a parameter that decides a result column's type, so
+// the driver casts it to the type of its bound value (#17). Check each type it
+// casts round-trips through SELECT $1.
+TEST_F(PostgresStatementTest, MotherDuckCastsParameters) {
+  struct Case {
+    std::string name;
+    std::function<ArrowErrorCode(ArrowSchema*)> set_type;
+    std::function<ArrowErrorCode(ArrowArray*)> append;
+    // What the bound value should equal
+    std::string expected;
+  };
+  auto type = [](ArrowType t) {
+    return [t](ArrowSchema* s) { return ArrowSchemaSetType(s, t); };
+  };
+  auto integer = [](int64_t v) {
+    return [v](ArrowArray* a) { return ArrowArrayAppendInt(a, v); };
+  };
+  auto real = [](double v) {
+    return [v](ArrowArray* a) { return ArrowArrayAppendDouble(a, v); };
+  };
+  auto string = [](std::string v) {
+    return [v](ArrowArray* a) {
+      return ArrowArrayAppendString(a, ArrowCharView(v.c_str()));
+    };
+  };
+  auto timestamp = [](const char* timezone) {
+    return [timezone](ArrowSchema* s) {
+      return ArrowSchemaSetTypeDateTime(s, NANOARROW_TYPE_TIMESTAMP,
+                                        NANOARROW_TIME_UNIT_MICRO, timezone);
+    };
+  };
+  auto list_of = [](ArrowType t) {
+    return [t](ArrowSchema* s) {
+      NANOARROW_RETURN_NOT_OK(ArrowSchemaSetType(s, NANOARROW_TYPE_LIST));
+      return ArrowSchemaSetType(s->children[0], t);
+    };
+  };
+
+  const std::vector<Case> cases = {
+      {"int16", type(NANOARROW_TYPE_INT16), integer(7), "7::SMALLINT"},
+      {"int32", type(NANOARROW_TYPE_INT32), integer(-7), "-7::INTEGER"},
+      {"int64", type(NANOARROW_TYPE_INT64), integer(1LL << 40), "1099511627776::BIGINT"},
+      {"uint32", type(NANOARROW_TYPE_UINT32), integer(4000000000), "4000000000"},
+      {"float32", type(NANOARROW_TYPE_FLOAT), real(1.5), "1.5::FLOAT"},
+      {"float64", type(NANOARROW_TYPE_DOUBLE), real(-2.25), "-2.25::DOUBLE"},
+      {"bool", type(NANOARROW_TYPE_BOOL), integer(1), "true"},
+      {"string", type(NANOARROW_TYPE_STRING), string("h\xc3\xa9llo"), "'h\xc3\xa9llo'"},
+      {"large_string", type(NANOARROW_TYPE_LARGE_STRING), string("x"), "'x'"},
+      {"binary", type(NANOARROW_TYPE_BINARY),
+       [](ArrowArray* a) {
+         const uint8_t bytes[] = {0x01, 0xff};
+         return ArrowArrayAppendBytes(a, {{bytes}, 2});
+       },
+       "'\\x01\\xFF'::BLOB"},
+      {"date32", type(NANOARROW_TYPE_DATE32), integer(18262), "DATE '2020-01-01'"},
+      {"time64",
+       [](ArrowSchema* s) {
+         return ArrowSchemaSetTypeDateTime(s, NANOARROW_TYPE_TIME64,
+                                           NANOARROW_TIME_UNIT_MICRO, nullptr);
+       },
+       integer(45296789000), "TIME '12:34:56.789'"},
+      {"timestamp", timestamp(nullptr), integer(1577836800123456),
+       "TIMESTAMP '2020-01-01 00:00:00.123456'"},
+      {"timestamptz", timestamp("UTC"), integer(1577836800123456),
+       "TIMESTAMPTZ '2020-01-01 00:00:00.123456+00'"},
+      {"interval", type(NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO),
+       [](ArrowArray* a) {
+         ArrowInterval interval;
+         ArrowIntervalInit(&interval, NANOARROW_TYPE_INTERVAL_MONTH_DAY_NANO);
+         interval.months = 1;
+         interval.days = 2;
+         interval.ns = 3000000000;
+         return ArrowArrayAppendInterval(a, &interval);
+       },
+       "INTERVAL '1 month 2 days 3 seconds'"},
+      {"decimal128",
+       [](ArrowSchema* s) {
+         return ArrowSchemaSetTypeDecimal(s, NANOARROW_TYPE_DECIMAL128, 10, 5);
+       },
+       [](ArrowArray* a) {
+         ArrowDecimal decimal;
+         ArrowDecimalInit(&decimal, 128, 10, 5);
+         ArrowDecimalSetInt(&decimal, 123456);
+         return ArrowArrayAppendDecimal(a, &decimal);
+       },
+       "1.23456::DECIMAL(10, 5)"},
+      {"list<int32>", list_of(NANOARROW_TYPE_INT32),
+       [](ArrowArray* a) {
+         NANOARROW_RETURN_NOT_OK(ArrowArrayAppendInt(a->children[0], 1));
+         NANOARROW_RETURN_NOT_OK(ArrowArrayAppendInt(a->children[0], 2));
+         return ArrowArrayFinishElement(a);
+       },
+       "[1, 2]"},
+      {"list<string>", list_of(NANOARROW_TYPE_STRING),
+       [](ArrowArray* a) {
+         NANOARROW_RETURN_NOT_OK(
+             ArrowArrayAppendString(a->children[0], ArrowCharView("a")));
+         NANOARROW_RETURN_NOT_OK(
+             ArrowArrayAppendString(a->children[0], ArrowCharView("b")));
+         return ArrowArrayFinishElement(a);
+       },
+       "['a', 'b']"},
+      // No type of its own, so it's bound as text.
+      {"null", type(NANOARROW_TYPE_NA),
+       [](ArrowArray* a) { return ArrowArrayAppendNull(a, 1); }, "NULL"},
+  };
+
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    nanoarrow::UniqueSchema schema_bind;
+    ArrowSchemaInit(schema_bind.get());
+    ASSERT_THAT(ArrowSchemaSetTypeStruct(schema_bind.get(), 1),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT(test_case.set_type(schema_bind->children[0]),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowSchemaSetName(schema_bind->children[0], "p"),
+                adbc_validation::IsOkErrno());
+
+    nanoarrow::UniqueArray bind;
+    ASSERT_THAT(ArrowArrayInitFromSchema(bind.get(), schema_bind.get(), nullptr),
+                adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayStartAppending(bind.get()), adbc_validation::IsOkErrno());
+    ASSERT_THAT(test_case.append(bind->children[0]), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayFinishElement(bind.get()), adbc_validation::IsOkErrno());
+    ASSERT_THAT(ArrowArrayFinishBuildingDefault(bind.get(), nullptr),
+                adbc_validation::IsOkErrno());
+
+    ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+    const std::string query =
+        "SELECT $1 AS v, $1 IS NOT DISTINCT FROM " + test_case.expected + " AS eq";
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query.c_str(), &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementBind(&statement, bind.get(), schema_bind.get(), &error),
+                IsOkStatus(&error));
+
+    nanoarrow::UniqueSchema result_schema;
+    ASSERT_THAT(AdbcStatementExecuteSchema(&statement, result_schema.get(), &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(result_schema->n_children, 2);
+
+    nanoarrow::UniqueSchema param_schema;
+    ASSERT_THAT(AdbcStatementGetParameterSchema(&statement, param_schema.get(), &error),
+                IsOkStatus(&error));
+    ASSERT_EQ(param_schema->n_children, 1);
+
+    {
+      adbc_validation::StreamReader reader;
+      ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                            &reader.rows_affected, &error),
+                  IsOkStatus(&error));
+      ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+      ASSERT_EQ(reader.schema->n_children, 2);
+      EXPECT_STREQ(reader.schema->children[0]->format,
+                   result_schema->children[0]->format);
+      ASSERT_NO_FATAL_FAILURE(reader.Next());
+      ASSERT_EQ(reader.array->length, 1);
+      ASSERT_FALSE(ArrowArrayViewIsNull(reader.array_view->children[1], 0));
+      EXPECT_EQ(ArrowArrayViewGetIntUnsafe(reader.array_view->children[1], 0), 1);
+    }
+    ASSERT_THAT(AdbcStatementRelease(&statement, &error), IsOkStatus(&error));
+  }
 }
 
 TEST_F(PostgresStatementTest, TransactionStatus) {
@@ -1858,6 +2878,7 @@ TEST_F(PostgresStatementTest, IsolationLevels) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestSchema) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   const std::string schema_name = "testschema";
 
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -2045,7 +3066,84 @@ TEST_F(PostgresStatementTest, SqlIngestTemporaryTable) {
   }
 }
 
+// Appending looks up the target's column types before COPY, so these errors
+// surface even without COPY FROM STDIN (#13).
+TEST_F(PostgresStatementTest, SqlIngestAppendTargetLookupErrors) {
+  ASSERT_THAT(quirks()->DropTable(&connection, "no_such_ingest_table", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(quirks()->DropTable(&connection, "ingest_lookup", &error),
+              IsOkStatus(&error));
+  {
+    adbc_validation::Handle<struct AdbcStatement> create;
+    ASSERT_THAT(AdbcStatementNew(&connection, &create.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(
+                    &create.value, "CREATE TABLE ingest_lookup (amount BIGINT)", &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&create.value, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
+  // Drop the table however the test exits, including through a failed ASSERT.
+  struct OnExit {
+    std::function<void()> run;
+    ~OnExit() { run(); }
+  } drop_on_exit{[this]() {
+    struct AdbcError drop_error = {};
+    EXPECT_THAT(quirks()->DropTable(&connection, "ingest_lookup", &drop_error),
+                IsOkStatus(&drop_error));
+  }};
+
+  auto append = [&](const char* db_schema, const char* target,
+                    const char* column) -> AdbcStatusCode {
+    adbc_validation::Handle<struct ArrowSchema> schema;
+    adbc_validation::Handle<struct ArrowArray> batch;
+    ArrowSchemaInit(&schema.value);
+    EXPECT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
+    EXPECT_THAT(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64),
+                adbc_validation::IsOkErrno());
+    EXPECT_THAT(ArrowSchemaSetName(schema->children[0], column),
+                adbc_validation::IsOkErrno());
+    EXPECT_THAT(
+        (adbc_validation::MakeBatch<int64_t>(
+            &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr), {1})),
+        adbc_validation::IsOkErrno());
+
+    adbc_validation::Handle<struct AdbcStatement> stmt;
+    EXPECT_THAT(AdbcStatementNew(&connection, &stmt.value, &error), IsOkStatus(&error));
+    EXPECT_THAT(AdbcStatementSetOption(&stmt.value, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                       target, &error),
+                IsOkStatus(&error));
+    if (db_schema != nullptr) {
+      EXPECT_THAT(AdbcStatementSetOption(&stmt.value, ADBC_INGEST_OPTION_TARGET_DB_SCHEMA,
+                                         db_schema, &error),
+                  IsOkStatus(&error));
+    }
+    EXPECT_THAT(AdbcStatementSetOption(&stmt.value, ADBC_INGEST_OPTION_MODE,
+                                       ADBC_INGEST_OPTION_MODE_APPEND, &error),
+                IsOkStatus(&error));
+    EXPECT_THAT(AdbcStatementBind(&stmt.value, &batch.value, &schema.value, &error),
+                IsOkStatus(&error));
+    return AdbcStatementExecuteQuery(&stmt.value, nullptr, nullptr, &error);
+  };
+
+  ASSERT_THAT(append(nullptr, "no_such_ingest_table", "amount"),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  ASSERT_THAT(append("no_such_ingest_schema", "ingest_lookup", "amount"),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  ASSERT_THAT(append(nullptr, "ingest_lookup", "not_a_column"),
+              IsStatus(ADBC_STATUS_ALREADY_EXISTS, &error));
+
+  // DuckDB column names ignore case, so a differently cased column passes the
+  // lookup; if the append still fails, it's at COPY FROM STDIN, which the
+  // endpoint lacks (#31).
+  if (append(nullptr, "INGEST_LOOKUP", "AMOUNT") != ADBC_STATUS_OK) {
+    EXPECT_THAT(error.message ? error.message : "",
+                ::testing::HasSubstr("COPY query failed"));
+  }
+  if (error.release) error.release(&error);
+}
+
 TEST_F(PostgresStatementTest, SqlIngestAppendIntegerIntoNumeric) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->DropTable(&connection, "numeric_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -2102,6 +3200,7 @@ TEST_F(PostgresStatementTest, SqlIngestAppendIntegerIntoNumeric) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendIntegerListIntoNumericArray) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->DropTable(&connection, "numeric_array_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -2156,6 +3255,7 @@ TEST_F(PostgresStatementTest, SqlIngestAppendIntegerListIntoNumericArray) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendIntegerBoundsIntoNumeric) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->DropTable(&connection, "numeric_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -2223,6 +3323,7 @@ TEST_F(PostgresStatementTest, SqlIngestAppendIntegerBoundsIntoNumeric) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestAppendFloatIntoNumericNotImplemented) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->DropTable(&connection, "numeric_ingest", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -2332,6 +3433,7 @@ TEST_F(PostgresStatementTest, SqlIngestTimestampOverflow) {
 }
 
 TEST_F(PostgresStatementTest, SqlIngestJson) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   std::string drop = "DROP TABLE IF EXISTS jsontable";
@@ -2404,6 +3506,7 @@ TEST_F(PostgresStatementTest, SqlIngestJson) {
 // Ensure the table is actually created with the JSON type by trying to ingest
 // invalid JSON
 TEST_F(PostgresStatementTest, SqlIngestJsonInvalid) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
   std::string drop = "DROP TABLE IF EXISTS jsontable";
@@ -3092,6 +4195,7 @@ TEST_F(PostgresStatementTest, SqlExecuteCopyZeroRowOutputError) {
 }
 
 TEST_F(PostgresStatementTest, BatchSizeHint) {
+  SKIP_WITHOUT_COPY_FROM_STDIN();
   ASSERT_THAT(quirks()->EnsureSampleTable(&connection, "batch_size_hint_test", &error),
               IsOkStatus(&error));
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
@@ -3557,6 +4661,47 @@ TEST_F(PostgresStatementTest, ExecuteManyTimestampTzError) {
   ASSERT_EQ("0", rows);
 }
 
+TEST_F(PostgresStatementTest, IngestReplaceKeepsTableOnBadColumnName) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(&statement,
+                                      {"DROP TABLE IF EXISTS test_ingest_bad_name",
+                                       "CREATE TABLE test_ingest_bad_name (ints BIGINT)",
+                                       "INSERT INTO test_ingest_bad_name VALUES (1)"},
+                                      &error));
+
+  // A column name that isn't valid UTF-8 can't be escaped. Replace mode must
+  // fail on it before dropping the existing table.
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ArrowSchemaInit(&schema.value);
+  ASSERT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(schema->children[0], "\xff"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(
+      (adbc_validation::MakeBatch<int64_t>(
+          &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr), {2})),
+      adbc_validation::IsOkErrno());
+  adbc_validation::Handle<struct AdbcStatement> ingest;
+  ASSERT_THAT(AdbcStatementNew(&connection, &ingest.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetOption(&ingest.value, ADBC_INGEST_OPTION_TARGET_TABLE,
+                                     "test_ingest_bad_name", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementSetOption(&ingest.value, ADBC_INGEST_OPTION_MODE,
+                                     ADBC_INGEST_OPTION_MODE_REPLACE, &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&ingest.value, &batch.value, &schema.value, &error),
+              IsOkStatus(&error));
+  ASSERT_EQ(ADBC_STATUS_INVALID_ARGUMENT,
+            AdbcStatementExecuteQuery(&ingest.value, nullptr, nullptr, &error));
+  error.release(&error);
+
+  std::string rows;
+  ASSERT_NO_FATAL_FAILURE(CountRows(&statement, "test_ingest_bad_name", &rows, &error));
+  ASSERT_EQ("1", rows);
+}
+
 TEST_F(PostgresStatementTest, SetUseCopyFalse) {
   ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
 
@@ -3830,12 +4975,6 @@ TEST_P(PostgresTypeTest, SelectValue) {
     GTEST_SKIP() << *reason;
   }
   std::string value = GetParam().sql_literal;
-  if ((value == "'-inf'") || (value == "'inf'")) {
-    const std::string version = adbc_validation::GetDriverVendorVersion(&connection_);
-    if (version < "140000") {
-      GTEST_SKIP() << "-inf and inf not implemented until postgres 14";
-    }
-  }
   // create table
   std::string query = "CREATE TABLE foo (col ";
   query += GetParam().sql_type;
@@ -4335,6 +5474,7 @@ static const std::vector<DecimalFixtureGroup>& DecimalFixtureGroups() {
 class PostgresDecimalTestBase : public ::testing::Test {
  public:
   void SetUp() override {
+    SKIP_WITHOUT_COPY_FROM_STDIN();
     ASSERT_THAT(AdbcDatabaseNew(&database_, &error_), IsOkStatus(&error_));
     ASSERT_THAT(quirks_.SetupDatabase(&database_, &error_), IsOkStatus(&error_));
     ASSERT_THAT(AdbcDatabaseInit(&database_, &error_), IsOkStatus(&error_));

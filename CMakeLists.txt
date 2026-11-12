@@ -39,7 +39,7 @@ option(MOTHERDUCK_TEST_POSTGRESQL "Run the inherited tests against PostgreSQL" O
 find_package(PostgreSQL REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-configure_file(src/adbc_driver_motherduck_config.h.in
+configure_file(src/motherduck/adbc_driver_motherduck_config.h.in
                generated/adbc_driver_motherduck_config.h @ONLY)
 
 add_subdirectory(third_party/arrow-adbc)

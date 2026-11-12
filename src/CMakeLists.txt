@@ -21,20 +21,30 @@
 # under the License.
 
 add_library(adbc_driver_motherduck_impl STATIC
-            auth/http_client.cc
-            auth/json.cc
-            auth/login.cc
-            auth/token_cache.cc
-            connection.cc
-            error.cc
-            database.cc
-            result_helper.cc
-            result_reader.cc
-            statement.cc
-            type_resolver_init.cc
+            postgres/connection.cc
+            postgres/error.cc
+            postgres/database.cc
+            postgres/result_helper.cc
+            postgres/result_reader.cc
+            postgres/statement.cc
+            postgres/type_resolver_init.cc
+            motherduck/motherduck_connection.cc
+            motherduck/motherduck_database.cc
+            motherduck/motherduck_error.cc
+            motherduck/motherduck_factory.cc
+            motherduck/motherduck_get_objects.cc
+            motherduck/motherduck_pipeline.cc
+            motherduck/motherduck_redact.cc
+            motherduck/motherduck_statement.cc
+            motherduck/motherduck_type_resolver.cc
+            motherduck/auth/http_client.cc
+            motherduck/auth/json.cc
+            motherduck/auth/login.cc
+            motherduck/auth/token_cache.cc
             ${PROJECT_SOURCE_DIR}/third_party/yyjson/yyjson.c)
 target_include_directories(adbc_driver_motherduck_impl
-                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/postgres
+                                  ${CMAKE_CURRENT_SOURCE_DIR}/motherduck
                                   ${PROJECT_SOURCE_DIR}/include
                                   ${PROJECT_BINARY_DIR}/generated)
 target_include_directories(adbc_driver_motherduck_impl SYSTEM
@@ -60,7 +70,7 @@ elseif(APPLE)
                                                            "-framework Security")
 endif()
 
-add_library(adbc_driver_motherduck SHARED postgresql.cc motherduck.cc)
+add_library(adbc_driver_motherduck SHARED postgres/postgresql.cc motherduck/motherduck.cc)
 target_link_libraries(adbc_driver_motherduck PRIVATE adbc_driver_motherduck_impl)
 target_include_directories(adbc_driver_motherduck
                            PUBLIC ${PROJECT_SOURCE_DIR}/include

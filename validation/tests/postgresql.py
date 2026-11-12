@@ -27,10 +27,14 @@ from pathlib import Path
 
 from adbc_drivers_validation import model, quirks
 
+# MotherDuck says `Table with name foo does not exist!`, or for a failed
+# `::regclass` cast, `relation "foo" does not exist`.
+_TABLE_NOT_FOUND = re.compile(
+    r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
+)
+
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
-    # Work around https://github.com/adbc-drivers/motherduck/issues/11
-    "adbc.postgresql.use_copy": "false",
 }
 
 
@@ -38,10 +42,12 @@ class PostgreSQLQuirks(model.DriverQuirks):
     name = "postgresql"
     driver = "adbc_driver_postgresql"
     driver_name = "ADBC MotherDuck Driver"
-    # The driver still reports PostgreSQL and the endpoint's server_version_num
+    # The driver still reports PostgreSQL as the vendor name
     # (https://github.com/adbc-drivers/motherduck/issues/15).
     vendor_name = "MotherDuck"
-    vendor_version = re.compile(r"[0-9]{6}")
+    # It reports no vendor version, rather than the endpoint's PostgreSQL
+    # server_version_num.
+    vendor_version = ""
     # MotherDuck is a service with no version to pin, so the docs label the
     # results "latest".
     short_version = "latest"
@@ -49,11 +55,13 @@ class PostgreSQLQuirks(model.DriverQuirks):
         connection_get_table_schema=True,
         connection_transactions=True,
         get_objects=True,
-        get_objects_constraints_foreign=False,
-        get_objects_constraints_primary=False,
-        get_objects_constraints_unique=False,
+        get_objects_constraints_check=True,
+        get_objects_constraints_foreign=True,
+        get_objects_constraints_primary=True,
+        get_objects_constraints_unique=True,
         metadata_type_name=True,
-        statement_bulk_ingest=True,
+        # Needs COPY FROM STDIN, which the endpoint lacks (#31).
+        statement_bulk_ingest=False,
         statement_bulk_ingest_catalog=False,
         statement_bulk_ingest_schema=False,
         # MotherDuck has no temporary tables.
@@ -80,31 +88,52 @@ class PostgreSQLQuirks(model.DriverQuirks):
     def queries_paths(self) -> tuple[Path, ...]:
         return (Path(__file__).parent.parent / "queries",)
 
+    def query_override(self, context: str, default: str) -> str:
+        # Unbound, the endpoint can't type a parameter that decides a result
+        # column's type, as in SELECT 1 + $1 (#17). Use ones it can type.
+        overrides = {
+            "TestStatement.test_parameter_schema::1": "SELECT 1 WHERE 1 = $1",
+            "TestStatement.test_parameter_schema::2": (
+                "SELECT 1 WHERE 1 = $1 AND 2 = $2"
+            ),
+        }
+        return overrides.get(context, default)
+
     def bind_parameter(self, index: int) -> str:
         """PostgreSQL uses $1, $2, $3, etc. for parameter placeholders."""
         return f"${index}"
 
-    def is_table_not_found(self, table_name: str, error: Exception) -> bool:
-        """Check if the error indicates a table not found condition."""
-        error_str = str(error).lower()
-        return (
-            (
-                "relation" in error_str
-                and "does not exist" in error_str
-                and table_name.lower() in error_str
-            )
-            or (
-                "table" in error_str
-                and "does not exist" in error_str
-                and table_name.lower() in error_str
-            )
-            or ("undefined_table" in error_str and table_name.lower() in error_str)
+    def is_table_not_found(self, table_name: str | None, error: Exception) -> bool:
+        """Check if the error indicates a table not found condition.
+
+        With no table name, any table not found error matches.
+        """
+        # Match the server's message, not the failed query the driver echoes
+        # into the error, which may mention "table" and the table's name.
+        match = _TABLE_NOT_FOUND.search(str(error).lower())
+        return match is not None and (
+            table_name is None or table_name.lower() in match.group(1)
         )
 
     def quote_one_identifier(self, identifier: str) -> str:
         """Quote an identifier using PostgreSQL's double-quote syntax."""
         identifier = identifier.replace('"', '""')
         return f'"{identifier}"'
+
+    @property
+    def sample_ddl_constraints(self) -> list[str]:
+        return [
+            "CREATE TABLE constraint_check (a INT CHECK (a > 0), b INT, CHECK (a + b > 0))",
+            "CREATE TABLE constraint_unique (a INT UNIQUE, b INT, c INT, UNIQUE (c, b))",
+            "CREATE TABLE constraint_primary (a INT PRIMARY KEY)",
+            "CREATE TABLE constraint_primary_multi (a INT, b INT, PRIMARY KEY (b, a))",
+            "CREATE TABLE constraint_primary_multi2 (a INT, b INT, PRIMARY KEY (a, b))",
+            "CREATE TABLE constraint_foreign (a INT, b INT REFERENCES constraint_primary (a))",
+            (
+                "CREATE TABLE constraint_foreign_multi (a INT, b INT, c INT,"
+                " FOREIGN KEY (c, b) REFERENCES constraint_primary_multi2 (a, b))"
+            ),
+        ]
 
     def split_statement(self, statement: str) -> list[str]:
         """Split a multi-statement SQL string into individual statements."""
