@@ -1194,26 +1194,7 @@ std::shared_ptr<PqResultArrayReader> PostgresConnection::ActiveReader() const {
   return active_reader_.lock();
 }
 
-void PostgresConnection::DrainRetiredReaders() {
-  std::vector<std::shared_ptr<PqResultArrayReader>> retired;
-  {
-    std::lock_guard<std::mutex> lock(retired_mu_);
-    retired.swap(retired_);
-  }
-  retired.clear();
-}
-
-void PostgresConnection::RetireReader(std::shared_ptr<PqResultArrayReader> reader) {
-  std::lock_guard<std::mutex> lock(retired_mu_);
-  if (disconnected_.load(std::memory_order_acquire)) return;
-  for (const auto& existing : retired_) {
-    if (existing == reader) return;
-  }
-  retired_.push_back(std::move(reader));
-}
-
 void PostgresConnection::FinishActiveReader() {
-  DrainRetiredReaders();
   std::shared_ptr<PqResultArrayReader> reader;
   {
     std::lock_guard<std::mutex> lock(active_reader_mu_);
@@ -1224,11 +1205,9 @@ void PostgresConnection::FinishActiveReader() {
 }
 
 AdbcStatusCode PostgresConnection::Release(struct AdbcError* error) {
-  // Detach readers on this thread before PQfinish. A reader parked by Cancel
-  // is destroyed here, not on the cancel thread.
+  // Finish a server read on this thread before PQfinish.
   FinishActiveReader();
   disconnected_.store(true, std::memory_order_release);
-  DrainRetiredReaders();
   if (cancel_) {
     PQfreeCancel(cancel_);
     cancel_ = nullptr;
