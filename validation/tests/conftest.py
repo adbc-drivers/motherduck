@@ -37,7 +37,7 @@ from adbc_drivers_validation.tests.conftest import (  # noqa: F401
     pytest_collection_modifyitems,
 )
 
-from .postgresql import get_quirks
+from .postgresql import TEST_SCHEMA, get_quirks
 
 
 def pytest_addoption(parser) -> None:
@@ -60,12 +60,18 @@ def driver_path(driver: adbc_drivers_validation.model.DriverQuirks) -> str:
     return str(base / f"build/libadbc_driver_motherduck.{ext}")
 
 
-# A schema or database name's Unix time (see ci/scripts/pre-test.sh) a day or more
-# ago, as 'stale'.
-_STALE = (
-    "CASE WHEN TRY_CAST(regexp_extract({0}, '^adbc_([0-9]+)_', 1) AS BIGINT) "
-    "< CAST(epoch(now()) AS BIGINT) - 86400 THEN 'stale' ELSE '' END"
-)
+# The name of a run's schema, or of a schema or database named after it, with
+# the run's Unix time as group 1 (see ci/scripts/pre-test.sh). The full shape
+# keeps the sweep from touching anything else in the account.
+_TEST_NAME_PATTERN = "^adbc_([0-9]{10})_.+_(linux|macos|windows)_(amd64|arm64)(_.+)?$"
+
+
+def _stale(column: str) -> str:
+    """'stale' for a test-shaped name in column with a time a day or more ago."""
+    return (
+        f"CASE WHEN TRY_CAST(regexp_extract({column}, '{_TEST_NAME_PATTERN}', 1) "
+        "AS BIGINT) < CAST(epoch(now()) AS BIGINT) - 86400 THEN 'stale' ELSE '' END"
+    )
 
 
 @pytest.fixture(scope="session")
@@ -76,7 +82,7 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
     so concurrent jobs and interrupted runs can't leave tables behind."""
     setup_uri = os.environ.get("MOTHERDUCK_TEST_SETUP_URI")
     catalog = os.environ.get("MOTHERDUCK_TEST_CATALOG")
-    schema = os.environ.get("MOTHERDUCK_TEST_SCHEMA")
+    schema = TEST_SCHEMA
     if not setup_uri or not catalog or not schema:
         yield
         return
@@ -107,7 +113,7 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
 
     def drop_leftovers(cursor) -> None:
         cursor.execute(
-            f"SELECT schema_name, {_STALE.format('schema_name')} "
+            f"SELECT schema_name, {_stale('schema_name')} "
             "FROM duckdb_schemas() WHERE database_name = current_database()"
         )
         for name, stale in cursor.fetchall():
@@ -116,8 +122,7 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
                     f"DROP SCHEMA IF EXISTS {database}.{quote(name)} CASCADE"
                 )
         cursor.execute(
-            f"SELECT database_name, {_STALE.format('database_name')} "
-            "FROM duckdb_databases()"
+            f"SELECT database_name, {_stale('database_name')} FROM duckdb_databases()"
         )
         for name, stale in cursor.fetchall():
             if name != catalog and leftover(name, stale):

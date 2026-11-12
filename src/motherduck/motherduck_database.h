@@ -71,9 +71,6 @@ class MotherduckDatabase : public PostgresDatabase {
   std::string_view DriverVersion() override;
 
  private:
-  /// Points the connection's search_path at db_schema_ in its current database.
-  AdbcStatusCode SetSearchPath(PGconn* conn, struct AdbcError* error) const;
-
   // Empty until set, so the URI can override the default.
   std::string attach_mode_;
   std::string session_name_;

@@ -33,9 +33,16 @@ _TABLE_NOT_FOUND = re.compile(
     r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
 )
 
-# The run's own schema in the shared test database (see ci/scripts/pre-test.sh),
-# which every connection starts in, or main.
-_test_schema = os.environ.get("MOTHERDUCK_TEST_SCHEMA")
+# This process's own schema in the shared test database: MOTHERDUCK_TEST_SCHEMA
+# (see ci/scripts/pre-test.sh) and the process ID, so runs that source the same
+# .env.override still get different schemas. Every connection starts in it.
+# None without the variable, when connections start in main.
+TEST_SCHEMA = (
+    f"{os.environ['MOTHERDUCK_TEST_SCHEMA']}_{os.getpid()}"
+    if os.environ.get("MOTHERDUCK_TEST_SCHEMA")
+    else None
+)
+_test_schema = TEST_SCHEMA
 
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),

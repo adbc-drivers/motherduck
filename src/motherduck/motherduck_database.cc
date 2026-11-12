@@ -37,6 +37,7 @@
 #include "driver/common/utils.h"
 #include "error.h"
 #include "motherduck_ascii.h"
+#include "motherduck_connection.h"
 #include "motherduck_type_resolver.h"
 
 namespace adbcpq {
@@ -429,42 +430,6 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   return ADBC_STATUS_OK;
 }
 
-AdbcStatusCode MotherduckDatabase::SetSearchPath(PGconn* conn,
-                                                 struct AdbcError* error) const {
-  // DuckDB resolves a bare search_path entry as a database before a schema, so
-  // qualify the schema with the connection's database.
-  PGresult* result = PQexec(conn, "SELECT current_database()");
-  if (PQresultStatus(result) != PGRES_TUPLES_OK || PQntuples(result) != 1 ||
-      PQnfields(result) != 1) {
-    InternalAdbcSetError(error,
-                         "[motherduck] Failed to look up the current database for "
-                         "%s=%s: %s",
-                         ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, db_schema_.c_str(),
-                         PQerrorMessage(conn));
-    PQclear(result);
-    return ADBC_STATUS_IO;
-  }
-  std::string database_name(PQgetvalue(result, 0, 0),
-                            static_cast<size_t>(PQgetlength(result, 0, 0)));
-  PQclear(result);
-
-  std::string database;
-  std::string schema;
-  RAISE_ADBC(EscapeIdentifier(conn, database_name, &database, error));
-  RAISE_ADBC(EscapeIdentifier(conn, db_schema_, &schema, error));
-  result = PQexec(conn, ("SET search_path TO " + database + "." + schema).c_str());
-  // MotherDuck answers SET with an empty Success result set.
-  ExecStatusType status = PQresultStatus(result);
-  PQclear(result);
-  if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
-    InternalAdbcSetError(error, "[motherduck] Failed to set %s=%s: %s",
-                         ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, db_schema_.c_str(),
-                         PQerrorMessage(conn));
-    return ADBC_STATUS_IO;
-  }
-  return ADBC_STATUS_OK;
-}
-
 AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* error) {
   std::vector<std::pair<std::string, std::string>> params;
   RAISE_ADBC(ConnectParams(&params, error));
@@ -487,9 +452,14 @@ AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* erro
   }
 
   // The endpoint rejects search_path as a startup option, so set it once
-  // connected.
+  // connected. A database named in the connection is its current database,
+  // which saves looking it up; md: (or none) leaves it to the server.
   if (!db_schema_.empty()) {
-    AdbcStatusCode status = SetSearchPath(*conn, error);
+    const char* dbname = PQdb(*conn);
+    std::string_view database;
+    if (dbname != nullptr && std::strchr(dbname, ':') == nullptr) database = dbname;
+    AdbcStatusCode status = SetMotherduckSearchPath(
+        *conn, db_schema_, database, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, error);
     if (status != ADBC_STATUS_OK) {
       PQfinish(*conn);
       *conn = nullptr;

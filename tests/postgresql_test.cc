@@ -42,7 +42,9 @@
 #include <variant>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -72,18 +74,31 @@ using std::string_literals::operator""s;
 
 namespace {
 
-// The schema this run works in (see ci/scripts/pre-test.sh), or main.
-std::string TestSchema() {
-  const char* schema = std::getenv("MOTHERDUCK_TEST_SCHEMA");
-  return schema && *schema ? schema : "main";
+// This process's own schema: MOTHERDUCK_TEST_SCHEMA (see
+// ci/scripts/pre-test.sh) and the process ID, so runs that source the same
+// .env.override still get different schemas. Empty without the variable.
+const std::string& RunSchema() {
+  static const std::string schema = [] {
+    const char* base = std::getenv("MOTHERDUCK_TEST_SCHEMA");
+    if (base == nullptr || *base == '\0') return std::string();
+#ifdef _WIN32
+    const int pid = _getpid();
+#else
+    const int pid = static_cast<int>(getpid());
+#endif
+    return std::string(base) + "_" + std::to_string(pid);
+  }();
+  return schema;
 }
 
-// Another schema of this run's own, named after the run's schema, so
-// concurrent runs never share it. MotherDuckTestDatabase drops it at the end.
+// The schema this run works in, or main.
+std::string TestSchema() { return RunSchema().empty() ? "main" : RunSchema(); }
+
+// Another schema (or database) of this run's own, named after the run's
+// schema, so concurrent runs never share it. MotherDuckTestDatabase drops it.
 std::string TestSchema(std::string_view suffix) {
-  const char* schema = std::getenv("MOTHERDUCK_TEST_SCHEMA");
-  if (!schema || !*schema) return std::string(suffix);
-  return std::string(schema) + "_" + std::string(suffix);
+  if (RunSchema().empty()) return std::string(suffix);
+  return RunSchema() + "_" + std::string(suffix);
 }
 
 std::string Upper(std::string value) {
@@ -114,7 +129,7 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     }
     RAISE_ADBC(SetupDatabase(database, uri, error));
     // Every connection starts in this run's schema.
-    if (std::getenv("MOTHERDUCK_TEST_SCHEMA")) {
+    if (!RunSchema().empty()) {
       RAISE_ADBC(AdbcDatabaseSetOption(database, "adbc.motherduck.db_schema",
                                        TestSchema().c_str(), error));
     }
@@ -305,8 +320,7 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   }
   std::string db_schema() const override { return TestSchema(); }
   std::string secondary_db_schema() const override {
-    const char* schema = std::getenv("MOTHERDUCK_TEST_SCHEMA");
-    if (!schema || !*schema) return adbc_validation::DriverQuirks::secondary_db_schema();
+    if (RunSchema().empty()) return adbc_validation::DriverQuirks::secondary_db_schema();
     return TestSchema("other");
   }
 
@@ -339,6 +353,11 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   // Statistics come from pg_stats, which DuckDB doesn't have.
   bool supports_statistics() const override { return false; }
 };
+
+// The name of a run's schema, or of a schema or database named after it, with
+// the run's Unix time as group 1 (see ci/scripts/pre-test.sh).
+constexpr std::string_view kTestNamePattern =
+    "^adbc_([0-9]{10})_.+_(linux|macos|windows)_(amd64|arm64)(_.+)?$";
 
 // Gives the test run a schema of its own in the shared test database (see
 // ci/scripts/pre-test.sh), and afterwards drops it, the other schemas and the
@@ -377,12 +396,11 @@ class MotherDuckTestDatabase : public ::testing::Environment {
   bool Configured() {
     const char* setup_uri = std::getenv("MOTHERDUCK_TEST_SETUP_URI");
     const char* catalog = std::getenv("MOTHERDUCK_TEST_CATALOG");
-    const char* schema = std::getenv("MOTHERDUCK_TEST_SCHEMA");
-    if (!setup_uri || !catalog || !schema || !*schema) return false;
+    if (!setup_uri || !catalog || RunSchema().empty()) return false;
     setup_uri_ = setup_uri;
     catalog_name_ = catalog;
     catalog_ = quirks_.QuoteIdentifier(catalog);
-    schema_ = schema;
+    schema_ = RunSchema();
     return true;
   }
 
@@ -403,13 +421,15 @@ class MotherDuckTestDatabase : public ::testing::Environment {
   }
 
   // Drops, in the current database, this run's schemas, and in the account,
-  // the databases named after them, along with any schema or database whose
-  // name starts with adbc_<Unix time>_ (see ci/scripts/pre-test.sh) for a time
-  // a day or more ago.
+  // the databases named after them, along with any schema or database named
+  // like a test run's, adbc_<Unix time>_..._<os>_<arch>[_...] (see
+  // ci/scripts/pre-test.sh), for a time a day or more ago. The full shape
+  // keeps it from touching anything else in the account.
   void DropLeftovers(struct AdbcConnection* connection) {
     auto stale = [](const char* column) {
-      return std::string("CASE WHEN TRY_CAST(regexp_extract(") + column +
-             ", '^adbc_([0-9]+)_', 1) AS BIGINT) < CAST(epoch(now()) AS BIGINT) - "
+      return std::string("CASE WHEN TRY_CAST(regexp_extract(") + column + ", '" +
+             std::string(kTestNamePattern) +
+             "', 1) AS BIGINT) < CAST(epoch(now()) AS BIGINT) - "
              "86400 THEN 'stale' ELSE '' END";
     };
     auto leftover = [&](const std::vector<std::string>& row) {
@@ -1073,7 +1093,7 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
   // Named after the run's schema, so concurrent runs don't share it, and
   // dropped with the run's leftovers if the test doesn't get to drop it.
   const std::string other =
-      std::getenv("MOTHERDUCK_TEST_SCHEMA") ? TestSchema("other_db") : catalog + "_other";
+      !RunSchema().empty() ? TestSchema("other_db") : catalog + "_other";
   const std::string drop = "DROP DATABASE IF EXISTS " + quirks_.QuoteIdentifier(other);
   ASSERT_THAT(ExecuteSql(&workspace.value, drop, &error), IsOkStatus(&error));
   ASSERT_THAT(ExecuteSql(&workspace.value,
@@ -4565,7 +4585,7 @@ void QueryScalar(struct AdbcStatement* statement, const char* query, std::string
 // even when an attached database has its name (a bare search_path entry would
 // switch to that database instead).
 TEST_F(PostgresDatabaseTest, DbSchemaOption) {
-  if (!std::getenv("MOTHERDUCK_TEST_SCHEMA")) {
+  if (RunSchema().empty()) {
     GTEST_SKIP() << "Needs MOTHERDUCK_TEST_SCHEMA (see ci/scripts/pre-test.sh)";
   }
   const std::string catalog = quirks_.catalog();
@@ -4611,6 +4631,37 @@ TEST_F(PostgresDatabaseTest, DbSchemaOption) {
     ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
                 IsOkStatus(&error));
     std::string current;
+    ASSERT_NO_FATAL_FAILURE(QueryScalar(
+        &statement.value, "SELECT current_database() || '.' || current_schema()",
+        &current, &error));
+    EXPECT_EQ(current, catalog + "." + name);
+
+    // The connection option, set before Init (as Python does), replaces it.
+    {
+      Handle<struct AdbcConnection> other;
+      Handle<struct AdbcStatement> other_statement;
+      ASSERT_THAT(AdbcConnectionNew(&other.value, &error), IsOkStatus(&error));
+      ASSERT_THAT(
+          AdbcConnectionSetOption(&other.value, ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+                                  TestSchema().c_str(), &error),
+          IsOkStatus(&error));
+      ASSERT_THAT(AdbcConnectionInit(&other.value, &database.value, &error),
+                  IsOkStatus(&error));
+      ASSERT_THAT(AdbcStatementNew(&other.value, &other_statement.value, &error),
+                  IsOkStatus(&error));
+      ASSERT_NO_FATAL_FAILURE(QueryScalar(
+          &other_statement.value, "SELECT current_database() || '.' || current_schema()",
+          &current, &error));
+      EXPECT_EQ(current, catalog + "." + TestSchema());
+    }
+
+    // The connection option resolves the same way: a name only an attached
+    // database has fails, rather than switching to that database.
+    EXPECT_THAT(AdbcConnectionSetOption(&connection.value,
+                                        ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+                                        database_only.c_str(), &error),
+                IsStatus(ADBC_STATUS_IO, &error));
+    if (error.release) error.release(&error);
     ASSERT_NO_FATAL_FAILURE(QueryScalar(
         &statement.value, "SELECT current_database() || '.' || current_schema()",
         &current, &error));

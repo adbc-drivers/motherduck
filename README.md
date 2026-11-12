@@ -102,7 +102,8 @@ once each connection is up, with the connection's current database. (DuckDB
 would take a bare name that's also an attached database's name as that
 database.) Connecting fails if the schema doesn't exist. It's unset by default, leaving
 MotherDuck's default (`main`); an empty value unsets it.
-`adbc.connection.db_schema` still changes a single connection's schema.
+`adbc.connection.db_schema` changes a single connection's schema the same way,
+in its current database, and replaces this option when set before `Init`.
 
 MotherDuck builds the user agent in query history and its logs from libpq's
 `application_name`. The driver adds `adbc_driver_motherduck/<version>` to it,
@@ -221,13 +222,17 @@ pixi run validate
 
 Runs share one database, `adbc_driver_tests`, which the tests create if it's
 missing and never drop. Each run gets its own schema in it,
-`adbc_<unix time>_<run>_<platform>_<arch>` (`<run>` is the GitHub run, attempt
-and job in CI, and `local_<pid>` locally), which every test connection starts
-in through `adbc.motherduck.db_schema`. Tests that need more schemas or
+`adbc_<unix time>_<run>_<platform>_<arch>_<pid>`: `ci/scripts/pre-test.sh`
+writes everything up to `<arch>` to `MOTHERDUCK_TEST_SCHEMA` (`<run>` is the
+GitHub run, attempt and job in CI, and `local_<pid>` locally), and each test
+process adds its own process ID, so runs that source the same `.env.override`
+still differ. Every test connection starts in the schema through
+`adbc.motherduck.db_schema`. Tests that need more schemas or
 databases name them after the run's schema, and the tests drop all of them when
 they finish, so concurrent jobs and runs don't share tables. Each run also drops
-any schema or database whose name starts with `adbc_<unix time>_` for a time a
-day or more ago, which an interrupted run left behind. A database per run would scale
+any schema or database named like a run's (or named after one), with a time a
+day or more ago, which an interrupted run left behind. Only names of that full
+shape are dropped, so nothing else in the account is touched. A database per run would scale
 worse: each interrupted run would leave a database and its retained storage
 behind, and every workspace-mode connection in the account attaches every
 database. Set `MOTHERDUCK_TEST_DATABASE` to use another database.
