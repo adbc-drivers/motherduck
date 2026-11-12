@@ -54,8 +54,9 @@ $ pixi run validate
 ```
 
 The suite works in a schema of its own in the shared `adbc_driver_tests`
-database, which it creates before it starts and drops, with the schemas named
-after it, when it finishes (see the main README). To use another database, set
+database, which it creates before it starts and drops, with the schemas and
+databases named after it, when it finishes; it also drops what interrupted runs
+left behind a day or more ago (see the main README). To use another database, set
 `MOTHERDUCK_TEST_DATABASE` before running `pre-test.sh`.
 `MOTHERDUCK_PG_HOST` overrides the default endpoint,
 `pg.us-east-1-aws.motherduck.com`.

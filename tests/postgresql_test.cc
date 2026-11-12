@@ -304,7 +304,11 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     return catalog;
   }
   std::string db_schema() const override { return TestSchema(); }
-  std::string secondary_db_schema() const override { return TestSchema("other"); }
+  std::string secondary_db_schema() const override {
+    const char* schema = std::getenv("MOTHERDUCK_TEST_SCHEMA");
+    if (!schema || !*schema) return adbc_validation::DriverQuirks::secondary_db_schema();
+    return TestSchema("other");
+  }
 
   // No COPY FROM STDIN yet (#31).
   bool supports_bulk_ingest(const char* mode) const override { return false; }
@@ -337,21 +341,36 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
 };
 
 // Gives the test run a schema of its own in the shared test database (see
-// ci/scripts/pre-test.sh), and drops it and every other schema named after it
-// afterwards, so concurrent jobs and earlier runs can't leave tables behind.
+// ci/scripts/pre-test.sh), and afterwards drops it, the other schemas and the
+// databases named after it, and whatever runs left behind a day or more ago, so
+// concurrent jobs and interrupted runs can't leave tables behind.
 class MotherDuckTestDatabase : public ::testing::Environment {
  public:
   void SetUp() override {
     if (!Configured()) return;
-    ASSERT_NO_FATAL_FAILURE(Execute("CREATE DATABASE IF NOT EXISTS " + catalog_));
-    ASSERT_NO_FATAL_FAILURE(DropRunSchemas());
+    Handle<struct AdbcDatabase> database;
+    Handle<struct AdbcConnection> connection;
+    ASSERT_NO_FATAL_FAILURE(Connect(&database.value, &connection.value));
+    // Runs that start together race to create it the first time. The loser
+    // fails, but by then the database exists, so a second try succeeds.
+    const std::string create = "CREATE DATABASE IF NOT EXISTS " + catalog_;
+    Handle<struct AdbcError> ignored;
+    if (Run(&connection.value, create, &ignored.value) != ADBC_STATUS_OK) {
+      ASSERT_NO_FATAL_FAILURE(Execute(&connection.value, create));
+    }
+    ASSERT_NO_FATAL_FAILURE(Execute(&connection.value, "USE " + catalog_));
+    ASSERT_NO_FATAL_FAILURE(DropLeftovers(&connection.value));
     ASSERT_NO_FATAL_FAILURE(
-        Execute("CREATE SCHEMA " + catalog_ + "." + quirks_.QuoteIdentifier(schema_)));
+        Execute(&connection.value, "CREATE SCHEMA " + quirks_.QuoteIdentifier(schema_)));
   }
 
   void TearDown() override {
     if (!Configured()) return;
-    ASSERT_NO_FATAL_FAILURE(DropRunSchemas());
+    Handle<struct AdbcDatabase> database;
+    Handle<struct AdbcConnection> connection;
+    ASSERT_NO_FATAL_FAILURE(Connect(&database.value, &connection.value));
+    ASSERT_NO_FATAL_FAILURE(Execute(&connection.value, "USE " + catalog_));
+    ASSERT_NO_FATAL_FAILURE(DropLeftovers(&connection.value));
   }
 
  private:
@@ -367,69 +386,100 @@ class MotherDuckTestDatabase : public ::testing::Environment {
     return true;
   }
 
-  // The run's schema and those TestSchema(suffix) names.
-  void DropRunSchemas() {
-    auto literal = [](const std::string& value) {
-      std::string quoted = "'";
-      for (char c : value) {
-        if (c == '\'') quoted += '\'';
-        quoted += c;
-      }
-      return quoted + "'";
+  // A workspace-mode connection to md:, which can create and drop databases.
+  void Connect(struct AdbcDatabase* database, struct AdbcConnection* connection) {
+    Handle<struct AdbcError> error;
+    ASSERT_THAT(AdbcDatabaseNew(database, &error.value), IsOkStatus(&error.value));
+    ASSERT_THAT(quirks_.SetupDatabase(database, setup_uri_.c_str(), &error.value),
+                IsOkStatus(&error.value));
+    // Single attach mode can't connect to md:.
+    ASSERT_THAT(AdbcDatabaseSetOption(database, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      "workspace", &error.value),
+                IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcDatabaseInit(database, &error.value), IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcConnectionNew(connection, &error.value), IsOkStatus(&error.value));
+    ASSERT_THAT(AdbcConnectionInit(connection, database, &error.value),
+                IsOkStatus(&error.value));
+  }
+
+  // Drops, in the current database, this run's schemas, and in the account,
+  // the databases named after them, along with any schema or database whose
+  // name starts with adbc_<Unix time>_ (see ci/scripts/pre-test.sh) for a time
+  // a day or more ago.
+  void DropLeftovers(struct AdbcConnection* connection) {
+    auto stale = [](const char* column) {
+      return std::string("CASE WHEN TRY_CAST(regexp_extract(") + column +
+             ", '^adbc_([0-9]+)_', 1) AS BIGINT) < CAST(epoch(now()) AS BIGINT) - "
+             "86400 THEN 'stale' ELSE '' END";
     };
-    std::vector<std::string> schemas;
-    ASSERT_NO_FATAL_FAILURE(
-        Execute("SELECT schema_name FROM duckdb_schemas() WHERE database_name = " +
-                    literal(catalog_name_) + " AND (schema_name = " + literal(schema_) +
-                    " OR starts_with(schema_name, " + literal(schema_ + "_") + "))",
-                &schemas));
-    for (const std::string& schema : schemas) {
-      ASSERT_NO_FATAL_FAILURE(Execute("DROP SCHEMA IF EXISTS " + catalog_ + "." +
-                                      quirks_.QuoteIdentifier(schema) + " CASCADE"));
+    auto leftover = [&](const std::vector<std::string>& row) {
+      return row[0] == schema_ || row[0].rfind(schema_ + "_", 0) == 0 ||
+             row[1] == "stale";
+    };
+
+    std::vector<std::vector<std::string>> schemas;
+    ASSERT_NO_FATAL_FAILURE(Query(connection,
+                                  "SELECT schema_name, " + stale("schema_name") +
+                                      " FROM duckdb_schemas() "
+                                      "WHERE database_name = current_database()",
+                                  &schemas));
+    for (const auto& row : schemas) {
+      if (!leftover(row)) continue;
+      ASSERT_NO_FATAL_FAILURE(
+          Execute(connection, "DROP SCHEMA IF EXISTS " + catalog_ + "." +
+                                  quirks_.QuoteIdentifier(row[0]) + " CASCADE"));
+    }
+
+    std::vector<std::vector<std::string>> databases;
+    ASSERT_NO_FATAL_FAILURE(Query(
+        connection,
+        "SELECT database_name, " + stale("database_name") + " FROM duckdb_databases()",
+        &databases));
+    for (const auto& row : databases) {
+      if (row[0] == catalog_name_ || !leftover(row)) continue;
+      ASSERT_NO_FATAL_FAILURE(Execute(
+          connection, "DROP DATABASE IF EXISTS " + quirks_.QuoteIdentifier(row[0])));
     }
   }
 
-  // Runs the query, collecting its first column's values into rows if given.
-  void Execute(const std::string& query, std::vector<std::string>* rows = nullptr) {
-    Handle<struct AdbcError> error;
-    Handle<struct AdbcDatabase> database;
-    Handle<struct AdbcConnection> connection;
+  AdbcStatusCode Run(struct AdbcConnection* connection, const std::string& query,
+                     struct AdbcError* error) {
     Handle<struct AdbcStatement> statement;
-    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error.value), IsOkStatus(&error.value));
-    ASSERT_THAT(quirks_.SetupDatabase(&database.value, setup_uri_.c_str(), &error.value),
-                IsOkStatus(&error.value));
-    // Single attach mode can't connect to md:.
-    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
-                                      "workspace", &error.value),
-                IsOkStatus(&error.value));
-    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error.value),
-                IsOkStatus(&error.value));
-    ASSERT_THAT(AdbcConnectionNew(&connection.value, &error.value),
-                IsOkStatus(&error.value));
-    ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error.value),
-                IsOkStatus(&error.value));
-    ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error.value),
+    RAISE_ADBC(AdbcStatementNew(connection, &statement.value, error));
+    RAISE_ADBC(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), error));
+    return AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, error);
+  }
+
+  void Execute(struct AdbcConnection* connection, const std::string& query) {
+    Handle<struct AdbcError> error;
+    ASSERT_THAT(Run(connection, query, &error.value), IsOkStatus(&error.value)) << query;
+  }
+
+  // The query's rows, whose columns must all be strings.
+  void Query(struct AdbcConnection* connection, const std::string& query,
+             std::vector<std::vector<std::string>>* rows) {
+    Handle<struct AdbcError> error;
+    Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcStatementNew(connection, &statement.value, &error.value),
                 IsOkStatus(&error.value));
     ASSERT_THAT(AdbcStatementSetSqlQuery(&statement.value, query.c_str(), &error.value),
                 IsOkStatus(&error.value));
-    if (rows == nullptr) {
-      ASSERT_THAT(
-          AdbcStatementExecuteQuery(&statement.value, nullptr, nullptr, &error.value),
-          IsOkStatus(&error.value));
-      return;
-    }
     adbc_validation::StreamReader reader;
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement.value, &reader.stream.value, nullptr,
                                           &error.value),
-                IsOkStatus(&error.value));
+                IsOkStatus(&error.value))
+        << query;
     ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
     while (true) {
       ASSERT_NO_FATAL_FAILURE(reader.Next());
       if (reader.array->release == nullptr) break;
       for (int64_t i = 0; i < reader.array->length; i++) {
-        const struct ArrowStringView value =
-            ArrowArrayViewGetStringUnsafe(reader.array_view->children[0], i);
-        rows->emplace_back(value.data, value.size_bytes);
+        std::vector<std::string>& row = rows->emplace_back();
+        for (int64_t c = 0; c < reader.array_view->n_children; c++) {
+          const struct ArrowStringView value =
+              ArrowArrayViewGetStringUnsafe(reader.array_view->children[c], i);
+          row.emplace_back(value.data, value.size_bytes);
+        }
       }
     }
   }
@@ -1020,7 +1070,10 @@ TEST_F(PostgresConnectionTest, GetObjectsGetCatalogsAttachMode) {
   ASSERT_THAT(AdbcDatabaseInit(&workspace.value, &error), IsOkStatus(&error));
 
   const std::string catalog = quirks()->catalog();
-  const std::string other = catalog + "_other";
+  // Named after the run's schema, so concurrent runs don't share it, and
+  // dropped with the run's leftovers if the test doesn't get to drop it.
+  const std::string other =
+      std::getenv("MOTHERDUCK_TEST_SCHEMA") ? TestSchema("other_db") : catalog + "_other";
   const std::string drop = "DROP DATABASE IF EXISTS " + quirks_.QuoteIdentifier(other);
   ASSERT_THAT(ExecuteSql(&workspace.value, drop, &error), IsOkStatus(&error));
   ASSERT_THAT(ExecuteSql(&workspace.value,
@@ -4505,6 +4558,97 @@ void QueryScalar(struct AdbcStatement* statement, const char* query, std::string
   struct ArrowStringView value =
       ArrowArrayViewGetStringUnsafe(reader.array_view->children[0], 0);
   out->assign(value.data, static_cast<size_t>(value.size_bytes));
+}
+
+// adbc.motherduck.db_schema starts every connection in that schema of the
+// connection's database, and connecting fails when the schema doesn't exist,
+// even when an attached database has its name (a bare search_path entry would
+// switch to that database instead).
+TEST_F(PostgresDatabaseTest, DbSchemaOption) {
+  if (!std::getenv("MOTHERDUCK_TEST_SCHEMA")) {
+    GTEST_SKIP() << "Needs MOTHERDUCK_TEST_SCHEMA (see ci/scripts/pre-test.sh)";
+  }
+  const std::string catalog = quirks_.catalog();
+  // A schema of the test database.
+  const std::string name = TestSchema("db_schema_option");
+  // A database, with no schema of that name in the test database.
+  const std::string database_only = TestSchema("db_schema_option_db");
+  const std::string quoted_database_only = quirks_.QuoteIdentifier(database_only);
+
+  // quirks_ sets the option to the run's schema.
+  Handle<struct AdbcDatabase> workspace;
+  ASSERT_THAT(AdbcDatabaseNew(&workspace.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&workspace.value, &error), IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &workspace.value, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, &error),
+              ::testing::Optional(TestSchema()));
+  ASSERT_THAT(AdbcDatabaseSetOption(&workspace.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                    "workspace", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&workspace.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(ExecuteSql(&workspace.value,
+                         "CREATE SCHEMA IF NOT EXISTS " + quirks_.QuoteIdentifier(name) +
+                             "; CREATE DATABASE IF NOT EXISTS " + quoted_database_only,
+                         &error),
+              IsOkStatus(&error));
+
+  {
+    Handle<struct AdbcDatabase> database;
+    Handle<struct AdbcConnection> connection;
+    Handle<struct AdbcStatement> statement;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      "workspace", &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA,
+                                      name.c_str(), &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementNew(&connection.value, &statement.value, &error),
+                IsOkStatus(&error));
+    std::string current;
+    ASSERT_NO_FATAL_FAILURE(QueryScalar(
+        &statement.value, "SELECT current_database() || '.' || current_schema()",
+        &current, &error));
+    EXPECT_EQ(current, catalog + "." + name);
+
+    // An empty value unsets it.
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA,
+                                      "", &error),
+                IsOkStatus(&error));
+    char value[128];
+    size_t length = sizeof(value);
+    EXPECT_THAT(AdbcDatabaseGetOption(&database.value, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA,
+                                      value, &length, &error),
+                IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+    if (error.release) error.release(&error);
+  }
+
+  {
+    Handle<struct AdbcDatabase> missing;
+    ASSERT_THAT(AdbcDatabaseNew(&missing.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupDatabase(&missing.value, &error), IsOkStatus(&error));
+    // Workspace mode attaches the database with the name.
+    ASSERT_THAT(AdbcDatabaseSetOption(&missing.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      "workspace", &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&missing.value, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA,
+                                      database_only.c_str(), &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseInit(&missing.value, &error),
+                IsStatus(ADBC_STATUS_IO, &error));
+    ASSERT_NE(nullptr, error.message);
+    EXPECT_THAT(error.message, ::testing::HasSubstr(ADBC_MOTHERDUCK_OPTION_DB_SCHEMA));
+    if (error.release) error.release(&error);
+  }
+
+  EXPECT_THAT(ExecuteSql(&workspace.value,
+                         "DROP DATABASE IF EXISTS " + quoted_database_only, &error),
+              IsOkStatus(&error));
 }
 
 // PostgreSQL rolls back a pipeline's implicit transaction when a command in it

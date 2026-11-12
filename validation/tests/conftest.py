@@ -60,11 +60,20 @@ def driver_path(driver: adbc_drivers_validation.model.DriverQuirks) -> str:
     return str(base / f"build/libadbc_driver_motherduck.{ext}")
 
 
+# A schema or database name's Unix time (see ci/scripts/pre-test.sh) a day or more
+# ago, as 'stale'.
+_STALE = (
+    "CASE WHEN TRY_CAST(regexp_extract({0}, '^adbc_([0-9]+)_', 1) AS BIGINT) "
+    "< CAST(epoch(now()) AS BIGINT) - 86400 THEN 'stale' ELSE '' END"
+)
+
+
 @pytest.fixture(scope="session")
 def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
     """Give the session a schema of its own in the shared test database (see
-    ci/scripts/pre-test.sh), and drop it and every schema named after it
-    afterwards, so concurrent jobs and earlier runs can't leave tables behind."""
+    ci/scripts/pre-test.sh), and afterwards drop it, the other schemas and the
+    databases named after it, and whatever runs left behind a day or more ago,
+    so concurrent jobs and interrupted runs can't leave tables behind."""
     setup_uri = os.environ.get("MOTHERDUCK_TEST_SETUP_URI")
     catalog = os.environ.get("MOTHERDUCK_TEST_CATALOG")
     schema = os.environ.get("MOTHERDUCK_TEST_SCHEMA")
@@ -72,7 +81,8 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
         yield
         return
 
-    database = driver.quote_one_identifier(catalog)
+    quote = driver.quote_one_identifier
+    database = quote(catalog)
     # The setup connection is to md:, where the run's schema doesn't resolve.
     setup_kwargs = {
         key: value
@@ -92,29 +102,42 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
             autocommit=True,
         )
 
-    def drop_run_schemas() -> None:
-        with connect() as c, c.cursor() as cursor:
-            cursor.execute(
-                "SELECT schema_name FROM duckdb_schemas() WHERE database_name = $1 "
-                "AND (schema_name = $2 OR starts_with(schema_name, $3))",
-                (catalog, schema, schema + "_"),
-            )
-            names = [row[0] for row in cursor.fetchall()]
-            for name in names:
+    def leftover(name: str, stale: str) -> bool:
+        return name == schema or name.startswith(schema + "_") or stale == "stale"
+
+    def drop_leftovers(cursor) -> None:
+        cursor.execute(
+            f"SELECT schema_name, {_STALE.format('schema_name')} "
+            "FROM duckdb_schemas() WHERE database_name = current_database()"
+        )
+        for name, stale in cursor.fetchall():
+            if leftover(name, stale):
                 cursor.execute(
-                    f"DROP SCHEMA IF EXISTS {database}."
-                    f"{driver.quote_one_identifier(name)} CASCADE"
+                    f"DROP SCHEMA IF EXISTS {database}.{quote(name)} CASCADE"
                 )
+        cursor.execute(
+            f"SELECT database_name, {_STALE.format('database_name')} "
+            "FROM duckdb_databases()"
+        )
+        for name, stale in cursor.fetchall():
+            if name != catalog and leftover(name, stale):
+                cursor.execute(f"DROP DATABASE IF EXISTS {quote(name)}")
 
     with connect() as c, c.cursor() as cursor:
-        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {database}")
-    drop_run_schemas()
-    with connect() as c, c.cursor() as cursor:
-        cursor.execute(
-            f"CREATE SCHEMA {database}.{driver.quote_one_identifier(schema)}"
-        )
+        create = f"CREATE DATABASE IF NOT EXISTS {database}"
+        try:
+            cursor.execute(create)
+        except adbc_driver_manager.dbapi.Error:
+            # Runs that start together race to create it the first time. The
+            # loser fails, but by then the database exists.
+            cursor.execute(create)
+        cursor.execute(f"USE {database}")
+        drop_leftovers(cursor)
+        cursor.execute(f"CREATE SCHEMA {quote(schema)}")
     yield
-    drop_run_schemas()
+    with connect() as c, c.cursor() as cursor:
+        cursor.execute(f"USE {database}")
+        drop_leftovers(cursor)
 
 
 @pytest.fixture(scope="session", autouse=True)

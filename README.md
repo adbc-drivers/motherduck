@@ -97,9 +97,10 @@ unset by default; an empty value unsets it.
 
 `adbc.motherduck.db_schema` (database option) sets the schema every new
 connection starts in. MotherDuck's endpoint doesn't accept `search_path` as a
-startup option, so the driver runs `SET search_path TO <schema>` once each
-connection is up; a bare name is a schema in the connection's database.
-Connecting fails if the schema doesn't exist. It's unset by default, leaving
+startup option, so the driver runs `SET search_path TO <database>.<schema>`
+once each connection is up, with the connection's current database. (DuckDB
+would take a bare name that's also an attached database's name as that
+database.) Connecting fails if the schema doesn't exist. It's unset by default, leaving
 MotherDuck's default (`main`); an empty value unsets it.
 `adbc.connection.db_schema` still changes a single connection's schema.
 
@@ -220,11 +221,13 @@ pixi run validate
 
 Runs share one database, `adbc_driver_tests`, which the tests create if it's
 missing and never drop. Each run gets its own schema in it,
-`adbc_<run>_<platform>_<arch>` (`<run>` is the GitHub run, attempt and job in
-CI, and a timestamp and process ID locally), which every test connection starts
-in through `adbc.motherduck.db_schema`. Tests that need more schemas name them
-after the run's schema, and the tests drop all of them when they finish, so
-concurrent jobs and runs don't share tables. A database per run would scale
+`adbc_<unix time>_<run>_<platform>_<arch>` (`<run>` is the GitHub run, attempt
+and job in CI, and `local_<pid>` locally), which every test connection starts
+in through `adbc.motherduck.db_schema`. Tests that need more schemas or
+databases name them after the run's schema, and the tests drop all of them when
+they finish, so concurrent jobs and runs don't share tables. Each run also drops
+any schema or database whose name starts with `adbc_<unix time>_` for a time a
+day or more ago, which an interrupted run left behind. A database per run would scale
 worse: each interrupted run would leave a database and its retained storage
 behind, and every workspace-mode connection in the account attaches every
 database. Set `MOTHERDUCK_TEST_DATABASE` to use another database.

@@ -45,9 +45,11 @@ if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
   run="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT:-1}_${GITHUB_JOB:-test}"
 else
   # Local runs need their own schema too, so concurrent runs don't collide.
-  run="local_$(date +%s)_$$"
+  run="local_$$"
 fi
-schema="adbc_${run}_${1}_${2}"
+# The leading Unix time lets later runs drop what interrupted runs left behind
+# (schemas, and databases named after them) once it's a day old.
+schema="adbc_$(date +%s)_${run}_${1}_${2}"
 
 # vcpkg's libpq can't see the OS trust store, so use the pixi env's CA bundle.
 # The generated test job doesn't install the env itself.
