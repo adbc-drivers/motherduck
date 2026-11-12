@@ -28,6 +28,9 @@ namespace adbcpq {
 
 namespace {
 
+// Replaces the statement echo that StripStatementEcho removes.
+constexpr char kStatementOmitted[] = "[statement omitted]";
+
 // Deliberately crude: patterns match raw text, ignoring quoting, and the earliest match
 // cuts the text there (group 1 is what's kept). Over-masking is fine; leaking is not.
 // Repeats are bounded because libstdc++'s matcher recurses once per iteration.
@@ -102,6 +105,49 @@ std::string RedactSecretStatements(std::string_view query) {
   }
 }
 
-void InstallMotherDuckQueryRedactor() { SetQueryRedactor(&RedactSecretStatements); }
+std::string StripStatementEcho(std::string_view text) {
+  // Find a line starting with "LINE", spaces, digits and ':'. Text cut short inside
+  // that header has no statement after it yet, so leaving it is harmless.
+  for (size_t line = 0; line < text.size();) {
+    size_t i = line;
+    if (text.compare(i, 4, "LINE") == 0) {
+      i += 4;
+      while (i < text.size() && text[i] == ' ') i++;
+      const size_t digits = i;
+      while (i < text.size() && text[i] >= '0' && text[i] <= '9') i++;
+      if (i > digits && i < text.size() && text[i] == ':') {
+        size_t cut = line;
+        while (cut > 0 && (text[cut - 1] == '\n' || text[cut - 1] == '\r')) cut--;
+        std::string out(text.substr(0, cut));
+        if (!out.empty()) out += ' ';
+        return out + kStatementOmitted;
+      }
+    }
+    const size_t next = text.find('\n', line);
+    if (next == std::string_view::npos) break;
+    line = next + 1;
+  }
+  return std::string(text);
+}
+
+namespace {
+
+// The message redactor. StripStatementEcho can throw bad_alloc, and an error is being
+// built, so this must not throw: on failure, hide everything.
+std::string RedactServerMessage(std::string_view text) {
+  try {
+    return RedactSecretStatements(StripStatementEcho(text));
+  } catch (...) {
+    return "(redacted)";
+  }
+}
+
+}  // namespace
+
+void InstallMotherDuckRedactors() {
+  // Message first: until it is set, messages fall back to the query redactor.
+  SetMessageRedactor(&RedactServerMessage);
+  SetQueryRedactor(&RedactSecretStatements);
+}
 
 }  // namespace adbcpq
