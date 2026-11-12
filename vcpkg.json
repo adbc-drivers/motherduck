@@ -2,6 +2,7 @@
   "name": "adbc-driver-motherduck",
   "version-string": "0.1.0",
   "dependencies": [
-    "libpq"
+    "libpq",
+    "openssl"
   ]
 }

@@ -31,9 +31,10 @@ The upstream PostgreSQL driver's approach credits [pgeon](https://github.com/0x0
 
 ## Build
 
-Requires CMake 3.24+, a C++20 compiler, and PostgreSQL's client library and
-headers (libpq). The driver bundles the Apache common/framework code, nanoarrow,
-fmt, portable-snippets, and boost.int128 it needs. Test builds also require
+Requires CMake 3.24+, a C++20 compiler, and the client libraries and headers
+of PostgreSQL (libpq) and OpenSSL. The driver bundles the Apache
+common/framework code, nanoarrow, fmt, portable-snippets, boost.int128,
+cpp-httplib, and yyjson it needs. Test builds also require
 GoogleTest/GoogleMock; CMake downloads GoogleTest 1.15.2 if it is not installed.
 
 For a native development build, set `PostgreSQL_ROOT` or `CMAKE_PREFIX_PATH`
@@ -87,6 +88,49 @@ libpq connection service files (`~/.pg_service.conf`, `service=`, or
 `PGSERVICE`) aren't supported: the driver always passes `options`, which
 replaces any `options` a service file sets. Put connection settings in the
 URI instead.
+
+### Browser login
+
+`adbc.motherduck.auth_type` (database option) chooses how the driver gets the
+MotherDuck token it sends as the password: `token` (the default) takes it from
+the URI, `PGPASSWORD` or `.pgpass`, and `browser` logs in through the browser,
+like `motherduck login` and dbt-motherduck's `externalbrowser`, so organizations
+that enforce SSO get their identity provider's login page. With `browser`, the
+URI must not contain a password, and it may leave out the host, for example
+`postgresql:///my_db`.
+
+`AdbcDatabaseInit` logs in if needed: it prints a URL and code to stderr,
+opens the browser, and blocks until the login is approved in the browser, for
+at most `adbc.motherduck.login_timeout`. It doesn't open a browser on Linux without
+`DISPLAY` or `WAYLAND_DISPLAY`; open the printed URL on any device instead.
+Like the MotherDuck DuckDB extension's login, it doesn't use an HTTP proxy.
+
+- The login gives a short-lived MotherDuck token, valid for 24 hours; after
+  that, the next connection logs in again.
+- The token is saved to `~/.motherduck/credentials.json` (or
+  `$MOTHERDUCK_HOME/credentials.json`, which must be absolute), readable only
+  by the user. The MotherDuck CLI and dbt-motherduck use the same file, so
+  logging in with any of them logs in the others, and a saved token is used
+  without opening a browser. Processes that use the same file take turns
+  logging in, through `credentials.json.lock` next to it, so they share one
+  login.
+- Without a host in the URI, `PGHOST` or `PGHOSTADDR`, the driver connects to
+  the Postgres endpoint of the user's organization, which it looks up at
+  `https://api.motherduck.com/mom/lookup-user-with-token`.
+- If the endpoint rejects a saved token and the MotherDuck API confirms that
+  it expired or was revoked, the driver deletes it and logs in again, once,
+  both in `AdbcDatabaseInit` and in `AdbcConnectionInit`.
+
+Related options and environment variables:
+
+| Name | Purpose |
+| --- | --- |
+| `adbc.motherduck.login_timeout` (database option) | Seconds to wait for the login (default `120`); `0` waits until the code expires, after 15 minutes. |
+| `adbc.motherduck.oauth_client_id` (database option) | The Auth0 application to log in through; defaults to MotherDuck's DuckDB extension. |
+| `motherduck_host` (environment) | The MotherDuck API host, for example `api.staging.motherduck.com`, as for the CLI. |
+| `sslrootcert` (URI) or `PGSSLROOTCERT` (environment) | A CA bundle that the login's HTTPS requests trust too. Otherwise they use the system's trust store. |
+
+Options are read when the database is initialized.
 
 ## Inherited tests
 

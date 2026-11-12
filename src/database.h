@@ -26,23 +26,43 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
 
+#include "auth/token_cache.h"
 #include "driver/framework/status.h"
 #include "postgres_type.h"
 #include "type_resolver_init.h"
 
 #define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
+#define ADBC_MOTHERDUCK_OPTION_AUTH_TYPE "adbc.motherduck.auth_type"
+#define ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID "adbc.motherduck.oauth_client_id"
+#define ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT "adbc.motherduck.login_timeout"
 
 namespace adbcpq {
 using adbc::driver::Status;
+
+/// \brief libpq connection parameters, as keyword/value pairs.
+using ConnectParams = std::vector<std::pair<std::string, std::string>>;
 
 /// \brief Append --attach_mode=<attach_mode> to libpq session options.
 ///
 /// Returns options unchanged if they already set attach_mode.
 std::string AddAttachMode(std::string_view options, std::string_view attach_mode);
+
+/// \brief Whether a libpq connection error may mean the endpoint rejected the
+///   token, so it's worth asking the MotherDuck API.
+///
+/// libpq drops the SQLSTATE of errors raised while connecting, so this matches
+/// the messages of MotherDuck's Postgres endpoint.
+bool IsAuthFailure(std::string_view message);
+
+/// \brief The parameters with browser login's password and, if need_host, host.
+ConnectParams AddCredentials(ConnectParams params, const auth::Credentials& credentials,
+                             bool need_host);
 
 class PostgresDatabase {
  public:
@@ -84,5 +104,10 @@ class PostgresDatabase {
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
   bool use_copy_ = true;
   std::string attach_mode_ = "single";
+  std::string auth_type_ = "token";
+  std::string oauth_client_id_{auth::kDefaultClientId};
+  int64_t login_timeout_seconds_ = 120;
+  // Set by Init when auth_type is browser.
+  std::unique_ptr<auth::TokenCache> token_cache_;
 };
 }  // namespace adbcpq

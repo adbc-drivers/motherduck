@@ -21,21 +21,43 @@
 # under the License.
 
 add_library(adbc_driver_motherduck_impl STATIC
+            auth/http_client.cc
+            auth/json.cc
+            auth/login.cc
+            auth/token_cache.cc
             connection.cc
             error.cc
             database.cc
             result_helper.cc
             result_reader.cc
             statement.cc
-            type_resolver_init.cc)
+            type_resolver_init.cc
+            ${PROJECT_SOURCE_DIR}/third_party/yyjson/yyjson.c)
 target_include_directories(adbc_driver_motherduck_impl
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
                                   ${PROJECT_SOURCE_DIR}/include
                                   ${PROJECT_BINARY_DIR}/generated)
-target_link_libraries(adbc_driver_motherduck_impl PUBLIC adbc_driver_framework
-                                                         PostgreSQL::PostgreSQL)
+target_include_directories(adbc_driver_motherduck_impl SYSTEM
+                           PRIVATE ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib
+                                   ${PROJECT_SOURCE_DIR}/third_party/yyjson)
+# Leave out the yyjson features the driver doesn't use; this also rejects
+# non-standard JSON.
+target_compile_definitions(adbc_driver_motherduck_impl
+                           PRIVATE YYJSON_DISABLE_INCR_READER=1
+                                   YYJSON_DISABLE_FILE=1
+                                   YYJSON_DISABLE_UTILS=1
+                                   YYJSON_DISABLE_NON_STANDARD=1)
+target_link_libraries(adbc_driver_motherduck_impl
+                      PUBLIC adbc_driver_framework
+                             PostgreSQL::PostgreSQL
+                             OpenSSL::SSL
+                             OpenSSL::Crypto)
 if(WIN32)
-  target_link_libraries(adbc_driver_motherduck_impl PUBLIC wsock32 ws2_32)
+  target_link_libraries(adbc_driver_motherduck_impl PUBLIC wsock32 ws2_32 shell32 crypt32)
+elseif(APPLE)
+  # cpp-httplib reads trusted CAs from the macOS keychain.
+  target_link_libraries(adbc_driver_motherduck_impl PUBLIC "-framework CoreFoundation"
+                                                           "-framework Security")
 endif()
 
 add_library(adbc_driver_motherduck SHARED postgresql.cc motherduck.cc)

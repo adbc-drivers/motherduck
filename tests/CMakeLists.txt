@@ -65,12 +65,17 @@ target_compile_definitions(motherduck_postgresql_test
 )
 add_test(NAME postgresql_unit
          COMMAND motherduck_postgresql_test
-                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:MotherDuckAttachModeTest.*:SplitStatementsTest.*:IsCopyStatementTest.*:IsResultOkTest.*
+                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:MotherDuckAttachModeTest.*:MotherDuckAuthTest.*:SplitStatementsTest.*:IsCopyStatementTest.*:IsResultOkTest.*
 )
 # Keep the server-independent run from creating a MotherDuck test database.
 set_tests_properties(postgresql_unit
                      PROPERTIES ENVIRONMENT_MODIFICATION
                                 "MOTHERDUCK_TEST_SETUP_URI=unset:")
+
+add_executable(motherduck_auth_test auth_test.cc)
+target_link_libraries(motherduck_auth_test PRIVATE adbc_driver_motherduck_impl
+                                                   GTest::gmock_main)
+gtest_discover_tests(motherduck_auth_test TEST_PREFIX auth.)
 
 add_executable(motherduck_copy_test copy/postgres_copy_reader_test.cc
                                     copy/postgres_copy_writer_test.cc)

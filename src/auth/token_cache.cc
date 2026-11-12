@@ -1,0 +1,371 @@
+// Copyright (c) 2026 ADBC Drivers Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// For #warning Please include winsock2.h before windows.h on RTools/msys2
+#ifdef _WIN32
+#include <winsock2.h>
+#endif
+
+#include "auth/token_cache.h"
+
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+
+#include <process.h>
+#else
+#include <fcntl.h>
+#include <pwd.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#include "auth/json.h"
+
+namespace adbcpq::auth {
+
+namespace {
+
+namespace fs = std::filesystem;
+
+constexpr std::uintmax_t kMaxFileBytes = 64 * 1024;
+
+std::string PathString(const fs::path& path) {
+  const std::u8string utf8 = path.u8string();
+  return std::string(utf8.begin(), utf8.end());
+}
+
+#ifdef _WIN32
+std::optional<fs::path> EnvPath(const wchar_t* name) {
+  wchar_t* value = nullptr;
+  size_t length = 0;
+  if (_wdupenv_s(&value, &length, name) != 0 || value == nullptr) return std::nullopt;
+  std::optional<fs::path> path;
+  if (*value != L'\0') path = fs::path(value);
+  std::free(value);
+  return path;
+}
+
+std::optional<fs::path> MotherDuckHome() { return EnvPath(L"MOTHERDUCK_HOME"); }
+
+std::optional<fs::path> HomeDirectory() { return EnvPath(L"USERPROFILE"); }
+
+int ProcessId() { return _getpid(); }
+
+Status WritePrivateFile(const fs::path& path, const std::string& contents) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+  file.close();
+  if (!file) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not write " + PathString(path));
+  }
+  return Status::Ok();
+}
+#else
+std::optional<fs::path> EnvPath(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || *value == '\0') return std::nullopt;
+  return fs::path(value);
+}
+
+std::optional<fs::path> MotherDuckHome() { return EnvPath("MOTHERDUCK_HOME"); }
+
+std::optional<fs::path> HomeDirectory() {
+  if (auto home = EnvPath("HOME")) return home;
+  struct passwd entry = {};
+  struct passwd* result = nullptr;
+  std::vector<char> buffer(16 * 1024);
+  if (getpwuid_r(getuid(), &entry, buffer.data(), buffer.size(), &result) == 0 &&
+      result != nullptr && result->pw_dir != nullptr && *result->pw_dir != '\0') {
+    return fs::path(result->pw_dir);
+  }
+  return std::nullopt;
+}
+
+int ProcessId() { return static_cast<int>(getpid()); }
+
+Status WritePrivateFile(const fs::path& path, const std::string& contents) {
+  const std::string name = PathString(path);
+  const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) return Status(ADBC_STATUS_IO, "[motherduck] Could not create " + name);
+  // The mode above applies only if open created the file.
+  bool ok = fchmod(fd, 0600) == 0;
+  size_t written = 0;
+  while (ok && written < contents.size()) {
+    const ssize_t n = write(fd, contents.data() + written, contents.size() - written);
+    if (n < 0 && errno == EINTR) continue;
+    ok = n > 0;
+    if (ok) written += static_cast<size_t>(n);
+  }
+  ok = (close(fd) == 0) && ok;
+  if (!ok) return Status(ADBC_STATUS_IO, "[motherduck] Could not write " + name);
+  return Status::Ok();
+}
+#endif
+
+std::string_view Trim(std::string_view text) {
+  constexpr std::string_view kWhitespace = " \t\n\r\f\v";
+  const size_t start = text.find_first_not_of(kWhitespace);
+  if (start == std::string_view::npos) return {};
+  return text.substr(start, text.find_last_not_of(kWhitespace) - start + 1);
+}
+
+// Logins share the credentials file, so one lock for the process lets a second
+// database wait for the first one's login and then use its token.
+std::mutex& LoginMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+// Create the credentials directory, readable only by the user, if it's missing.
+Status EnsureDirectory(const fs::path& directory) {
+  std::error_code ec;
+  if (fs::exists(directory, ec)) return Status::Ok();
+  fs::create_directories(directory, ec);
+  if (ec) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not create " +
+                                      PathString(directory) + ": " + ec.message());
+  }
+  fs::permissions(directory, fs::perms::owner_all, fs::perm_options::replace, ec);
+  return Status::Ok();
+}
+
+fs::path LockPath(const fs::path& path) {
+  fs::path lock_path = path;
+  lock_path += ".lock";
+  return lock_path;
+}
+
+}  // namespace
+
+#ifdef _WIN32
+Status CredentialsLock::Acquire(const fs::path& path,
+                                std::unique_ptr<CredentialsLock>* lock) {
+  UNWRAP_STATUS(EnsureDirectory(path.parent_path()));
+  const fs::path lock_path = LockPath(path);
+  HANDLE file = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not open " + PathString(lock_path));
+  }
+  OVERLAPPED overlapped = {};
+  if (!LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+    CloseHandle(file);
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not lock " + PathString(lock_path));
+  }
+  lock->reset(new CredentialsLock(reinterpret_cast<intptr_t>(file)));
+  return Status::Ok();
+}
+
+// Closing the handle releases the lock.
+CredentialsLock::~CredentialsLock() { CloseHandle(reinterpret_cast<HANDLE>(handle_)); }
+#else
+Status CredentialsLock::Acquire(const fs::path& path,
+                                std::unique_ptr<CredentialsLock>* lock) {
+  UNWRAP_STATUS(EnsureDirectory(path.parent_path()));
+  const fs::path lock_path = LockPath(path);
+  const int fd = open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not open " + PathString(lock_path));
+  }
+  while (flock(fd, LOCK_EX) != 0) {
+    if (errno != EINTR) {
+      close(fd);
+      return Status(ADBC_STATUS_IO,
+                    "[motherduck] Could not lock " + PathString(lock_path));
+    }
+  }
+  lock->reset(new CredentialsLock(fd));
+  return Status::Ok();
+}
+
+// Closing the descriptor releases the lock.
+CredentialsLock::~CredentialsLock() { close(static_cast<int>(handle_)); }
+#endif
+
+Status CredentialsPath(fs::path* path) {
+  if (auto home = MotherDuckHome()) {
+    // A relative path would silently put credentials somewhere unexpected.
+    if (!home->is_absolute()) {
+      return Status(ADBC_STATUS_INVALID_ARGUMENT,
+                    "[motherduck] MOTHERDUCK_HOME must be an absolute path, got \"" +
+                        PathString(*home) + "\"");
+    }
+    *path = *home / "credentials.json";
+    return Status::Ok();
+  }
+  auto home = HomeDirectory();
+  if (!home) {
+    return Status(ADBC_STATUS_INVALID_STATE,
+                  "[motherduck] Could not find the home directory for the MotherDuck "
+                  "credentials file; set MOTHERDUCK_HOME");
+  }
+  *path = *home / ".motherduck" / "credentials.json";
+  return Status::Ok();
+}
+
+std::optional<std::string> LoadSavedToken(const fs::path& path) {
+  std::error_code ec;
+  const std::uintmax_t size = fs::file_size(path, ec);
+  if (ec || size > kMaxFileBytes) return std::nullopt;
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return std::nullopt;
+  const std::string text((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+  const JsonObject credentials = JsonObject::Parse(text);
+  if (credentials.GetInt("version") != 1) return std::nullopt;
+  const std::optional<std::string> token = credentials.GetString("motherduck_token");
+  if (!token) return std::nullopt;
+  const std::string_view trimmed = Trim(*token);
+  if (trimmed.empty()) return std::nullopt;
+  return std::string(trimmed);
+}
+
+Status SaveToken(const fs::path& path, std::string_view token) {
+  std::error_code ec;
+  const fs::path directory = path.parent_path();
+  UNWRAP_STATUS(EnsureDirectory(directory));
+  // Write a sibling and rename it over the file, so readers never see a partial file.
+  const fs::path temporary = directory / ("." + PathString(path.filename()) + "." +
+                                          std::to_string(ProcessId()) + ".tmp");
+  const std::optional<std::string> contents = CredentialsJson(token);
+  if (!contents) {
+    return Status(ADBC_STATUS_INVALID_ARGUMENT,
+                  "[motherduck] Could not encode the MotherDuck token");
+  }
+  Status status = WritePrivateFile(temporary, *contents);
+  if (status.ok()) {
+    fs::rename(temporary, path, ec);
+    if (ec) {
+      status = Status(ADBC_STATUS_IO, "[motherduck] Could not replace " +
+                                          PathString(path) + ": " + ec.message());
+    }
+  }
+  if (!status.ok()) fs::remove(temporary, ec);
+  return status;
+}
+
+void RemoveSavedToken(const fs::path& path, std::string_view token) {
+  if (LoadSavedToken(path) != token) return;
+  std::error_code ec;
+  fs::remove(path, ec);
+}
+
+Status TokenCache::Get(bool need_host, Credentials* credentials) {
+  std::lock_guard<std::mutex> lock(LoginMutex());
+  fs::path path;
+  UNWRAP_STATUS(CredentialsPath(&path));
+
+  // An expired token is used anyway: the server rejects it, and the caller logs
+  // in again.
+  bool fresh = false;
+  if (token_.empty()) {
+    std::optional<std::string> saved = LoadSavedToken(path);
+    if (saved) {
+      token_ = std::move(*saved);
+    } else {
+      UNWRAP_STATUS(Login(path, /*rejected=*/"", &fresh));
+    }
+  }
+
+  if (need_host && host_.empty()) {
+    Status status = LookupPgEndpoint(env_, options_, token_, &host_);
+    if (!status.ok() && !fresh && status.ToAdbc(nullptr) == ADBC_STATUS_UNAUTHENTICATED) {
+      // The saved token expired or was revoked.
+      const std::string rejected = token_;
+      ForgetLocked(path);
+      UNWRAP_STATUS(Login(path, rejected, &fresh));
+      status =
+          host_.empty() ? LookupPgEndpoint(env_, options_, token_, &host_) : Status::Ok();
+    }
+    UNWRAP_STATUS(std::move(status));
+  }
+
+  credentials->token = token_;
+  credentials->host = host_;
+  credentials->fresh = fresh;
+  return Status::Ok();
+}
+
+bool TokenCache::Reject(const std::string& token) {
+  std::lock_guard<std::mutex> lock(LoginMutex());
+  if (token != token_) return true;
+  // Keep the token if the API accepts it, or can't be reached: the failure has
+  // another cause, which logging in again wouldn't fix.
+  std::string pg_endpoint;
+  if (LookupPgEndpoint(env_, options_, token, &pg_endpoint).ToAdbc(nullptr) !=
+      ADBC_STATUS_UNAUTHENTICATED) {
+    return false;
+  }
+  fs::path path;
+  if (CredentialsPath(&path).ok()) {
+    ForgetLocked(path);
+  } else {
+    token_.clear();
+    host_.clear();
+  }
+  return true;
+}
+
+Status TokenCache::Login(const fs::path& path, const std::string& rejected, bool* fresh) {
+  // Wait for a login another process is running through the same file, and use
+  // its token. Without the lock, such as in a read-only home directory, log in
+  // anyway.
+  std::unique_ptr<CredentialsLock> lock;
+  static_cast<void>(CredentialsLock::Acquire(path, &lock));
+  if (std::optional<std::string> saved = LoadSavedToken(path);
+      saved && *saved != rejected) {
+    token_ = std::move(*saved);
+    host_.clear();
+    *fresh = false;
+    return Status::Ok();
+  }
+
+  LoginResult result;
+  UNWRAP_STATUS(DeviceLogin(env_, options_, &result));
+  token_ = std::move(result.token);
+  host_ = std::move(result.pg_endpoint);
+  *fresh = true;
+  Status saved = SaveToken(path, token_);
+  if (!saved.ok()) {
+    env_.print(saved.message() + ". You'll be asked to log in again next time.");
+  }
+  return Status::Ok();
+}
+
+void TokenCache::ForgetLocked(const fs::path& path) {
+  {
+    // So another process can't save a new token between the check and the delete.
+    std::unique_ptr<CredentialsLock> lock;
+    static_cast<void>(CredentialsLock::Acquire(path, &lock));
+    RemoveSavedToken(path, token_);
+  }
+  token_.clear();
+  host_.clear();
+}
+
+}  // namespace adbcpq::auth
