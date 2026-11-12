@@ -14,9 +14,11 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -33,6 +35,8 @@
 
 namespace adbcpq::auth {
 using adbc::driver::Status;
+
+class CredentialsLock;
 
 struct Credentials {
   /// \brief The MotherDuck token, the password for the Postgres endpoint.
@@ -72,9 +76,17 @@ class TokenCache {
   bool Reject(const std::string& token);
 
  private:
+  using Deadline = std::optional<std::chrono::steady_clock::time_point>;
+
+  // When to stop waiting for another login: after the login timeout, or never
+  // without one.
+  Deadline LockDeadline() const;
+  bool LockWithin(std::unique_lock<std::mutex>* lock, const Deadline& deadline) const;
+  Status LockCredentials(const std::filesystem::path& path, const Deadline& deadline,
+                         std::unique_ptr<CredentialsLock>* lock) const;
   Status Login(const std::filesystem::path& path, const std::string& rejected,
-               bool* fresh);
-  void ForgetLocked(const std::filesystem::path& path);
+               const Deadline& deadline, bool* fresh);
+  void ForgetLocked(const std::filesystem::path& path, const Deadline& deadline);
 
   const LoginEnvironment env_;
   const LoginOptions options_;
@@ -86,9 +98,12 @@ class TokenCache {
 ///   file. Released when destroyed, or by the OS if the process ends.
 class CredentialsLock {
  public:
-  /// \brief Wait for the lock of the credentials file at path.
+  /// \brief Take the lock of the credentials file at path.
+  ///
+  /// \param block Wait while another process holds it. Otherwise a lock held
+  ///   elsewhere leaves *lock empty and returns OK.
   static Status Acquire(const std::filesystem::path& path,
-                        std::unique_ptr<CredentialsLock>* lock);
+                        std::unique_ptr<CredentialsLock>* lock, bool block = true);
 
   CredentialsLock(const CredentialsLock&) = delete;
   CredentialsLock& operator=(const CredentialsLock&) = delete;

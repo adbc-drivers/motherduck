@@ -256,6 +256,8 @@ std::string_view MotherduckDatabase::DriverVersion() {
 }
 
 AdbcStatusCode MotherduckDatabase::Init(struct AdbcError* error) {
+  // A failed Init may be retried with other options.
+  token_cache_.reset();
   if (auth_type_ == kAuthTypeBrowser) {
     auth::LoginOptions options;
     options.client_id = oauth_client_id_;

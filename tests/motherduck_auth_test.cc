@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -26,6 +27,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -454,6 +459,21 @@ TEST_F(CredentialsFileTest, SaveAndLoad) {
 #endif
 }
 
+#ifndef _WIN32
+TEST_F(CredentialsFileTest, SaveReplacesPlantedSymlink) {
+  // Someone who can write to the directory links the temporary file elsewhere.
+  const fs::path target = dir_.path() / "target";
+  WriteFile(target, "keep");
+  fs::create_symlink(
+      target, dir_.path() / (".credentials.json." + std::to_string(getpid()) + ".tmp"));
+  ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "token").ok());
+  std::ifstream file(target);
+  EXPECT_EQ(std::string(std::istreambuf_iterator<char>(file), {}), "keep");
+  EXPECT_FALSE(fs::is_symlink(path_));
+  EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), "token");
+}
+#endif
+
 TEST_F(CredentialsFileTest, ReadsCliFile) {
   WriteFile(path_,
             "{\n  \"version\": 1,\n  \"motherduck_token\": \" cli-token\\n\"\n}\n");
@@ -559,6 +579,16 @@ TEST_F(TokenCacheTest, UsesTokenFromLoginInAnotherProcess) {
   ASSERT_TRUE(result.get().ok());
   EXPECT_EQ(credentials.token, "other-token");
   EXPECT_FALSE(credentials.fresh);
+  EXPECT_TRUE(http_->requests.empty());
+}
+
+TEST_F(TokenCacheTest, TimesOutWaitingForLoginInAnotherProcess) {
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  options_.timeout = 5s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
   EXPECT_TRUE(http_->requests.empty());
 }
 

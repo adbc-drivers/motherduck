@@ -20,9 +20,11 @@
 #include "auth/token_cache.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -35,6 +37,7 @@
 #include <windows.h>
 
 #include <process.h>
+#include <sddl.h>
 #else
 #include <fcntl.h>
 #include <pwd.h>
@@ -75,13 +78,59 @@ std::optional<fs::path> HomeDirectory() { return EnvPath(L"USERPROFILE"); }
 
 int ProcessId() { return _getpid(); }
 
-Status WritePrivateFile(const fs::path& path, const std::string& contents) {
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
-  file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-  file.close();
-  if (!file) {
-    return Status(ADBC_STATUS_IO, "[motherduck] Could not write " + PathString(path));
+// A security descriptor that lets only the current user access a file, whatever
+// the directory passes on, or null. Free it with LocalFree.
+PSECURITY_DESCRIPTOR UserOnlySecurityDescriptor() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return nullptr;
+  DWORD size = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+  std::vector<BYTE> buffer(size);
+  const bool got =
+      size > 0 && GetTokenInformation(token, TokenUser, buffer.data(), size, &size);
+  CloseHandle(token);
+  if (!got) return nullptr;
+  LPWSTR sid = nullptr;
+  if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid,
+                              &sid)) {
+    return nullptr;
   }
+  // P: protected, so nothing is inherited. FA: full access.
+  const std::wstring sddl = std::wstring(L"D:P(A;;FA;;;") + sid + L")";
+  LocalFree(sid);
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
+                                                            &descriptor, nullptr)) {
+    return nullptr;
+  }
+  return descriptor;
+}
+
+Status WritePrivateFile(const fs::path& path, const std::string& contents) {
+  const std::string name = PathString(path);
+  PSECURITY_DESCRIPTOR descriptor = UserOnlySecurityDescriptor();
+  if (descriptor == nullptr) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not restrict access to " + name);
+  }
+  // Create the file anew, so nothing already at the path, such as a link someone
+  // who can write to the directory put there, is followed.
+  if (!DeleteFileW(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+    LocalFree(descriptor);
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not replace " + name);
+  }
+  SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, &attributes, CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  LocalFree(descriptor);
+  if (file == INVALID_HANDLE_VALUE) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not create " + name);
+  }
+  DWORD written = 0;
+  bool ok = WriteFile(file, contents.data(), static_cast<DWORD>(contents.size()),
+                      &written, nullptr) &&
+            written == contents.size();
+  ok = CloseHandle(file) && ok;
+  if (!ok) return Status(ADBC_STATUS_IO, "[motherduck] Could not write " + name);
   return Status::Ok();
 }
 #else
@@ -109,9 +158,15 @@ int ProcessId() { return static_cast<int>(getpid()); }
 
 Status WritePrivateFile(const fs::path& path, const std::string& contents) {
   const std::string name = PathString(path);
-  const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  // Create the file anew, so nothing already at the path, such as a symlink
+  // someone who can write to the directory put there, is followed.
+  if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not replace " + name);
+  }
+  const int fd =
+      open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (fd < 0) return Status(ADBC_STATUS_IO, "[motherduck] Could not create " + name);
-  // The mode above applies only if open created the file.
+  // Whatever the umask took away.
   bool ok = fchmod(fd, 0600) == 0;
   size_t written = 0;
   while (ok && written < contents.size()) {
@@ -135,6 +190,23 @@ std::string_view Trim(std::string_view text) {
 
 // Logins share the credentials file, so one lock for the process lets a second
 // database wait for the first one's login and then use its token.
+constexpr std::chrono::milliseconds kLockPollInterval{100};
+
+// Retry try_acquire until it succeeds or the deadline passes.
+bool Poll(const LoginEnvironment& env, std::chrono::steady_clock::time_point deadline,
+          const std::function<bool()>& try_acquire) {
+  while (!try_acquire()) {
+    if (env.now() >= deadline) return false;
+    env.sleep(kLockPollInterval);
+  }
+  return true;
+}
+
+Status WaitTimedOut() {
+  return Status(ADBC_STATUS_TIMEOUT,
+                "[motherduck] Timed out waiting for another MotherDuck login to finish");
+}
+
 std::mutex& LoginMutex() {
   static std::mutex mutex;
   return mutex;
@@ -163,7 +235,8 @@ fs::path LockPath(const fs::path& path) {
 
 #ifdef _WIN32
 Status CredentialsLock::Acquire(const fs::path& path,
-                                std::unique_ptr<CredentialsLock>* lock) {
+                                std::unique_ptr<CredentialsLock>* lock, bool block) {
+  lock->reset();
   UNWRAP_STATUS(EnsureDirectory(path.parent_path()));
   const fs::path lock_path = LockPath(path);
   HANDLE file = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
@@ -173,8 +246,11 @@ Status CredentialsLock::Acquire(const fs::path& path,
     return Status(ADBC_STATUS_IO, "[motherduck] Could not open " + PathString(lock_path));
   }
   OVERLAPPED overlapped = {};
-  if (!LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+  const DWORD flags = LOCKFILE_EXCLUSIVE_LOCK | (block ? 0 : LOCKFILE_FAIL_IMMEDIATELY);
+  if (!LockFileEx(file, flags, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+    const DWORD code = GetLastError();
     CloseHandle(file);
+    if (!block && code == ERROR_LOCK_VIOLATION) return Status::Ok();
     return Status(ADBC_STATUS_IO, "[motherduck] Could not lock " + PathString(lock_path));
   }
   lock->reset(new CredentialsLock(reinterpret_cast<intptr_t>(file)));
@@ -185,19 +261,20 @@ Status CredentialsLock::Acquire(const fs::path& path,
 CredentialsLock::~CredentialsLock() { CloseHandle(reinterpret_cast<HANDLE>(handle_)); }
 #else
 Status CredentialsLock::Acquire(const fs::path& path,
-                                std::unique_ptr<CredentialsLock>* lock) {
+                                std::unique_ptr<CredentialsLock>* lock, bool block) {
+  lock->reset();
   UNWRAP_STATUS(EnsureDirectory(path.parent_path()));
   const fs::path lock_path = LockPath(path);
-  const int fd = open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  const int fd = open(lock_path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (fd < 0) {
     return Status(ADBC_STATUS_IO, "[motherduck] Could not open " + PathString(lock_path));
   }
-  while (flock(fd, LOCK_EX) != 0) {
-    if (errno != EINTR) {
-      close(fd);
-      return Status(ADBC_STATUS_IO,
-                    "[motherduck] Could not lock " + PathString(lock_path));
-    }
+  while (flock(fd, LOCK_EX | (block ? 0 : LOCK_NB)) != 0) {
+    const int code = errno;
+    if (code == EINTR) continue;
+    close(fd);
+    if (!block && code == EWOULDBLOCK) return Status::Ok();
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not lock " + PathString(lock_path));
   }
   lock->reset(new CredentialsLock(fd));
   return Status::Ok();
@@ -276,7 +353,9 @@ void RemoveSavedToken(const fs::path& path, std::string_view token) {
 }
 
 Status TokenCache::Get(bool need_host, Credentials* credentials) {
-  std::lock_guard<std::mutex> lock(LoginMutex());
+  const Deadline deadline = LockDeadline();
+  std::unique_lock<std::mutex> lock(LoginMutex(), std::defer_lock);
+  if (!LockWithin(&lock, deadline)) return WaitTimedOut();
   fs::path path;
   UNWRAP_STATUS(CredentialsPath(&path));
 
@@ -288,7 +367,7 @@ Status TokenCache::Get(bool need_host, Credentials* credentials) {
     if (saved) {
       token_ = std::move(*saved);
     } else {
-      UNWRAP_STATUS(Login(path, /*rejected=*/"", &fresh));
+      UNWRAP_STATUS(Login(path, /*rejected=*/"", deadline, &fresh));
     }
   }
 
@@ -297,8 +376,8 @@ Status TokenCache::Get(bool need_host, Credentials* credentials) {
     if (!status.ok() && !fresh && status.ToAdbc(nullptr) == ADBC_STATUS_UNAUTHENTICATED) {
       // The saved token expired or was revoked.
       const std::string rejected = token_;
-      ForgetLocked(path);
-      UNWRAP_STATUS(Login(path, rejected, &fresh));
+      ForgetLocked(path, deadline);
+      UNWRAP_STATUS(Login(path, rejected, deadline, &fresh));
       status =
           host_.empty() ? LookupPgEndpoint(env_, options_, token_, &host_) : Status::Ok();
     }
@@ -312,7 +391,9 @@ Status TokenCache::Get(bool need_host, Credentials* credentials) {
 }
 
 bool TokenCache::Reject(const std::string& token) {
-  std::lock_guard<std::mutex> lock(LoginMutex());
+  const Deadline deadline = LockDeadline();
+  std::unique_lock<std::mutex> lock(LoginMutex(), std::defer_lock);
+  if (!LockWithin(&lock, deadline)) return false;
   if (token != token_) return true;
   // Keep the token if the API accepts it, or can't be reached: the failure has
   // another cause, which logging in again wouldn't fix.
@@ -323,7 +404,7 @@ bool TokenCache::Reject(const std::string& token) {
   }
   fs::path path;
   if (CredentialsPath(&path).ok()) {
-    ForgetLocked(path);
+    ForgetLocked(path, deadline);
   } else {
     token_.clear();
     host_.clear();
@@ -331,12 +412,41 @@ bool TokenCache::Reject(const std::string& token) {
   return true;
 }
 
-Status TokenCache::Login(const fs::path& path, const std::string& rejected, bool* fresh) {
+TokenCache::Deadline TokenCache::LockDeadline() const {
+  if (options_.timeout <= std::chrono::seconds::zero()) return std::nullopt;
+  return env_.now() + options_.timeout;
+}
+
+bool TokenCache::LockWithin(std::unique_lock<std::mutex>* lock,
+                            const Deadline& deadline) const {
+  if (!deadline) {
+    lock->lock();
+    return true;
+  }
+  return Poll(env_, *deadline, [lock] { return lock->try_lock(); });
+}
+
+Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadline,
+                                   std::unique_ptr<CredentialsLock>* lock) const {
+  if (!deadline) return CredentialsLock::Acquire(path, lock);
+  Status status;
+  const bool acquired = Poll(env_, *deadline, [&] {
+    status = CredentialsLock::Acquire(path, lock, /*block=*/false);
+    return !status.ok() || *lock != nullptr;
+  });
+  if (!status.ok()) return status;
+  if (!acquired) return WaitTimedOut();
+  return Status::Ok();
+}
+
+Status TokenCache::Login(const fs::path& path, const std::string& rejected,
+                         const Deadline& deadline, bool* fresh) {
   // Wait for a login another process is running through the same file, and use
   // its token. Without the lock, such as in a read-only home directory, log in
   // anyway.
   std::unique_ptr<CredentialsLock> lock;
-  static_cast<void>(CredentialsLock::Acquire(path, &lock));
+  Status locked = LockCredentials(path, deadline, &lock);
+  if (locked.ToAdbc(nullptr) == ADBC_STATUS_TIMEOUT) return locked;
   if (std::optional<std::string> saved = LoadSavedToken(path);
       saved && *saved != rejected) {
     token_ = std::move(*saved);
@@ -357,12 +467,15 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected, bool
   return Status::Ok();
 }
 
-void TokenCache::ForgetLocked(const fs::path& path) {
+void TokenCache::ForgetLocked(const fs::path& path, const Deadline& deadline) {
   {
     // So another process can't save a new token between the check and the delete.
+    // Without the lock, delete anyway; after waiting for it in vain, leave the
+    // file to the process holding it.
     std::unique_ptr<CredentialsLock> lock;
-    static_cast<void>(CredentialsLock::Acquire(path, &lock));
-    RemoveSavedToken(path, token_);
+    if (LockCredentials(path, deadline, &lock).ToAdbc(nullptr) != ADBC_STATUS_TIMEOUT) {
+      RemoveSavedToken(path, token_);
+    }
   }
   token_.clear();
   host_.clear();

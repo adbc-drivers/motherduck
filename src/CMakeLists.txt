@@ -63,7 +63,8 @@ target_link_libraries(adbc_driver_motherduck_impl
                              OpenSSL::SSL
                              OpenSSL::Crypto)
 if(WIN32)
-  target_link_libraries(adbc_driver_motherduck_impl PUBLIC wsock32 ws2_32 shell32 crypt32)
+  target_link_libraries(adbc_driver_motherduck_impl PUBLIC wsock32 ws2_32 shell32 crypt32
+                                                           advapi32)
 elseif(APPLE)
   # cpp-httplib reads trusted CAs from the macOS keychain.
   target_link_libraries(adbc_driver_motherduck_impl PUBLIC "-framework CoreFoundation"

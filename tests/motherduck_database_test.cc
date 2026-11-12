@@ -773,6 +773,24 @@ TEST(MotherDuckAuthTest, OptionInvalid) {
               ::testing::Optional("120"s));
 }
 
+TEST(MotherDuckAuthTest, TokenModeAfterFailedBrowserInit) {
+  struct AdbcError error = {};
+  adbcpq::MotherduckDatabase database;
+  // Port 1, so a connection attempt fails right away.
+  ASSERT_THAT(
+      database.SetOption("uri", "postgresql://postgres:secret@127.0.0.1:1/db", &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(database.SetOption(ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, "browser", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(database.Init(&error), IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+  if (error.release) error.release(&error);
+  // Retried in token mode, Init uses the URI's password instead of logging in.
+  ASSERT_THAT(database.SetOption(ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, "token", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(database.Init(&error), IsStatus(ADBC_STATUS_IO, &error));
+  if (error.release) error.release(&error);
+}
+
 TEST(MotherDuckAuthTest, IsAuthFailure) {
   for (const char* message : {
            "[libpq] Failed to connect: connection to server at \"pg.example\" "
