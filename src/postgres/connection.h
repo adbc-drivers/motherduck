@@ -23,8 +23,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,7 +43,7 @@ struct GetObjectsHelper;
 
 namespace adbcpq {
 class PostgresDatabase;
-
+class PqResultArrayReader;
 class PostgresConnection {
  public:
   PostgresConnection()
@@ -93,6 +95,14 @@ class PostgresConnection {
   AdbcStatusCode SetOptionInt(const char* key, int64_t value, struct AdbcError* error);
 
   PGconn* conn() const { return conn_; }
+  // The stream currently reading from conn_, if any. Any new command on this
+  // connection has to finish that read first, whichever statement starts it.
+  void TrackActiveReader(const std::shared_ptr<PqResultArrayReader>& reader);
+  std::shared_ptr<PqResultArrayReader> ActiveReader() const;
+  AdbcStatusCode FinishActiveReader(struct AdbcError* error);
+  // The reader that opened a transaction could not commit or roll it back.
+  void NoteAbandonedTransaction() { abandoned_txn_ = true; }
+  bool disconnected() const { return disconnected_.load(); }
   const std::shared_ptr<PostgresTypeResolver>& type_resolver() const {
     return type_resolver_;
   }
@@ -117,11 +127,19 @@ class PostgresConnection {
   friend class PostgresStatement;
 
   AdbcStatusCode EnsureTransaction(struct AdbcError* error);
+  AdbcStatusCode RollbackAbandonedTransaction(struct AdbcError* error);
 
   std::shared_ptr<PostgresDatabase> database_;
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
   PGconn* conn_;
   PGcancel* cancel_;
+  // Guards active_reader_. Cancel runs on another thread from the read.
+  mutable std::mutex active_reader_mu_;
+  std::weak_ptr<PqResultArrayReader> active_reader_;
+  // Set before PQfinish. A reader destroyed after that only frees results.
+  std::atomic<bool> disconnected_{false};
+  // A reader gave up a transaction it could not commit or roll back.
+  bool abandoned_txn_ = false;
   bool autocommit_;
   bool use_copy_;
   std::vector<std::pair<std::string, std::string>> post_init_options_;
