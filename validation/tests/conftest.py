@@ -60,10 +60,10 @@ def driver_path(driver: adbc_drivers_validation.model.DriverQuirks) -> str:
     return str(base / f"build/libadbc_driver_motherduck.{ext}")
 
 
-# The name of a run's schema, or of a schema or database named after it, with
-# the run's Unix time as group 1 (see ci/scripts/pre-test.sh). The full shape
-# keeps the sweep from touching anything else in the account.
-_TEST_NAME_PATTERN = "^adbc_([0-9]{10})_.+_(linux|macos|windows)_(amd64|arm64)(_.+)?$"
+# How a run's schema (see TEST_SCHEMA), and every schema or database named after
+# it, starts, with the run's Unix time as group 1. Matches kTestNamePattern in
+# tests/postgresql_test.cc, which names the C++ suite's schemas the same way.
+_TEST_NAME_PATTERN = "^adbc_test_([0-9]{10})_[0-9]+_"
 
 
 def _stale(column: str) -> str:
@@ -121,8 +121,10 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
         elif stale == "stale":
             try:
                 cursor.execute(query)
-            except adbc_driver_manager.dbapi.Error:
-                pass
+            except adbc_driver_manager.dbapi.Error as e:
+                # Only a conflict means another run got there first.
+                if "conflict" not in str(e).lower():
+                    raise
 
     def drop_leftovers(cursor) -> None:
         cursor.execute(

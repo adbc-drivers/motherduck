@@ -233,21 +233,26 @@ pixi run validate
 ```
 
 Runs share one database, `adbc_driver_tests`, which the tests create if it's
-missing and never drop. Each run gets its own schema in it,
-`adbc_<unix time>_<run>_<platform>_<arch>_<pid>`: `ci/scripts/pre-test.sh`
-writes everything up to `<arch>` to `MOTHERDUCK_TEST_SCHEMA` (`<run>` is the
-GitHub run, attempt and job in CI, and `local_<pid>` locally), and each test
-process adds its own process ID, so runs that source the same `.env.override`
-still differ. Every test connection starts in the schema through
-`adbc.motherduck.db_schema`. Tests that need more schemas or
-databases name them after the run's schema, and the tests drop all of them when
-they finish, so concurrent jobs and runs don't share tables. Each run also drops
-any schema or database named like a run's (or named after one), with a time a
-day or more ago, which an interrupted run left behind. Only names of that full
-shape are dropped, so nothing else in the account is touched. A database per run would scale
-worse: each interrupted run would leave a database and its retained storage
-behind, and every workspace-mode connection in the account attaches every
-database. Set `MOTHERDUCK_TEST_DATABASE` to use another database.
+missing and never drop. Each test process gets its own schema in it,
+`adbc_test_<start time>_<pid>_<run>`, where `<run>` is the
+`MOTHERDUCK_TEST_RUN` that `ci/scripts/pre-test.sh` writes (the GitHub run,
+attempt and job in CI, or `local_<pid>`, followed by the platform and arch). The
+start time and process ID keep runs apart even when they source the same
+`.env.override`. Every test connection starts in the schema through
+`adbc.motherduck.db_schema`. Tests that need more schemas or databases name
+them after it, and the tests drop all of them when they finish, so concurrent
+jobs and runs don't share tables. Each run also drops any schema or database
+named `adbc_test_<time>_<pid>_...` with a time a day or more ago, which an
+interrupted run left behind; only names of that shape are dropped. A database
+per run would scale worse: each interrupted run would leave a database and its
+retained storage behind, and every workspace-mode connection in the account
+attaches every database.
+
+Set `MOTHERDUCK_TEST_DATABASE` to use another database. The tests treat it like
+`adbc_driver_tests`: they create it if it's missing, create and drop their
+schemas in it, and sweep stale test-named schemas from it and test-named
+databases from the account. So the token needs to be able to create databases
+and schemas, and a read-only or shared database won't work.
 `MOTHERDUCK_PG_HOST` overrides the default host
 (`pg.us-east-1-aws.motherduck.com`). Test connections use the driver's default
 `attach_mode=single`, so other databases in the account stay out of catalog

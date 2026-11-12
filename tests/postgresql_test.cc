@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -75,19 +76,22 @@ using std::string_literals::operator""s;
 
 namespace {
 
-// This process's own schema: MOTHERDUCK_TEST_SCHEMA (see
-// ci/scripts/pre-test.sh) and the process ID, so runs that source the same
-// .env.override still get different schemas. Empty without the variable.
+// This process's own schema, adbc_test_<Unix time>_<process ID>_<run>, where
+// <run> is MOTHERDUCK_TEST_RUN (see ci/scripts/pre-test.sh). The time is when
+// the process started, which later runs go by to drop what an interrupted run
+// left behind (kTestNamePattern), and the process ID keeps runs that source
+// the same .env.override apart. Empty without the variable.
 const std::string& RunSchema() {
   static const std::string schema = [] {
-    const char* base = std::getenv("MOTHERDUCK_TEST_SCHEMA");
-    if (base == nullptr || *base == '\0') return std::string();
+    const char* run = std::getenv("MOTHERDUCK_TEST_RUN");
+    if (run == nullptr || *run == '\0') return std::string();
 #ifdef _WIN32
     const int pid = _getpid();
 #else
     const int pid = static_cast<int>(getpid());
 #endif
-    return std::string(base) + "_" + std::to_string(pid);
+    return "adbc_test_" + std::to_string(static_cast<int64_t>(std::time(nullptr))) + "_" +
+           std::to_string(pid) + "_" + run;
   }();
   return schema;
 }
@@ -355,10 +359,10 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   bool supports_statistics() const override { return false; }
 };
 
-// The name of a run's schema, or of a schema or database named after it, with
-// the run's Unix time as group 1 (see ci/scripts/pre-test.sh).
-constexpr std::string_view kTestNamePattern =
-    "^adbc_([0-9]{10})_.+_(linux|macos|windows)_(amd64|arm64)(_.+)?$";
+// How a run's schema (see RunSchema), and every schema or database named
+// after it, starts, with the run's Unix time as group 1. The validation suite
+// (validation/tests/conftest.py) names its schemas the same way.
+constexpr std::string_view kTestNamePattern = "^adbc_test_([0-9]{10})_[0-9]+_";
 
 // Gives the test run a schema of its own in the shared test database (see
 // ci/scripts/pre-test.sh), and afterwards drops it, the other schemas and the
@@ -423,9 +427,7 @@ class MotherDuckTestDatabase : public ::testing::Environment {
 
   // Drops, in the current database, this run's schemas, and in the account,
   // the databases named after them, along with any schema or database named
-  // like a test run's, adbc_<Unix time>_..._<os>_<arch>[_...] (see
-  // ci/scripts/pre-test.sh), for a time a day or more ago. The full shape
-  // keeps it from touching anything else in the account.
+  // like a test run's (kTestNamePattern) for a time a day or more ago.
   void DropLeftovers(struct AdbcConnection* connection) {
     auto stale = [](const char* column) {
       return std::string("CASE WHEN TRY_CAST(regexp_extract(") + column + ", '" +
@@ -444,8 +446,14 @@ class MotherDuckTestDatabase : public ::testing::Environment {
       if (own(name)) {
         ASSERT_NO_FATAL_FAILURE(Execute(connection, query));
       } else if (stale == "stale") {
-        Handle<struct AdbcError> ignored;
-        std::ignore = Run(connection, query, &ignored.value);
+        Handle<struct AdbcError> error;
+        if (Run(connection, query, &error.value) != ADBC_STATUS_OK) {
+          // Only a conflict means another run got there first.
+          const std::string message = error.value.message ? error.value.message : "";
+          if (message.find("onflict") == std::string::npos) {
+            ADD_FAILURE() << "Failed to drop a stale leftover: " << message;
+          }
+        }
       }
     };
 
@@ -5222,7 +5230,7 @@ void QueryScalar(struct AdbcStatement* statement, const char* query, std::string
 // switch to that database instead).
 TEST_F(PostgresDatabaseTest, DbSchemaOption) {
   if (RunSchema().empty()) {
-    GTEST_SKIP() << "Needs MOTHERDUCK_TEST_SCHEMA (see ci/scripts/pre-test.sh)";
+    GTEST_SKIP() << "Needs MOTHERDUCK_TEST_RUN (see ci/scripts/pre-test.sh)";
   }
   const std::string catalog = quirks_.catalog();
   // A schema of the test database.

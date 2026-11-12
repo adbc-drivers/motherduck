@@ -23,6 +23,7 @@
 import functools
 import os
 import re
+import time
 from pathlib import Path
 
 from adbc_drivers_validation import model, quirks
@@ -33,22 +34,21 @@ _TABLE_NOT_FOUND = re.compile(
     r'(?:table with name|relation) ("*[^\s!]+?"*) does not exist'
 )
 
-# This process's own schema in the shared test database: MOTHERDUCK_TEST_SCHEMA
-# (see ci/scripts/pre-test.sh) and the process ID, so runs that source the same
-# .env.override still get different schemas. Every connection starts in it.
-# None without the variable, when connections start in main.
+# This process's own schema in the shared test database, named like the C++
+# suite's (see RunSchema in tests/postgresql_test.cc):
+# adbc_test_<start time>_<process ID>_<MOTHERDUCK_TEST_RUN>. Every connection
+# starts in it. None without the variable, when connections start in main.
 TEST_SCHEMA = (
-    f"{os.environ['MOTHERDUCK_TEST_SCHEMA']}_{os.getpid()}"
-    if os.environ.get("MOTHERDUCK_TEST_SCHEMA")
+    f"adbc_test_{int(time.time())}_{os.getpid()}_{os.environ['MOTHERDUCK_TEST_RUN']}"
+    if os.environ.get("MOTHERDUCK_TEST_RUN")
     else None
 )
-_test_schema = TEST_SCHEMA
 
 _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
 }
-if _test_schema:
-    _database_args["adbc.motherduck.db_schema"] = _test_schema
+if TEST_SCHEMA:
+    _database_args["adbc.motherduck.db_schema"] = TEST_SCHEMA
 
 
 class PostgreSQLQuirks(model.DriverQuirks):
@@ -87,9 +87,9 @@ class PostgreSQLQuirks(model.DriverQuirks):
         statement_rows_affected_ddl=False,
         # The database ci/scripts/pre-test.sh picks.
         current_catalog=os.environ.get("MOTHERDUCK_TEST_CATALOG", "my_db"),
-        current_schema=_test_schema or "main",
+        current_schema=TEST_SCHEMA or "main",
         # Named after the run's schema, so concurrent runs don't share it.
-        secondary_schema=f"{_test_schema}_secondary" if _test_schema else "secondary",
+        secondary_schema=f"{TEST_SCHEMA}_secondary" if TEST_SCHEMA else "secondary",
         supported_xdbc_fields=["xdbc_type_name"],
     )
     setup = model.DriverSetup(

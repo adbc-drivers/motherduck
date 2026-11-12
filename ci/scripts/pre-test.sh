@@ -47,9 +47,9 @@ else
   # Local runs need their own schema too, so concurrent runs don't collide.
   run="local_$$"
 fi
-# The leading Unix time lets later runs drop what interrupted runs left behind
-# (schemas, and databases named after them) once it's a day old.
-schema="adbc_$(date +%s)_${run}_${1}_${2}"
+# Each test process names its schema after this, with its start time and
+# process ID (see RunSchema in tests/postgresql_test.cc).
+test_run="${run}_${1}_${2}"
 
 # vcpkg's libpq can't see the OS trust store, so use the pixi env's CA bundle.
 # The generated test job doesn't install the env itself.
@@ -83,7 +83,7 @@ uri_for() {
 {
   printf 'ADBC_POSTGRESQL_TEST_URI=%q\n' "$(uri_for "$database")"
   printf 'MOTHERDUCK_TEST_CATALOG=%q\n' "$database"
-  printf 'MOTHERDUCK_TEST_SCHEMA=%q\n' "$schema"
+  printf 'MOTHERDUCK_TEST_RUN=%q\n' "$test_run"
   # The tests create the database and their schema through this connection.
   printf 'MOTHERDUCK_TEST_SETUP_URI=%q\n' "$(uri_for md:)"
 } > "${repo_root}/.env.override"
