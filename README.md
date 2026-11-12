@@ -105,6 +105,20 @@ after the URI's session options, escaping whitespace and backslashes with a
 backslash; MotherDuck removes the escapes, so `my session` arrives as is. It's
 unset by default; an empty value unsets it.
 
+`adbc.motherduck.db_schema` (database option) sets the schema every new
+connection starts in. MotherDuck's endpoint doesn't accept `search_path` as a
+startup option, so the driver runs `SET search_path TO <database>.<schema>`
+once each connection is up, with the connection's current database. (DuckDB
+would take a bare name that's also an attached database's name as that
+database.) Connecting fails if the schema doesn't exist. It's unset by default, leaving
+MotherDuck's default (`main`); an empty value unsets it.
+`adbc.connection.db_schema` changes a single connection's schema the same way,
+in its current database, and replaces this option when set before `Init`.
+Both name a schema only: unlike the PostgreSQL driver's bare `SET search_path`,
+which DuckDB would take as an attached database's name when no such schema
+exists, a name that isn't a schema of the current database fails with the
+server's error. Use `USE <database>` to change databases.
+
 MotherDuck builds the user agent in query history and its logs from libpq's
 `application_name`. The driver adds `adbc_driver_motherduck/<version>` to it,
 after the application's own name if the URI's `application_name` or
