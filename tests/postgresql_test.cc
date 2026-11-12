@@ -3604,7 +3604,8 @@ TEST_F(PostgresStatementTest, SqlReadIntervalOverflow) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
                 IsOkStatus(&error));
-    ASSERT_EQ(reader.rows_affected, -1);
+    // MotherDuck has no COPY: rows_affected is the SELECT 1 command tag's count.
+    ASSERT_EQ(reader.rows_affected, 1);
     ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
     ASSERT_THAT(reader.MaybeNext(),
                 adbc_validation::IsErrno(EINVAL, &reader.stream.value, nullptr));
@@ -3622,7 +3623,7 @@ TEST_F(PostgresStatementTest, SqlReadIntervalOverflow) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
                 IsOkStatus(&error));
-    ASSERT_EQ(reader.rows_affected, -1);
+    ASSERT_EQ(reader.rows_affected, 1);
     ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
     ASSERT_THAT(reader.MaybeNext(),
                 adbc_validation::IsErrno(EINVAL, &reader.stream.value, nullptr));
@@ -3680,7 +3681,8 @@ TEST_F(PostgresStatementTest, UpdateInExecuteQuery) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
                 IsOkStatus(&error));
-    ASSERT_EQ(reader.rows_affected, -1);
+    // MotherDuck has no COPY: rows_affected is the INSERT 0 2 command tag's count.
+    ASSERT_EQ(reader.rows_affected, 2);
     ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
     ASSERT_NO_FATAL_FAILURE(reader.Next());
     ASSERT_NE(reader.array->release, nullptr);
