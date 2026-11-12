@@ -116,8 +116,8 @@ void PqResultHelper::WaitUntilReady() {
   for (;;) {
     if (PQconsumeInput(conn_) != 1) return;
     if (PQisBusy(conn_) == 0) return;
-    const bool stop = stop_if_blocked_ || (cancel_flag_ != nullptr &&
-                                           cancel_flag_->load(std::memory_order_acquire));
+    const bool stop =
+        stop_if_blocked_ || (cancel_flag_ != nullptr && cancel_flag_->load());
     if (stop && !cancel_sent_) {
       SendCancel(conn_);
       cancel_sent_ = true;
@@ -133,8 +133,7 @@ bool PqResultHelper::AbandonStream() {
     if (!IsFailure(result)) return false;
     // A cancel this drain sent, so the connection can be reused, is not a
     // failed script. A user cancel still is.
-    if (IsCancelError(result) &&
-        (cancel_flag_ == nullptr || !cancel_flag_->load(std::memory_order_acquire))) {
+    if (IsCancelError(result) && (cancel_flag_ == nullptr || !cancel_flag_->load())) {
       return false;
     }
     return true;
@@ -188,8 +187,8 @@ void AbortCopy(PGconn* conn, ExecStatusType status) {
 
 Status PqResultHelper::ExecuteCancellable(const std::string& sql) {
   if (PQsendQuery(conn_, sql.c_str()) != 1) {
-    return MakeStatus(nullptr, "[libpq] Failed to execute query '{}': {}", sql.c_str(),
-                      PQerrorMessage(conn_));
+    return MakeStatus(nullptr, "[libpq] Failed to execute query '{}': {}",
+                      RedactQuery(sql), PqErrorText(nullptr, conn_));
   }
   Status failure = Status::Ok();
   for (;;) {
@@ -208,13 +207,13 @@ Status PqResultHelper::ExecuteCancellable(const std::string& sql) {
       continue;
     }
     if (IsFailure(result) && failure.ok()) {
-      if (cancel_flag_ != nullptr && cancel_flag_->load(std::memory_order_acquire)) {
+      if (cancel_flag_ != nullptr && cancel_flag_->load()) {
         failure = Status(ADBC_STATUS_CANCELLED,
                          "[libpq] canceling statement due to user request");
         failure.SetSqlState("57014");
       } else {
         failure = MakeStatus(result, "[libpq] Failed to execute query '{}': {}",
-                             sql.c_str(), PQresultErrorMessage(result));
+                             RedactQuery(sql), PqErrorText(result, conn_));
       }
     }
     PQclear(result);
@@ -230,8 +229,8 @@ Status PqResultHelper::BeginRowStream() {
                         /*paramValues=*/nullptr, /*paramLengths=*/nullptr,
                         /*paramFormats=*/nullptr,
                         static_cast<int>(output_format_)) != 1) {
-    return MakeStatus(nullptr, "[libpq] Failed to send query '{}': {}", query_.c_str(),
-                      PQerrorMessage(conn_));
+    return MakeStatus(nullptr, "[libpq] Failed to send query '{}': {}",
+                      RedactQuery(query_), PqErrorText(nullptr, conn_));
   }
 
 #ifdef LIBPQ_HAS_CHUNK_MODE
@@ -246,7 +245,7 @@ Status PqResultHelper::BeginRowStream() {
     streaming_ = true;
     AbandonStream();
     return MakeStatus(nullptr, "[libpq] Failed to read query '{}' in batches: {}",
-                      query_.c_str(), PQerrorMessage(conn_));
+                      RedactQuery(query_), PqErrorText(nullptr, conn_));
   }
   streaming_ = true;
   return Status::Ok();
@@ -329,7 +328,7 @@ Status PqResultHelper::NextPacket() {
   }
 
   Status error = MakeStatus(result_, "[libpq] Failed to execute query '{}': {}",
-                            query_.c_str(), PQresultErrorMessage(result_));
+                            RedactQuery(query_), PqErrorText(result_, conn_));
   ClearResult();
   PGresult* extra;
   while ((extra = PQgetResult(conn_)) != nullptr) {

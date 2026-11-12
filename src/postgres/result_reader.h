@@ -115,6 +115,8 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   // Set when this reader issued BEGIN so a multi-statement query stays one
   // transaction. Cleared once that transaction is committed or rolled back.
   bool own_txn_ = false;
+  // A client-side read error. Close rolls the owned script back.
+  bool script_failed_ = false;
   // The streamed statement of an owned script is inside SAVEPOINT adbc_stream.
   bool savepoint_ = false;
   AdbcStatusCode status_ = ADBC_STATUS_OK;
@@ -135,10 +137,12 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
         closed_(other->closed_),
         cancel_requested_(other->cancel_requested_.load()),
         own_txn_(other->own_txn_),
+        script_failed_(other->script_failed_),
         savepoint_(other->savepoint_),
         status_(other->status_) {
     other->cancel_requested_.store(false);
     other->own_txn_ = false;
+    other->script_failed_ = false;
     other->savepoint_ = false;
     helper_.SetCancelFlag(&cancel_requested_);
     ArrowErrorInit(&na_error_);
@@ -160,6 +164,8 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   int GetNextStream(struct ArrowArray* out);
   int Fail(const Status& status);
   int FailArrow(int code);
+  // Record a client-side read failure so Close rolls the script back.
+  int FailRead(int code);
 
   // Prepare the query with the bind stream's parameter types
   virtual Status PrepareWithParamTypes();

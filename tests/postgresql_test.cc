@@ -3609,8 +3609,8 @@ TEST_F(PostgresStatementTest, SqlReadIntervalOverflow) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
                 IsOkStatus(&error));
-    // MotherDuck has no COPY: rows_affected is the SELECT 1 command tag's count.
-    ASSERT_EQ(reader.rows_affected, 1);
+    // A streamed result still has rows, so the count is unknown.
+    ASSERT_EQ(reader.rows_affected, -1);
     ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
     ASSERT_THAT(reader.MaybeNext(),
                 adbc_validation::IsErrno(EINVAL, &reader.stream.value, nullptr));
@@ -3635,7 +3635,7 @@ TEST_F(PostgresStatementTest, SqlReadIntervalOverflow) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
                 IsOkStatus(&error));
-    ASSERT_EQ(reader.rows_affected, 1);
+    ASSERT_EQ(reader.rows_affected, -1);
     ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
     ASSERT_THAT(reader.MaybeNext(),
                 adbc_validation::IsErrno(EINVAL, &reader.stream.value, nullptr));
@@ -3651,6 +3651,41 @@ TEST_F(PostgresStatementTest, SqlReadIntervalOverflow) {
                 ::testing::HasSubstr("would overflow when converting to nanoseconds"));
     ASSERT_EQ(reader.array->release, nullptr);
   }
+}
+
+TEST_F(PostgresStatementTest, ScriptReadErrorRollsBack) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  for (const char* query : {"DROP TABLE IF EXISTS test_stream_read_error",
+                            "CREATE TABLE test_stream_read_error (ints INT)"}) {
+    ASSERT_THAT(AdbcStatementSetSqlQuery(&statement, query, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+                IsOkStatus(&error));
+  }
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "INSERT INTO test_stream_read_error VALUES (1); "
+                                       "SELECT CAST('2562048 hours' AS INTERVAL)",
+                                       &error),
+              IsOkStatus(&error));
+  {
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcStatementExecuteQuery(&statement, &reader.stream.value, nullptr, &error),
+        IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_THAT(reader.MaybeNext(),
+                adbc_validation::IsErrno(EINVAL, &reader.stream.value, nullptr));
+  }
+
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "SELECT COUNT(*) FROM test_stream_read_error", &error),
+              IsOkStatus(&error));
+  adbc_validation::StreamReader count;
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &count.stream.value, nullptr, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(count.GetSchema());
+  ASSERT_NO_FATAL_FAILURE(count.Next());
+  ASSERT_EQ(ArrowArrayViewGetIntUnsafe(count.array_view->children[0], 0), 0);
 }
 
 TEST_F(PostgresStatementTest, UpdateInExecuteQuery) {
@@ -3700,8 +3735,8 @@ TEST_F(PostgresStatementTest, UpdateInExecuteQuery) {
     ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
                                           &reader.rows_affected, &error),
                 IsOkStatus(&error));
-    // MotherDuck has no COPY: rows_affected is the INSERT 0 2 command tag's count.
-    ASSERT_EQ(reader.rows_affected, 2);
+    // The RETURNING rows are still unread, so the count is unknown.
+    ASSERT_EQ(reader.rows_affected, -1);
     ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
     ASSERT_NO_FATAL_FAILURE(reader.Next());
     ASSERT_NE(reader.array->release, nullptr);

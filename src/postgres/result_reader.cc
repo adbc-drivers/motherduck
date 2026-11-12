@@ -46,14 +46,14 @@ void PqResultArrayReader::Close() {
     return;
   }
   closed_ = true;
-  const bool user_cancel = cancel_requested_.load(std::memory_order_acquire);
+  const bool user_cancel = cancel_requested_.load();
   // Cancel only a statement that has no transaction to preserve. Cancelling
   // inside the caller's transaction aborts it. A script whose last statement
   // sits in a savepoint can cancel that statement and still commit the rest.
   // A reader that cannot use a savepoint drains the last statement instead.
   const bool fast_close = savepoint_ && !user_cancel && helper_.streaming();
   const bool cancel_if_blocked = user_cancel || fast_close || (autocommit_ && !own_txn_);
-  const bool failed = helper_.Finish(cancel_if_blocked);
+  const bool failed = helper_.Finish(cancel_if_blocked) || script_failed_;
   if (fast_close && !failed &&
       (helper_.CancelSent() || PQtransactionStatus(conn_) == PQTRANS_INERROR)) {
     PGresult* result = PQexec(conn_, "ROLLBACK TO SAVEPOINT adbc_stream");
@@ -92,7 +92,7 @@ int PqResultArrayReader::GetSchema(struct ArrowSchema* out) {
 }
 
 int PqResultArrayReader::GetNext(struct ArrowArray* out) {
-  if (cancel_requested_.load(std::memory_order_acquire) && !closed_) {
+  if (cancel_requested_.load() && !closed_) {
     Close();
     Status status(ADBC_STATUS_CANCELLED,
                   "[libpq] canceling statement due to user request");
@@ -253,9 +253,9 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
         return Status::IO("[libpq] Query returned no result");
       }
     }
-    if (!helper_.streaming()) {
-      // The server is done, including a command whose only leftover was a
-      // buffered trailer. Commit before returning so the change is visible.
+    if (!helper_.streaming() && helper_.NumRows() == 0) {
+      // Nothing left to convert. A result that still has rows waits until that
+      // conversion succeeds, so a client-side read error can still roll back.
       UNWRAP_STATUS(EndOwnedTransaction(true));
     }
     if (helper_.streaming() || helper_.NumRows() > 0) {
@@ -388,19 +388,24 @@ bool PqResultArrayReader::CommandSucceeded(const PGresult* result) const {
 
 Status PqResultArrayReader::EndOwnedTransaction(bool commit) {
   if (!own_txn_) return Status::Ok();
-  own_txn_ = false;
   // A failed statement aborts the transaction. COMMIT would be rejected.
   if (commit && PQtransactionStatus(conn_) == PQTRANS_INERROR) commit = false;
   const char* sql = commit ? "COMMIT" : "ROLLBACK";
   PGresult* result = PQexec(conn_, sql);
-  if (result == nullptr || !CommandSucceeded(result)) {
-    Status status = MakeStatus(result, "[libpq] Failed to execute query '{}': {}", sql,
-                               PQerrorMessage(conn_));
+  if (result != nullptr && CommandSucceeded(result)) {
     PQclear(result);
-    return status;
+    own_txn_ = false;
+    return Status::Ok();
   }
+  Status status = MakeStatus(result, "[libpq] Failed to execute query '{}': {}",
+                             RedactQuery(sql), PqErrorText(result, conn_));
   PQclear(result);
-  return Status::Ok();
+  if (!commit) return status;
+  // A failed COMMIT must not leave the transaction open with no owner.
+  PGresult* rollback = PQexec(conn_, "ROLLBACK");
+  if (rollback != nullptr && CommandSucceeded(rollback)) own_txn_ = false;
+  PQclear(rollback);
+  return status;
 }
 
 Status PqResultArrayReader::OpenRowStream() {
@@ -447,7 +452,7 @@ void PqResultArrayReader::ReleaseConnection() {
   if (closed_) return;
   if (!helper_.streaming()) {
     // Rows already received stay readable. Commit a script the server finished.
-    EndOwnedTransaction(true);
+    EndOwnedTransaction(!script_failed_);
     return;
   }
   Close();
@@ -458,7 +463,7 @@ void PqResultArrayReader::ReleaseConnection() {
 
 AdbcStatusCode PqResultArrayReader::RequestCancel(struct AdbcError* error) {
   (void)error;
-  cancel_requested_.store(true, std::memory_order_release);
+  cancel_requested_.store(true);
   return ADBC_STATUS_OK;
 }
 
@@ -535,6 +540,11 @@ int PqResultArrayReader::FailArrow(int code) {
   return code;
 }
 
+int PqResultArrayReader::FailRead(int code) {
+  if (code != NANOARROW_OK) script_failed_ = true;
+  return FailArrow(code);
+}
+
 int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
   nanoarrow::UniqueArray tmp;
   bool started = false;
@@ -557,12 +567,12 @@ int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
 
     if (!started) {
       if (int code =
-              FailArrow(ArrowArrayInitFromSchema(tmp.get(), schema_.get(), &na_error_))) {
+              FailRead(ArrowArrayInitFromSchema(tmp.get(), schema_.get(), &na_error_))) {
         return code;
       }
-      if (int code = FailArrow(ArrowArrayStartAppending(tmp.get()))) return code;
+      if (int code = FailRead(ArrowArrayStartAppending(tmp.get()))) return code;
       for (int i = 0; i < columns; i++) {
-        if (int code = FailArrow(field_readers_[i]->InitArray(tmp->children[i]))) {
+        if (int code = FailRead(field_readers_[i]->InitArray(tmp->children[i]))) {
           return code;
         }
       }
@@ -575,7 +585,7 @@ int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
       PqRecord value = row[i];
       item.data.data = value.data;
       item.size_bytes = value.is_null ? -1 : value.len;
-      if (int code = FailArrow(
+      if (int code = FailRead(
               field_readers_[i]->Read(&item, static_cast<int32_t>(item.size_bytes),
                                       tmp->children[i], &na_error_))) {
         return code;
@@ -587,25 +597,29 @@ int PqResultArrayReader::GetNextStream(struct ArrowArray* out) {
     if (bytes >= batch_size_hint_bytes_) break;
   }
 
-  if (!helper_.streaming()) {
-    if (Status end = EndOwnedTransaction(true); !end.ok()) return Fail(end);
-  }
-
   if (nrows == 0) {
+    if (!helper_.streaming()) {
+      if (Status end = EndOwnedTransaction(!script_failed_); !end.ok()) return Fail(end);
+    }
     out->release = nullptr;
     return NANOARROW_OK;
   }
 
   for (int i = 0; i < columns; i++) {
     if (int code =
-            FailArrow(field_readers_[i]->FinishArray(tmp->children[i], &na_error_))) {
+            FailRead(field_readers_[i]->FinishArray(tmp->children[i], &na_error_))) {
       return code;
     }
   }
   tmp->length = nrows;
   tmp->null_count = 0;
-  if (int code = FailArrow(ArrowArrayFinishBuildingDefault(tmp.get(), &na_error_))) {
+  if (int code = FailRead(ArrowArrayFinishBuildingDefault(tmp.get(), &na_error_))) {
     return code;
+  }
+  // Commit only after the batch is built. A conversion error above sets
+  // script_failed_ so Close rolls the script back instead.
+  if (!helper_.streaming()) {
+    if (Status end = EndOwnedTransaction(!script_failed_); !end.ok()) return Fail(end);
   }
   ArrowArrayMove(tmp.get(), out);
   return NANOARROW_OK;
