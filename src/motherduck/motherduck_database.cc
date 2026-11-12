@@ -70,6 +70,23 @@ std::string GetEnv(const char* name) {
 #endif
 }
 
+// An environment variable as libpq reads it, or empty if it's unset. libpq is
+// linked into this DLL, so on Windows it reads the same C runtime copy that
+// GetEnv avoids; elsewhere the two are the same.
+std::string LibpqGetEnv(const char* name) {
+#ifdef _MSC_VER
+  char* value = nullptr;
+  size_t size = 0;
+  if (_dupenv_s(&value, &size, name) != 0 || value == nullptr) return "";
+  std::string out(value);
+  std::free(value);
+  return out;
+#else
+  const char* value = std::getenv(name);
+  return value ? value : "";
+#endif
+}
+
 // A host for comparison: lowercase, without a trailing dot.
 std::string NormalizeHost(std::string_view host) {
   if (!host.empty() && host.back() == '.') host.remove_suffix(1);
@@ -334,13 +351,20 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   }
   PQconninfoFree(conninfo);
 
-  bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
+  // Whether libpq will read a service file. It reads PGSERVICE only from its
+  // own view of the environment, and only when the URI names no service.
+  bool libpq_loads_service = !uri_service.empty() || !LibpqGetEnv("PGSERVICE").empty();
+  // Whether either view names one. On Windows the two can differ when the
+  // application changes PGSERVICE after the DLL loads.
+  bool names_service = libpq_loads_service || !GetEnv("PGSERVICE").empty();
   // On Windows the driver reads the process environment, but libpq reads its
   // own C runtime copy, which can be stale. Pass the TLS settings the driver
-  // acts on, so libpq uses the same ones. With a named service the driver
-  // doesn't act on them, and passing them would make them override the
-  // service file's, which libpq ranks above the environment.
-  if (!names_service) {
+  // acts on, so libpq uses the same ones. When libpq loads a service, passing
+  // them would make them override the service file's, which libpq ranks above
+  // the environment, so they are left to libpq. The cost on Windows: a TLS
+  // variable changed after the DLL loaded stays unset when the service file
+  // omits it, since libpq fills the gap from its stale copy.
+  if (!libpq_loads_service) {
     if (uri_sslmode.empty()) {
       if (std::string env = GetEnv("PGSSLMODE"); !env.empty()) {
         params->emplace_back("sslmode", std::move(env));
@@ -378,10 +402,11 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     if (uri_port.empty()) params->emplace_back("port", "5432");
   }
   // Don't let libpq's default sslmode=prefer send the token in plaintext.
-  // Certificate verification still needs sslmode=verify-full (#34). A named
-  // service may set sslmode itself, which this would override; with a region,
-  // a service is already an error.
-  if (!names_service && DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
+  // Certificate verification still needs sslmode=verify-full (#34). A service
+  // libpq loads may set sslmode itself, which this would override; one only
+  // the process environment names is never loaded, so the default applies.
+  // With a region, a service is already an error.
+  if (!libpq_loads_service && DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
     params->emplace_back("sslmode", "require");
   }
   if (!password_.empty()) password = password_;
