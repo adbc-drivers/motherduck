@@ -115,7 +115,9 @@ std::string StripStatementEcho(std::string_view text) {
       if (i > digits && i < text.size() && text[i] == ':') {
         size_t cut = line;
         while (cut > 0 && (text[cut - 1] == '\n' || text[cut - 1] == '\r')) cut--;
-        return std::string(text.substr(0, cut));
+        std::string out(text.substr(0, cut));
+        if (!out.empty()) out += ' ';
+        return out + kStatementOmitted;
       }
     }
     const size_t next = text.find('\n', line);
@@ -125,7 +127,11 @@ std::string StripStatementEcho(std::string_view text) {
   return std::string(text);
 }
 
-std::string RedactMotherDuckErrorText(std::string_view text) {
+namespace {
+
+// The message redactor. StripStatementEcho can throw bad_alloc, and an error is being
+// built, so this must not throw: on failure, hide everything.
+std::string RedactServerMessage(std::string_view text) {
   try {
     return RedactSecretStatements(StripStatementEcho(text));
   } catch (...) {
@@ -133,6 +139,11 @@ std::string RedactMotherDuckErrorText(std::string_view text) {
   }
 }
 
-void InstallMotherDuckQueryRedactor() { SetQueryRedactor(&RedactMotherDuckErrorText); }
+}  // namespace
+
+void InstallMotherDuckQueryRedactor() {
+  SetQueryRedactor(&RedactSecretStatements);
+  SetMessageRedactor(&RedactServerMessage);
+}
 
 }  // namespace adbcpq

@@ -105,6 +105,11 @@ namespace adbcpq {
 /// \brief Install the redactor used by RedactQuery (nullptr: none). Call at init.
 void SetQueryRedactor(QueryRedactor redactor);
 
+/// \brief Install the redactor used by RedactMessage, for text the server wrote.
+///
+/// nullptr (the default) means RedactMessage uses the query redactor. Call at init.
+void SetMessageRedactor(QueryRedactor redactor);
+
 /// \brief Truncate SQL text to kMaxQueryBytes, then apply the installed redactor.
 ///
 /// Truncation comes first, so the redactor never sees text past the cut.
