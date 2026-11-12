@@ -1224,26 +1224,25 @@ AdbcStatusCode PostgresConnection::FinishActiveReader(struct AdbcError* error) {
     reader = active_reader_.lock();
     active_reader_.reset();
   }
-  Status ended = Status::Ok();
-  if (reader) ended = reader->ReleaseConnection();
-  AdbcStatusCode rollback = RollbackAbandonedTransaction(error);
-  if (!ended.ok()) return ended.ToAdbc(error);
-  return rollback;
+  // A script's commit failure stays on that reader. Only a transaction this
+  // connection still cannot roll back fails the caller.
+  if (reader) reader->ReleaseConnection();
+  return RollbackAbandonedTransaction(error);
 }
 
 AdbcStatusCode PostgresConnection::Release(struct AdbcError* error) {
-  // Finish a server read on this thread before PQfinish.
-  AdbcStatusCode finished = FinishActiveReader(error);
+  // Finish a server read on this thread before PQfinish. Disconnect drops any
+  // transaction the script could not end, so that failure is not reported.
+  FinishActiveReader(nullptr);
   disconnected_.store(true);
   if (cancel_) {
     PQfreeCancel(cancel_);
     cancel_ = nullptr;
   }
   if (conn_) {
-    AdbcStatusCode code = database_->Disconnect(&conn_, error);
-    if (code != ADBC_STATUS_OK) return code;
+    return database_->Disconnect(&conn_, error);
   }
-  return finished;
+  return ADBC_STATUS_OK;
 }
 
 AdbcStatusCode PostgresConnection::Rollback(struct AdbcError* error) {

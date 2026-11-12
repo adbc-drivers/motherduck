@@ -48,21 +48,10 @@ Status PqResultArrayReader::Close() {
   closed_ = true;
   const bool user_cancel = cancel_requested_.load();
   // Cancel only a statement that has no transaction to preserve. Cancelling
-  // inside the caller's transaction aborts it. A script whose last statement
-  // sits in a savepoint can cancel that statement and still commit the rest.
-  // A reader that cannot use a savepoint drains the last statement instead.
-  const bool fast_close = savepoint_ && !user_cancel && helper_.streaming();
-  const bool cancel_if_blocked = user_cancel || fast_close || (autocommit_ && !own_txn_);
+  // inside the caller's transaction aborts it. An owned script drains, then
+  // commits unless the caller cancelled or a row failed to convert.
+  const bool cancel_if_blocked = user_cancel || (autocommit_ && !own_txn_);
   const bool failed = helper_.Finish(cancel_if_blocked) || script_failed_;
-  if (fast_close && !failed &&
-      (helper_.CancelSent() || PQtransactionStatus(conn_) == PQTRANS_INERROR)) {
-    PGresult* result = PQexec(conn_, "ROLLBACK TO SAVEPOINT adbc_stream");
-    const bool rolled_back = result != nullptr && CommandSucceeded(result);
-    PQclear(result);
-    savepoint_ = false;
-    if (!rolled_back) return EndOwnedTransaction(false);
-  }
-  if (fast_close && !failed) return EndOwnedTransaction(true);
   Status ended = EndOwnedTransaction(!(failed || user_cancel));
   // Both COMMIT and ROLLBACK failed. The connection rolls this back before
   // the next command, since this reader is about to be destroyed.
@@ -257,6 +246,7 @@ Status PqResultArrayReader::Initialize(int64_t* rows_affected) {
     if (!helper_.streaming() && helper_.NumRows() == 0) {
       // Nothing left to convert. A result that still has rows waits until that
       // conversion succeeds, so a client-side read error can still roll back.
+      // Until then the script is uncommitted and invisible to other connections.
       UNWRAP_STATUS(EndOwnedTransaction(true));
     }
     if (helper_.streaming() || helper_.NumRows() > 0) {
@@ -436,21 +426,13 @@ Status PqResultArrayReader::OpenRowStream() {
   }
 
   helper_.set_query(std::move(statements.back()));
-  if (own_txn_ && ReleaseCanUseSavepoint()) {
-    Status savepoint = helper_.ExecuteCancellable("SAVEPOINT adbc_stream");
-    if (!savepoint.ok()) {
-      EndOwnedTransaction(false);
-      return savepoint;
-    }
-    savepoint_ = true;
-  }
   Status status = helper_.BeginRowStream();
   if (!status.ok()) EndOwnedTransaction(false);
   return status;
 }
 
-Status PqResultArrayReader::ReleaseConnection() {
-  if (closed_) return Status::Ok();
+void PqResultArrayReader::ReleaseConnection() {
+  if (closed_) return;
   if (!helper_.streaming()) {
     // Rows already received stay readable. Commit a script the server finished.
     Status ended = EndOwnedTransaction(!script_failed_);
@@ -460,13 +442,22 @@ Status PqResultArrayReader::ReleaseConnection() {
       if (connection_ != nullptr) connection_->NoteAbandonedTransaction();
       own_txn_ = false;
     }
-    return ended;
+    // The failure belongs to this stream. The command that needed the
+    // connection is a different statement.
+    if (!ended.ok()) {
+      status_ = ended.ToAdbc(&error_);
+      closed_ = true;
+    }
+    return;
   }
   Status ended = Close();
+  if (!ended.ok()) {
+    status_ = ended.ToAdbc(&error_);
+    return;
+  }
   status_ = ADBC_STATUS_INVALID_STATE;
   InternalAdbcSetError(&error_, "%s",
                        "[libpq] Reader invalidated (statement or reader was closed)");
-  return ended;
 }
 
 AdbcStatusCode PqResultArrayReader::RequestCancel(struct AdbcError* error) {

@@ -78,9 +78,9 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   // True until the transaction this reader opened is committed or rolled back.
   bool owns_transaction() const { return own_txn_; }
   // Drop a server read so the connection can run another command. A result
-  // that is already fully buffered stays readable. Failure means the script
-  // was not committed.
-  Status ReleaseConnection();
+  // that is already fully buffered stays readable. A script that could not be
+  // committed fails the next read of this stream, not the next command.
+  void ReleaseConnection();
   // Finish an open read on this thread. Safe to call more than once.
   Status Close();
   // Thread-safe. Sets the cancel flag. The reading thread sends the cancel.
@@ -120,8 +120,6 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   bool own_txn_ = false;
   // A client-side read error. Close rolls the owned script back.
   bool script_failed_ = false;
-  // The streamed statement of an owned script is inside SAVEPOINT adbc_stream.
-  bool savepoint_ = false;
   AdbcStatusCode status_ = ADBC_STATUS_OK;
   struct AdbcError error_;
   struct ArrowError na_error_;
@@ -141,12 +139,10 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
         cancel_requested_(other->cancel_requested_.load()),
         own_txn_(other->own_txn_),
         script_failed_(other->script_failed_),
-        savepoint_(other->savepoint_),
         status_(other->status_) {
     other->cancel_requested_.store(false);
     other->own_txn_ = false;
     other->script_failed_ = false;
-    other->savepoint_ = false;
     helper_.SetCancelFlag(&cancel_requested_);
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
@@ -157,10 +153,6 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   Status OpenRowStream();
   // A command tag is success. A subclass may also accept a tuples result.
   virtual bool CommandSucceeded(const PGresult* result) const;
-  // When true, the last statement of an owned script is wrapped in a savepoint
-  // so closing the stream can cancel it. A server that rejects SAVEPOINT
-  // returns false and the close drains that statement instead.
-  virtual bool ReleaseCanUseSavepoint() const { return true; }
   // End the transaction this reader opened. commit is ignored when the server
   // has already aborted it. Does nothing when this reader did not begin one.
   Status EndOwnedTransaction(bool commit);

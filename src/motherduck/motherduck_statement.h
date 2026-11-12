@@ -49,7 +49,6 @@ class MotherduckResultReader : public PqResultArrayReader {
 
  protected:
   bool CommandSucceeded(const PGresult* result) const override;
-  bool ReleaseCanUseSavepoint() const override { return false; }
   Status ExecuteAll(int64_t* affected_rows) override;
   Status PrepareWithParamTypes() override;
   Status ResolveNullParamTypes() override;

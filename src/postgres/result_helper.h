@@ -171,7 +171,6 @@ class PqResultHelper {
     stop_if_blocked_ = cancel_if_blocked;
     return AbandonStream();
   }
-  bool CancelSent() const { return cancel_sent_; }
   // Free result memory without talking to the server. Used after PQfinish.
   void DiscardLocal();
   Status ExecuteCopy();
