@@ -416,6 +416,9 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     if (!session_options.empty()) session_options += ' ';
     session_options += session_option;
   };
+  // Have the endpoint send PostgreSQL command tags with affected-row counts
+  // instead of DuckDB's Count and Success result sets.
+  add(SessionOption("return_pg_command_tags", "on"));
   if (attach_mode_.empty()) add(SessionOption("attach_mode", kDefaultAttachMode));
   add(options);
   if (!attach_mode_.empty()) add(SessionOption("attach_mode", attach_mode_));

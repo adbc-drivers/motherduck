@@ -22,6 +22,8 @@
 
 #include "error.h"
 
+#include <atomic>
+#include <string>
 #include <string_view>
 
 #include <libpq-fe.h>
@@ -29,6 +31,44 @@
 #include "driver/common/utils.h"
 
 namespace adbcpq {
+
+namespace {
+std::atomic<QueryRedactor> query_redactor{nullptr};
+}  // namespace
+
+void SetQueryRedactor(QueryRedactor redactor) { query_redactor.store(redactor); }
+
+namespace {
+
+// Cut to max_bytes, redact what is kept, and mark the cut.
+RedactedText TruncateAndRedact(std::string_view text, size_t max_bytes) {
+  bool truncated = false;
+  if (text.size() > max_bytes) {
+    size_t cut = max_bytes;
+    // Don't split a UTF-8 sequence.
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) cut--;
+    text = text.substr(0, cut);
+    truncated = true;
+  }
+  std::string out;
+  if (QueryRedactor redactor = query_redactor.load()) {
+    out = redactor(text);
+  } else {
+    out = std::string(text);
+  }
+  if (truncated) out += "... [truncated]";
+  return RedactedText(std::move(out));
+}
+
+}  // namespace
+
+RedactedText RedactQuery(std::string_view query) {
+  return TruncateAndRedact(query, kMaxQueryBytes);
+}
+
+RedactedText RedactMessage(std::string_view message) {
+  return TruncateAndRedact(message, kMaxMessageBytes);
+}
 
 AdbcStatusCode ClassifySqlState(const char* sqlstate) {
   if (!sqlstate) {
@@ -96,7 +136,7 @@ AdbcStatusCode EscapeIdentifier(PGconn* conn, std::string_view identifier,
     shown.resize(std::strlen(shown.c_str()));
     InternalAdbcSetError(error, "[libpq] Could not escape identifier %s%s: %s",
                          shown.c_str(), identifier.size() > kMaxShown ? "..." : "",
-                         conn ? PQerrorMessage(conn) : "no connection");
+                         conn ? PqErrorText(nullptr, conn).c_str() : "no connection");
     // Without a healthy connection the failure says nothing about the identifier.
     return (conn != nullptr && PQstatus(conn) == CONNECTION_OK)
                ? ADBC_STATUS_INVALID_ARGUMENT

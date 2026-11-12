@@ -27,6 +27,8 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <arrow-adbc/adbc.h>
@@ -65,6 +67,83 @@ static const std::vector<DetailField> kDetailFields = {
 
 AdbcStatusCode ClassifySqlState(const char* sqlstate);
 
+/// \brief Hook that masks sensitive text in SQL before it goes into an error message.
+///
+/// It only sees text already cut to kMaxQueryBytes or kMaxMessageBytes.
+using QueryRedactor = std::string (*)(std::string_view query);
+
+/// Longest SQL text kept in an error message; the rest is cut before redaction.
+constexpr size_t kMaxQueryBytes = 512 * 1024;
+/// Longest server text (messages and diagnostic fields) kept in an error.
+constexpr size_t kMaxMessageBytes = 8192;
+
+/// \brief Text that is safe to put in an error message.
+///
+/// RedactQuery, RedactMessage and PqErrorText return it, and MakeStatus accepts nothing
+/// else as an argument, so raw SQL or PQerrorMessage can't slip into an error. Wrapping
+/// text that is already safe, like a status name, is explicit.
+class RedactedText : public std::string {
+ public:
+  RedactedText() = default;
+  explicit RedactedText(std::string text) : std::string(std::move(text)) {}
+  explicit RedactedText(const char* text) : std::string(text) {}
+};
+
+}  // namespace adbcpq
+
+// fmt matches exact types, so a std::string subclass needs its own formatter.
+template <>
+struct fmt::formatter<adbcpq::RedactedText> : fmt::formatter<std::string_view> {
+  template <typename FormatContext>
+  auto format(const adbcpq::RedactedText& text, FormatContext& ctx) const {
+    return fmt::formatter<std::string_view>::format(std::string_view(text), ctx);
+  }
+};
+
+namespace adbcpq {
+
+/// \brief Install the redactor used by RedactQuery (nullptr: none). Call at init.
+void SetQueryRedactor(QueryRedactor redactor);
+
+/// \brief Truncate SQL text to kMaxQueryBytes, then apply the installed redactor.
+///
+/// Truncation comes first, so the redactor never sees text past the cut.
+RedactedText RedactQuery(std::string_view query);
+
+/// \brief As RedactQuery, for text the server wrote (kMaxMessageBytes).
+RedactedText RedactMessage(std::string_view message);
+
+/// \brief The server's error text without the echoed statement.
+///
+/// libpq's default verbosity echoes the statement ("LINE n:", "QUERY:"), which can hold
+/// credentials, so this uses the terse form. Without a result, or when the result has no
+/// fields, it uses the connection's message.
+inline RedactedText PqErrorText(PGresult* result, PGconn* conn) {
+  if (result != nullptr) {
+    // Results libpq makes itself (lost connection) have no fields, so the verbose form
+    // says "missing error text". Their own message has no echo to leak.
+    if (PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY) == nullptr) {
+      std::string_view own = PQresultErrorMessage(result);
+      if (!own.empty()) return RedactMessage(own);
+      return conn != nullptr ? RedactMessage(PQerrorMessage(conn)) : RedactedText();
+    }
+    char* text =
+        PQresultVerboseErrorMessage(result, PQERRORS_TERSE, PQSHOW_CONTEXT_NEVER);
+    // Don't fall back to the default message: it echoes the statement.
+    if (text == nullptr) return RedactedText("(server error text unavailable)");
+    std::string out(text);
+    PQfreemem(text);
+    // The message itself can quote the statement too.
+    return RedactMessage(out);
+  }
+  return conn != nullptr ? RedactMessage(PQerrorMessage(conn)) : RedactedText();
+}
+
+/// \brief libpq's name for a result status, e.g. "PGRES_FATAL_ERROR".
+inline RedactedText PqStatusName(ExecStatusType status) {
+  return RedactedText(PQresStatus(status));
+}
+
 /// \brief Quote an identifier with PQescapeIdentifier, storing the result in *out.
 ///
 /// libpq rejects identifiers that are not valid in the client encoding, so a
@@ -82,6 +161,10 @@ AdbcStatusCode ClassifyServerError(const char* sqlstate, const char* primary_mes
 
 template <typename... Args>
 Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
+  static_assert((... && (std::is_arithmetic_v<std::decay_t<Args>> ||
+                         std::is_same_v<std::decay_t<Args>, RedactedText>)),
+                "MakeStatus arguments must be numbers or RedactedText: pass SQL through "
+                "RedactQuery and libpq errors through PqErrorText");
   auto message = ::fmt::vformat(format_string, ::fmt::make_format_args(args...));
 
   AdbcStatusCode code = ADBC_STATUS_IO;
@@ -105,7 +188,7 @@ Status MakeStatus(PGresult* result, const char* format_string, Args&&... args) {
   for (const auto& field : kDetailFields) {
     const char* value = PQresultErrorField(result, field.code);
     if (value) {
-      status.AddDetail(field.key, value);
+      status.AddDetail(field.key, RedactMessage(value));
     }
   }
 

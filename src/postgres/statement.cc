@@ -92,7 +92,7 @@ int TupleReader::GetCopyData() {
   int get_copy_res = PQgetCopyData(conn_, &pgbuf_, /*async=*/0);
   if (get_copy_res == -2) {
     InternalAdbcSetError(&error_, "[libpq] PQgetCopyData() failed: %s",
-                         PQerrorMessage(conn_));
+                         PqErrorText(nullptr, conn_).c_str());
     status_ = ADBC_STATUS_IO;
     return InternalAdbcStatusCodeToErrno(status_);
   }
@@ -105,7 +105,7 @@ int TupleReader::GetCopyData() {
     int errno_result = ENODATA;
     if (pq_status != PGRES_COMMAND_OK) {
       status_ = MakeStatus(result_, "[libpq] Execution error [{}]: {}",
-                           PQresStatus(pq_status), PQresultErrorMessage(result_))
+                           PqStatusName(pq_status), PqErrorText(result_, conn_))
                     .ToAdbc(&error_);
       errno_result = InternalAdbcStatusCodeToErrno(status_);
     }
@@ -500,7 +500,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
       if (!IsCommandOk(result)) {
         AdbcStatusCode code =
             MakeStatus(result, "[libpq] Failed to drop table: {}\nQuery was: {}",
-                       PQerrorMessage(conn), drop)
+                       PqErrorText(result, conn), RedactQuery(drop))
                 .ToAdbc(error);
         PQclear(result);
         return code;
@@ -535,7 +535,7 @@ AdbcStatusCode PostgresStatement::CreateBulkTable(const std::string& current_sch
   if (!IsCommandOk(result)) {
     AdbcStatusCode code =
         MakeStatus(result, "[libpq] Failed to create table: {}\nQuery was: {}",
-                   PQerrorMessage(conn), create)
+                   PqErrorText(result, conn), RedactQuery(create))
             .ToAdbc(error);
     PQclear(result);
     return code;
@@ -802,7 +802,7 @@ AdbcStatusCode PostgresStatement::ExecuteIngest(struct ArrowArrayStream* stream,
   if (PQresultStatus(result) != PGRES_COPY_IN) {
     AdbcStatusCode code =
         MakeStatus(result, "[libpq] COPY query failed: {}\nQuery was: {}",
-                   PQerrorMessage(connection_->conn()), query)
+                   PqErrorText(result, connection_->conn()), RedactQuery(query))
             .ToAdbc(error);
     PQclear(result);
     return code;
