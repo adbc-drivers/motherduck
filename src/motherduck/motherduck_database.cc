@@ -452,12 +452,16 @@ AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* erro
   }
 
   // The endpoint rejects search_path as a startup option, so set it once
-  // connected. A database named in the connection is its current database,
-  // which saves looking it up; md: (or none) leaves it to the server.
+  // connected. A database the URI names is the connection's current database,
+  // which saves looking it up. Otherwise (md:, or no database, where libpq
+  // falls back to the user name) the server says which it is.
   if (!db_schema_.empty()) {
-    const char* dbname = PQdb(*conn);
     std::string_view database;
-    if (dbname != nullptr && std::strchr(dbname, ':') == nullptr) database = dbname;
+    for (const auto& [keyword, value] : params) {
+      if (keyword == "dbname" && !value.empty() && value.find(':') == std::string::npos) {
+        database = value;
+      }
+    }
     AdbcStatusCode status = SetMotherduckSearchPath(
         *conn, db_schema_, database, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, error);
     if (status != ADBC_STATUS_OK) {

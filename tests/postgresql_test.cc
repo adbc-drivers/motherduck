@@ -38,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -432,9 +433,20 @@ class MotherDuckTestDatabase : public ::testing::Environment {
              "', 1) AS BIGINT) < CAST(epoch(now()) AS BIGINT) - "
              "86400 THEN 'stale' ELSE '' END";
     };
-    auto leftover = [&](const std::vector<std::string>& row) {
-      return row[0] == schema_ || row[0].rfind(schema_ + "_", 0) == 0 ||
-             row[1] == "stale";
+    auto own = [&](const std::string& name) {
+      return name == schema_ || name.rfind(schema_ + "_", 0) == 0;
+    };
+    // This run's own objects must go. Stale ones belong to a dead run, and
+    // concurrent runs may drop the same one at once, which MotherDuck rejects
+    // as a write-write conflict for all but one, so their drops are best-effort.
+    auto drop = [&](const std::string& name, const std::string& stale,
+                    const std::string& query) {
+      if (own(name)) {
+        ASSERT_NO_FATAL_FAILURE(Execute(connection, query));
+      } else if (stale == "stale") {
+        Handle<struct AdbcError> ignored;
+        std::ignore = Run(connection, query, &ignored.value);
+      }
     };
 
     std::vector<std::vector<std::string>> schemas;
@@ -444,10 +456,9 @@ class MotherDuckTestDatabase : public ::testing::Environment {
                                       "WHERE database_name = current_database()",
                                   &schemas));
     for (const auto& row : schemas) {
-      if (!leftover(row)) continue;
-      ASSERT_NO_FATAL_FAILURE(
-          Execute(connection, "DROP SCHEMA IF EXISTS " + catalog_ + "." +
-                                  quirks_.QuoteIdentifier(row[0]) + " CASCADE"));
+      ASSERT_NO_FATAL_FAILURE(drop(row[0], row[1],
+                                   "DROP SCHEMA IF EXISTS " + catalog_ + "." +
+                                       quirks_.QuoteIdentifier(row[0]) + " CASCADE"));
     }
 
     std::vector<std::vector<std::string>> databases;
@@ -456,9 +467,9 @@ class MotherDuckTestDatabase : public ::testing::Environment {
         "SELECT database_name, " + stale("database_name") + " FROM duckdb_databases()",
         &databases));
     for (const auto& row : databases) {
-      if (row[0] == catalog_name_ || !leftover(row)) continue;
-      ASSERT_NO_FATAL_FAILURE(Execute(
-          connection, "DROP DATABASE IF EXISTS " + quirks_.QuoteIdentifier(row[0])));
+      if (row[0] == catalog_name_) continue;
+      ASSERT_NO_FATAL_FAILURE(drop(
+          row[0], row[1], "DROP DATABASE IF EXISTS " + quirks_.QuoteIdentifier(row[0])));
     }
   }
 
@@ -4656,11 +4667,16 @@ TEST_F(PostgresDatabaseTest, DbSchemaOption) {
     }
 
     // The connection option resolves the same way: a name only an attached
-    // database has fails, rather than switching to that database.
-    EXPECT_THAT(AdbcConnectionSetOption(&connection.value,
-                                        ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
-                                        database_only.c_str(), &error),
-                IsStatus(ADBC_STATUS_IO, &error));
+    // database has fails, rather than switching to that database, with the
+    // server's SQLSTATE.
+    EXPECT_NE(AdbcConnectionSetOption(&connection.value,
+                                      ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA,
+                                      database_only.c_str(), &error),
+              ADBC_STATUS_OK);
+    EXPECT_NE(error.sqlstate[0], '\0');
+    ASSERT_NE(nullptr, error.message);
+    EXPECT_THAT(error.message,
+                ::testing::HasSubstr(ADBC_CONNECTION_OPTION_CURRENT_DB_SCHEMA));
     if (error.release) error.release(&error);
     ASSERT_NO_FATAL_FAILURE(QueryScalar(
         &statement.value, "SELECT current_database() || '.' || current_schema()",
@@ -4680,6 +4696,34 @@ TEST_F(PostgresDatabaseTest, DbSchemaOption) {
   }
 
   {
+    // A URI that names no database (md:) leaves the current database to the
+    // server, which the driver looks up to qualify the schema.
+    const char* setup_uri = std::getenv("MOTHERDUCK_TEST_SETUP_URI");
+    ASSERT_NE(setup_uri, nullptr) << "Must provide env var MOTHERDUCK_TEST_SETUP_URI";
+    Handle<struct AdbcDatabase> md;
+    Handle<struct AdbcConnection> md_connection;
+    Handle<struct AdbcStatement> md_statement;
+    ASSERT_THAT(AdbcDatabaseNew(&md.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(quirks_.SetupDatabase(&md.value, setup_uri, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&md.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                      "workspace", &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&md.value, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, "main",
+                                      &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseInit(&md.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcConnectionNew(&md_connection.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcConnectionInit(&md_connection.value, &md.value, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementNew(&md_connection.value, &md_statement.value, &error),
+                IsOkStatus(&error));
+    std::string md_current;
+    ASSERT_NO_FATAL_FAILURE(
+        QueryScalar(&md_statement.value, "SELECT current_schema()", &md_current, &error));
+    EXPECT_EQ(md_current, "main");
+  }
+
+  {
     Handle<struct AdbcDatabase> missing;
     ASSERT_THAT(AdbcDatabaseNew(&missing.value, &error), IsOkStatus(&error));
     ASSERT_THAT(quirks_.SetupDatabase(&missing.value, &error), IsOkStatus(&error));
@@ -4690,8 +4734,9 @@ TEST_F(PostgresDatabaseTest, DbSchemaOption) {
     ASSERT_THAT(AdbcDatabaseSetOption(&missing.value, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA,
                                       database_only.c_str(), &error),
                 IsOkStatus(&error));
-    ASSERT_THAT(AdbcDatabaseInit(&missing.value, &error),
-                IsStatus(ADBC_STATUS_IO, &error));
+    // Fails with the server's SQLSTATE.
+    ASSERT_NE(AdbcDatabaseInit(&missing.value, &error), ADBC_STATUS_OK);
+    EXPECT_NE(error.sqlstate[0], '\0');
     ASSERT_NE(nullptr, error.message);
     EXPECT_THAT(error.message, ::testing::HasSubstr(ADBC_MOTHERDUCK_OPTION_DB_SCHEMA));
     if (error.release) error.release(&error);

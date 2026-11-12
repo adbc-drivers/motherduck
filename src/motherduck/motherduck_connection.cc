@@ -77,15 +77,20 @@ AdbcStatusCode SetMotherduckSearchPath(PGconn* conn, std::string_view schema,
   RAISE_ADBC(EscapeIdentifier(conn, database_name, &database_esc, error));
   RAISE_ADBC(EscapeIdentifier(conn, schema, &schema_esc, error));
   // The endpoint doesn't accept a parameter here.
-  PqResultHelper helper(conn, "SET search_path TO " + database_esc + "." + schema_esc);
-  adbc::driver::Status status = helper.Execute();
-  if (!status.ok()) {
-    InternalAdbcSetError(error, "[motherduck] Failed to set %s=%.*s: %s", option,
-                         static_cast<int>(schema.size()), schema.data(),
-                         status.message().c_str());
-    return ADBC_STATUS_IO;
+  PGresult* result =
+      PQexec(conn, ("SET search_path TO " + database_esc + "." + schema_esc).c_str());
+  // MotherDuck answers SET with an empty Success result set.
+  const ExecStatusType result_status = PQresultStatus(result);
+  if (result_status == PGRES_COMMAND_OK || result_status == PGRES_TUPLES_OK) {
+    PQclear(result);
+    return ADBC_STATUS_OK;
   }
-  return ADBC_STATUS_OK;
+  // Keeps the server's SQLSTATE and details, and classifies the status.
+  adbc::driver::Status status =
+      MakeStatus(result, "[motherduck] Failed to set {}={}: {}", option,
+                 std::string(schema), PQerrorMessage(conn));
+  PQclear(result);
+  return status.ToAdbc(error);
 }
 
 std::vector<uint32_t> MotherduckInfoCodes(const uint32_t* info_codes,

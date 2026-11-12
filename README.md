@@ -104,6 +104,10 @@ database.) Connecting fails if the schema doesn't exist. It's unset by default, 
 MotherDuck's default (`main`); an empty value unsets it.
 `adbc.connection.db_schema` changes a single connection's schema the same way,
 in its current database, and replaces this option when set before `Init`.
+Both name a schema only: unlike the PostgreSQL driver's bare `SET search_path`,
+which DuckDB would take as an attached database's name when no such schema
+exists, a name that isn't a schema of the current database fails with the
+server's error. Use `USE <database>` to change databases.
 
 MotherDuck builds the user agent in query history and its logs from libpq's
 `application_name`. The driver adds `adbc_driver_motherduck/<version>` to it,

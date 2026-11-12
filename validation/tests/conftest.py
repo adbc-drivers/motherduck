@@ -108,8 +108,21 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
             autocommit=True,
         )
 
-    def leftover(name: str, stale: str) -> bool:
-        return name == schema or name.startswith(schema + "_") or stale == "stale"
+    def own(name: str) -> bool:
+        return name == schema or name.startswith(schema + "_")
+
+    def drop(cursor, name: str, stale: str, query: str) -> None:
+        # This run's own objects must go. Stale ones belong to a dead run, and
+        # concurrent runs may drop the same one at once, which MotherDuck
+        # rejects as a write-write conflict for all but one, so their drops
+        # are best-effort.
+        if own(name):
+            cursor.execute(query)
+        elif stale == "stale":
+            try:
+                cursor.execute(query)
+            except adbc_driver_manager.dbapi.Error:
+                pass
 
     def drop_leftovers(cursor) -> None:
         cursor.execute(
@@ -117,16 +130,18 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
             "FROM duckdb_schemas() WHERE database_name = current_database()"
         )
         for name, stale in cursor.fetchall():
-            if leftover(name, stale):
-                cursor.execute(
-                    f"DROP SCHEMA IF EXISTS {database}.{quote(name)} CASCADE"
-                )
+            drop(
+                cursor,
+                name,
+                stale,
+                f"DROP SCHEMA IF EXISTS {database}.{quote(name)} CASCADE",
+            )
         cursor.execute(
             f"SELECT database_name, {_stale('database_name')} FROM duckdb_databases()"
         )
         for name, stale in cursor.fetchall():
-            if name != catalog and leftover(name, stale):
-                cursor.execute(f"DROP DATABASE IF EXISTS {quote(name)}")
+            if name != catalog:
+                drop(cursor, name, stale, f"DROP DATABASE IF EXISTS {quote(name)}")
 
     with connect() as c, c.cursor() as cursor:
         create = f"CREATE DATABASE IF NOT EXISTS {database}"
