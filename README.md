@@ -55,8 +55,9 @@ For a release build without test dependencies:
 
 The scripts copy the library to `build/libadbc_driver_motherduck.dylib` on
 macOS, `.so` on Linux, or `.dll` on Windows. The entry point inferred by ADBC
-driver managers is `AdbcDriverMotherduckInit`. The original PostgreSQL entry
-point and the generic `AdbcDriverInit` remain available.
+driver managers is `AdbcDriverMotherduckInit`, and the generic `AdbcDriverInit`
+forwards to it. The original PostgreSQL entry point `AdbcDriverPostgresqlInit`
+remains available and does not install the MotherDuck error-message redaction.
 
 For Foundry packaging, use the vcpkg toolchain through `CMAKE_TOOLCHAIN_FILE`,
 `VCPKG_ROOT`, or `VCPKG_INSTALLATION_ROOT`. The scripts choose static vcpkg

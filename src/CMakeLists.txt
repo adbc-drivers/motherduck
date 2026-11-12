@@ -34,6 +34,7 @@ add_library(adbc_driver_motherduck_impl STATIC
             motherduck/motherduck_factory.cc
             motherduck/motherduck_get_objects.cc
             motherduck/motherduck_pipeline.cc
+            motherduck/motherduck_redact.cc
             motherduck/motherduck_statement.cc
             motherduck/motherduck_type_resolver.cc)
 target_include_directories(adbc_driver_motherduck_impl
