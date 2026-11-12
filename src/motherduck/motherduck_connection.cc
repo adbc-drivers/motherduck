@@ -87,8 +87,9 @@ AdbcStatusCode SetMotherduckSearchPath(PGconn* conn, std::string_view schema,
   }
   // Keeps the server's SQLSTATE and details, and classifies the status.
   adbc::driver::Status status =
-      MakeStatus(result, "[motherduck] Failed to set {}={}: {}", option,
-                 std::string(schema), PQerrorMessage(conn));
+      MakeStatus(result, "[motherduck] Failed to set {}={}: {}", RedactedText(option),
+                 // An identifier the caller chose, not SQL or server text.
+                 RedactedText(std::string(schema)), PqErrorText(result, conn));
   PQclear(result);
   return status.ToAdbc(error);
 }
