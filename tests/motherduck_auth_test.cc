@@ -184,6 +184,7 @@ class LoginTest : public ::testing::Test {
       sleeps_.push_back(duration);
       now_ += duration;
     };
+    options_.client_id = adbcpq::auth::kDefaultClientId;
     options_.auth_origin = "https://auth.test";
     options_.api_origin = "https://api.test";
   }
@@ -399,6 +400,17 @@ TEST_F(LoginTest, LookupPgEndpointRejected) {
       adbcpq::auth::LookupPgEndpoint(env_, options_, "md-token", &endpoint);
   EXPECT_EQ(Code(status), ADBC_STATUS_UNAUTHENTICATED);
   EXPECT_THAT(status.message(), HasSubstr("Invalid token"));
+}
+
+TEST_F(LoginTest, LookupPgEndpointNotFound) {
+  http_->Respond(kLookupUserWithTokenUrl, 404,
+                 R"({"errMessage":"Route not found: GET /mom/lookup-user-with-token",)"
+                 R"("mdFriendlyStatusCode":"NOT_FOUND"})");
+  std::string endpoint;
+  const Status status =
+      adbcpq::auth::LookupPgEndpoint(env_, options_, "md-token", &endpoint);
+  EXPECT_EQ(Code(status), ADBC_STATUS_IO);
+  EXPECT_THAT(status.message(), HasSubstr("Route not found"));
 }
 
 TEST_F(LoginTest, LookupPgEndpointFails) {
@@ -639,6 +651,19 @@ TEST_F(TokenCacheTest, RejectKeepsTokenTheApiAccepts) {
   EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), "saved-token");
   ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
   EXPECT_EQ(credentials.token, "saved-token");
+  EXPECT_EQ(http_->Count(kDeviceCodeUrl), 0);
+}
+
+TEST_F(TokenCacheTest, KeepsTokenWhenHostLookupNotFound) {
+  ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "saved-token").ok());
+  http_->Respond(kLookupUserWithTokenUrl, 404,
+                 R"({"errMessage":"User not found","mdFriendlyStatusCode":"NOT_FOUND"})");
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/true, &credentials)), ADBC_STATUS_IO);
+  EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), "saved-token");
+  EXPECT_FALSE(cache.Reject("saved-token"));
+  EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), "saved-token");
   EXPECT_EQ(http_->Count(kDeviceCodeUrl), 0);
 }
 

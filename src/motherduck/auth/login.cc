@@ -74,8 +74,6 @@ std::string Reason(const JsonObject& body, long status) {
   return fmt::format("HTTP {}", status);
 }
 
-bool IsRejection(long status) { return status == 401 || status == 403 || status == 404; }
-
 seconds Clamp(std::optional<int64_t> value, seconds fallback, seconds max) {
   if (!value || *value <= 0) return fallback;
   return seconds(std::min<int64_t>(*value, max.count()));
@@ -151,7 +149,10 @@ Status ExchangeIdToken(const LoginEnvironment& env, const LoginOptions& options,
           return Status::Ok();
         }
         last_error = "the response has no token";
-      } else if (IsRejection(response.status)) {
+      } else if (response.status == 401 || response.status == 403 ||
+                 response.status == 404) {
+        // Here 404 means there's no account for this login, or the selected
+        // organization is gone, which retrying doesn't change.
         std::string reason = Reason(body, response.status);
         if (auto method = body.GetString("requiredAlternateLoginMethodDisplayName");
             method && !method->empty()) {
@@ -307,7 +308,10 @@ Status LookupPgEndpoint(const LoginEnvironment& env, const LoginOptions& options
   UNWRAP_STATUS(env.http->Get(options.api_origin + "/mom/lookup-user-with-token", token,
                               &response));
   const JsonObject body = JsonObject::Parse(response.body);
-  if (IsRejection(response.status)) {
+  // Only an authentication failure rejects the token. A 404 (a deleted user, or
+  // a wrong motherduck_host) isn't fixed by logging in again, which would also
+  // delete the token the MotherDuck CLI and dbt-motherduck share.
+  if (response.status == 401 || response.status == 403) {
     return Status(
         ADBC_STATUS_UNAUTHENTICATED,
         "[motherduck] MotherDuck rejected the token: " + Reason(body, response.status));

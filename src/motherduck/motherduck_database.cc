@@ -261,6 +261,7 @@ AdbcStatusCode MotherduckDatabase::Init(struct AdbcError* error) {
   if (auth_type_ == kAuthTypeBrowser) {
     auth::LoginOptions options;
     options.client_id = oauth_client_id_;
+    options.auth_origin = auth::kAuthOrigin;
     options.api_origin = auth::ApiOrigin();
     options.timeout = std::chrono::seconds(login_timeout_seconds_);
     token_cache_ = std::make_unique<auth::TokenCache>(

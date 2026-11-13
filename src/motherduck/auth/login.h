@@ -30,6 +30,9 @@ using adbc::driver::Status;
 ///   for SSO and for MotherDuck's sign-up and organization prompts.
 inline constexpr std::string_view kDefaultClientId = "Jmv3p1mAqA0WG0aunWVBtQ2jFTPuHsGU";
 
+/// \brief MotherDuck's Auth0 tenant, shared by production and staging.
+inline constexpr std::string_view kAuthOrigin = "https://auth.motherduck.com";
+
 /// \brief The effects of logging in, replaceable in tests.
 struct LoginEnvironment {
   std::shared_ptr<HttpClient> http;
@@ -47,11 +50,14 @@ struct LoginEnvironment {
 LoginEnvironment DefaultLoginEnvironment(std::string ca_bundle);
 
 struct LoginOptions {
-  std::string client_id{kDefaultClientId};
-  std::string auth_origin = "https://auth.motherduck.com";
-  std::string api_origin = "https://api.motherduck.com";
+  /// \brief The Auth0 application to log in through, such as kDefaultClientId.
+  std::string client_id;
+  /// \brief The Auth0 origin, such as kAuthOrigin.
+  std::string auth_origin;
+  /// \brief The MotherDuck API origin, such as ApiOrigin().
+  std::string api_origin;
   /// \brief How long to wait for the user; zero waits until the login code expires.
-  std::chrono::seconds timeout{0};
+  std::chrono::seconds timeout{};
 };
 
 /// \brief The MotherDuck API origin: https://api.motherduck.com, or the host in
@@ -75,7 +81,8 @@ Status DeviceLogin(const LoginEnvironment& env, const LoginOptions& options,
 
 /// \brief Look up the Postgres endpoint host of a MotherDuck token's organization.
 ///
-/// Returns UNAUTHENTICATED if MotherDuck rejects the token.
+/// Returns UNAUTHENTICATED if MotherDuck rejects the token (401 or 403). Other
+/// failures, including 404, return IO.
 Status LookupPgEndpoint(const LoginEnvironment& env, const LoginOptions& options,
                         const std::string& token, std::string* pg_endpoint);
 
