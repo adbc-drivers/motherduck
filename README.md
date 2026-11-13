@@ -31,54 +31,77 @@
 
 # ADBC Driver for MotherDuck
 
-A C++ ADBC driver for MotherDuck's PostgreSQL protocol endpoint, forked from
-Apache Arrow ADBC's libpq-based PostgreSQL driver. This is the initial fork;
-MotherDuck-specific protocol and authentication changes remain to be implemented.
-The upstream PostgreSQL driver's approach credits [pgeon](https://github.com/0x0L/pgeon).
+An [ADBC](https://arrow.apache.org/adbc/) driver for
+[MotherDuck](https://motherduck.com), implemented in C++. It connects through
+MotherDuck's PostgreSQL protocol endpoint and is forked from Apache Arrow ADBC's
+libpq-based PostgreSQL driver. The upstream PostgreSQL driver's approach credits
+[pgeon](https://github.com/0x0L/pgeon).
 
-## Build
+> [!IMPORTANT]
+> This driver is **not** a drop-in replacement for the ADBC PostgreSQL driver,
+> although it is built from it and talks to MotherDuck's PostgreSQL protocol
+> endpoint. It is a separate driver with its own name and entry point, it only
+> works with MotherDuck, and some of the PostgreSQL driver's options and
+> features behave differently or don't work. See
+> [Differences from the PostgreSQL driver](#differences-from-the-postgresql-driver).
 
-Requires CMake 3.24+, a C++20 compiler, and libpq 15 or newer. The driver bundles the Apache common/framework code, nanoarrow,
-fmt, portable-snippets, and boost.int128 it needs. Test builds also require
-GoogleTest/GoogleMock; CMake downloads GoogleTest 1.15.2 if it is not installed.
+## Installation
 
-For a native development build, set `PostgreSQL_ROOT` or `CMAKE_PREFIX_PATH`
-if CMake cannot find libpq, then run:
-
-```sh
-./ci/scripts/build.sh test macos arm64
-./ci/scripts/test.sh macos arm64
-```
-
-Use `linux` or `windows` and `amd64` or `arm64` as appropriate. With Homebrew,
-for example, set `PostgreSQL_ROOT="$(brew --prefix libpq)"` after installing
-`libpq`. An existing Homebrew PostgreSQL installation also supplies libpq.
-
-For a release build without test dependencies:
+Released builds are published for various platforms on the
+[Columnar](https://columnar.tech) CDN. They can be installed by any tool that
+supports [ADBC](https://arrow.apache.org/adbc/) Driver Manifests, such as
+[dbc](https://columnar.tech/dbc):
 
 ```sh
-./ci/scripts/build.sh release macos arm64
+dbc install motherduck --pre
 ```
 
-The scripts copy the library to `build/libadbc_driver_motherduck.dylib` on
-macOS, `.so` on Linux, or `.dll` on Windows. The entry point inferred by ADBC
-driver managers is `AdbcDriverMotherduckInit`, and the generic `AdbcDriverInit`
-forwards to it. The original PostgreSQL entry point `AdbcDriverPostgresqlInit`
-remains available and does not install the MotherDuck error-message redaction.
+> **Note:** The driver hasn't been published to the Columnar registry yet, so
+> this command won't find it until the first release.
 
-For Foundry packaging, use the vcpkg toolchain through `CMAKE_TOOLCHAIN_FILE`,
-`VCPKG_ROOT`, or `VCPKG_INSTALLATION_ROOT`. The scripts choose static vcpkg
-triplets, including a static runtime on Windows. A native build with a system
-libpq is suitable for local development and retains that runtime dependency.
+Until then, or if you would rather build the driver yourself, see
+[Building](#building).
 
-Direct CMake builds are also supported:
+## Connecting
+
+The driver uses your MotherDuck token as the password. Export it, then give the
+database to connect to and your account's region (find yours with
+`md_user_info()`):
 
 ```sh
-cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/debug --parallel
-ctest --test-dir build/debug --output-on-failure
-cmake --install build/debug --prefix build/install
+export MOTHERDUCK_TOKEN=...
+pip install adbc-driver-manager pyarrow
 ```
+
+```python
+from adbc_driver_manager import dbapi
+
+with dbapi.connect(
+    driver="motherduck",
+    db_kwargs={
+        "uri": "postgresql:///my_db",
+        "adbc.motherduck.region": "us-east-1",
+    },
+) as conn:
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT 42")
+        print(cursor.fetch_arrow_table())
+```
+
+The region sets the host, so the URI can leave it out: `us-east-1` connects to
+`pg.us-east-1-aws.motherduck.com`. Without the option, put the host in the URI,
+as in `postgresql://pg.us-east-1-aws.motherduck.com/my_db`. To use a driver you
+built yourself, pass the path to the library as `driver`, such as
+`build/libadbc_driver_motherduck.dylib`.
+
+The URI is a libpq connection URI (`postgresql://[user[:password]@][host][:port]/database[?parameters]`).
+See [Options](#options) for everything else you can set, including how the
+driver finds the token.
+
+The entry point inferred by ADBC driver managers is `AdbcDriverMotherduckInit`,
+and the generic `AdbcDriverInit` forwards to it. The original PostgreSQL entry
+point `AdbcDriverPostgresqlInit` remains available and does not install the
+MotherDuck error-message redaction.
 
 ## Options
 
@@ -216,6 +239,31 @@ replaces any `options` a service file sets, doesn't default `sslmode` or
 `sslrootcert` when one is named, and can't combine one with a `region`. Put
 connection settings in the URI instead.
 
+## Differences from the PostgreSQL driver
+
+Code written for the ADBC PostgreSQL driver (`adbc_driver_postgresql`) needs
+changes to use this driver, and settings for this driver mean nothing to the
+PostgreSQL driver:
+
+- **A separate driver.** Load `motherduck`, not `postgresql`. The entry point is
+  `AdbcDriverMotherduckInit`, not `AdbcDriverPostgresqlInit`.
+- **MotherDuck only.** The driver connects only to MotherDuck's PostgreSQL
+  endpoint. Plain PostgreSQL servers aren't supported, because every connection
+  sets `attach_mode`.
+- **Connection settings.** The MotherDuck token is the password, and the user
+  defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
+  and connection service files are never used, and `sslmode` defaults to
+  `require`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
+- **Options that differ.** `adbc.postgresql.use_copy` defaults to `false`, and
+  setting it to `true` fails. `adbc.postgresql.type_resolver_mode` is accepted
+  and ignored. `adbc.connection.db_schema` names a schema, not an arbitrary
+  `search_path`; use `USE <database>` to change databases.
+- **Results and errors.** DML and DDL return an empty stream, and `rows_affected`
+  for `UPDATE` and `DELETE` is the number of rows changed. Data conversion
+  errors map to `INTERNAL` instead of `INVALID_DATA`.
+- **Missing features.** Bulk ingest, COPY result reads, statistics, and others
+  don't work; see the list below.
+
 ## Unsupported PostgreSQL driver features
 
 These upstream PostgreSQL driver features don't work against MotherDuck's
@@ -252,154 +300,22 @@ to fail.
 - **Errors:** data conversion errors map to `INTERNAL` instead of
   `INVALID_DATA` (#32).
 
-## Inherited tests
+## Building
 
-The complete upstream C++ test suites are compiled in test builds. The
-integration tests and the Python validation suite run against MotherDuck's
-Postgres endpoint; plain PostgreSQL isn't supported, because every connection
-sets `attach_mode`. Linux test builds enable the integration tests by default,
-and macOS and Windows run only server-independent tests unless you set
-`MOTHERDUCK_TEST_POSTGRESQL=ON` when building.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-To run them locally, export a MotherDuck token and let `ci/scripts/pre-test.sh`
-write the connection settings to `.env.override` (it needs `pixi install` for
-its CA bundle):
+## Contributing
 
-```sh
-export MOTHERDUCK_TOKEN=...
-./ci/scripts/pre-test.sh macos arm64
-set -a
-source .env.override
-set +a
-MOTHERDUCK_TEST_POSTGRESQL=ON ./ci/scripts/build.sh test macos arm64
-./ci/scripts/test.sh macos arm64
-pixi run validate
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md). For how the driver is put together and
+how it relates to the upstream PostgreSQL driver, see
+[docs/DESIGN.md](docs/DESIGN.md).
 
-Runs share one database, `adbc_driver_tests`, which the tests create if it's
-missing and never drop. Each test process gets its own schema in it,
-`adbc_test_<start time>_<pid>_<run>`, where `<run>` is the
-`MOTHERDUCK_TEST_RUN` that `ci/scripts/pre-test.sh` writes (the GitHub run,
-attempt and job in CI, or `local_<pid>`, followed by the platform and arch). The
-start time and process ID keep runs apart even when they source the same
-`.env.override`. Every test connection starts in the schema through
-`adbc.motherduck.db_schema`. Tests that need more schemas or databases name
-them after it, and the tests drop all of them when they finish, so concurrent
-jobs and runs don't share tables. Each run also drops any schema or database
-named `adbc_test_<time>_<pid>_...` (or `adbc_<time>_..._<platform>_<arch>`, as
-an earlier version of the tests named them) with a time a day or more ago,
-which an interrupted run left behind; only names of those shapes are dropped
-(`IsStaleTestName` in `tests/postgresql_test.cc`, mirrored in
-`validation/tests/naming.py`, with tests for both). Databases the old
-database-per-run setup left, `adbc_ci_<run>_...`, carry no time, so they can't
-be told from a live run's and have to be dropped by hand. A database
-per run would scale worse: each interrupted run would leave a database and its
-retained storage behind, and every workspace-mode connection in the account
-attaches every database.
+## License
 
-Set `MOTHERDUCK_TEST_DATABASE` to use another database. The tests treat it like
-`adbc_driver_tests`: they create it if it's missing, create and drop their
-schemas in it, and sweep stale test-named schemas from it and test-named
-databases from the account. So the token needs to be able to create databases
-and schemas, and a read-only or shared database won't work.
-`MOTHERDUCK_PG_HOST` overrides the default host
-(`pg.us-east-1-aws.motherduck.com`). Test connections use the driver's default
-`attach_mode=single`, so other databases in the account stay out of catalog
-queries.
-
-CI does the same, using the `MOTHERDUCK_TOKEN` secret from the `test` GitHub
-environment.
-
-The validation suite's quirks in `validation/tests/postgresql.py` describe
-MotherDuck: its catalog, the run's schema, no temporary tables, and the vendor
-name `MotherDuck`. The driver still reports itself as PostgreSQL (#15), so the
-vendor check fails until that's fixed. Published validation documentation will
-be configured separately.
-
-## Code layout
-
-The upstream driver's sources in `src/postgres/` are kept as close to
-Apache's as possible, so upstream fixes merge cleanly. MotherDuck behavior
-lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
-
-- `motherduck_database`: `MotherduckDatabase`, which adds `attach_mode`,
-  `session_name`, `region`, and the token and user handling described under
-  Options, defaults `adbc.postgresql.use_copy` to `false`, ignores
-  `adbc.postgresql.type_resolver_mode`, uses the built-in type table
-  instead of reading the server's, and reports the MotherDuck driver name and
-  version.
-- `motherduck_connection`: `MotherduckConnection`, which leaves the vendor
-  version out of `GetInfo` rather than report the endpoint's PostgreSQL
-  `server_version_num`, describes `SELECT * FROM` the table for
-  `GetTableSchema`, reports only `table` and `view` table types, and rejects
-  the statistics calls.
-- `motherduck_get_objects`: the `GetObjects` helper, which reads DuckDB's
-  `duckdb_*()` metadata functions for every attached database, one query per
-  level, with case-insensitive filters.
-- `motherduck_error`: `ClassifyServerError`, which classifies the endpoint's
-  missing-object errors as `NOT_FOUND` although they arrive with the generic
-  SQLSTATE `XXUUU`.
-- `motherduck_statement`: `MotherduckStatement`, which accepts the result sets
-  MotherDuck returns for DDL, and `MotherduckResultReader`, which runs queries
-  without a result through a pipeline. Both cast parameters to their bound
-  types when the endpoint can't prepare a query without them.
-- `motherduck_pipeline`: pipelined execution, splitting multi-statement
-  queries, and casting a query's parameters.
-- `motherduck_type_resolver`: DuckDB-only type OIDs.
-- `motherduck_trust_store`: finding the OS's trusted CA certificates for
-  libpq, which can't read them itself.
-- `motherduck_factory`: the subclasses `postgresql.cc` creates.
-- `motherduck.cc`: the `AdbcDriverMotherduckInit` entry point.
-
-The upstream files still differ from Apache's in these ways:
-
-- Every file starts with the modification notice described below, and
-  includes use paths relative to `src/postgres/`.
-- Hooks for the subclasses: `virtual` methods and `protected` members in
-  `PostgresDatabase`, `PostgresConnection`, `PostgresStatement`, and
-  `PqResultArrayReader`; `MakeGetObjectsHelper()`, which lets a subclass
-  supply the `GetObjects` helper; `ClassifyServerError()`, which `MakeStatus`
-  calls and `motherduck_error.cc` defines;
-  `DriverName()` and `DriverVersion()`, which `GetInfo` reports; and the
-  factory calls in `postgresql.cc`.
-- `BindStream::SerializeCurrentRow()` is split out of
-  `BindAndExecuteCurrentRow()` so rows can also be sent in a pipeline.
-- A failed bound row rolls back the transaction begun to set the time zone
-  (`BindStream::Abort()`); upstream leaves it open. This is a candidate to
-  contribute upstream, as is the `SerializeCurrentRow()` split.
-
-When merging from upstream, keep these differences and put new MotherDuck
-behavior in `src/motherduck/`. MotherDuck's own tests are in
-`tests/motherduck_*_test.cc`; upstream tests that don't apply are skipped
-through `MOTHERDUCK_SKIPPED_UPSTREAM_TESTS` in `tests/CMakeLists.txt`.
-
-## Upstream history and licensing
-
-The fork was extracted from `apache/arrow-adbc` at
-`b519e662f9e368c9dfbef313d0914b6afe50fe37` (2026-10-26), retaining 373 commits
-for the driver and its bundled Apache dependencies. The original driver
-history begins with the libpq implementation on 2022-08-26. Historical paths
-`c/drivers/postgres/`, `c/driver/postgres/`, and `c/driver/postgresql/` are all
-included. The extraction puts driver sources in `src/` (since moved to
-`src/postgres/`), C++ tests in `tests/`, and shared Apache code in
-`third_party/arrow-adbc/`.
-
-To reproduce the extraction in a fresh, full-history clone of Apache Arrow ADBC
-checked out at that commit, use this repository's `ci/upstream-paths.txt`:
-
-```sh
-git filter-repo --paths-from-file /path/to/motherduck/ci/upstream-paths.txt \
-  --preserve-commit-hashes --preserve-commit-encoding
-```
-
-Filtering changes commit IDs. Authors, committers, dates, and commit messages
-are preserved. The retained commits are mapped in
-[`ci/upstream-commit-map.txt`](ci/upstream-commit-map.txt); the full map, including
-pruned commits, is retained locally at `.git/filter-repo/commit-map`.
-
-Imported ASF headers retain their original text, preceded by a 2026 ADBC
-Drivers Contributors copyright and modification notice. Other bundled
-third-party notices remain intact. See `LICENSE.txt` and `NOTICE.txt`.
+The driver is licensed under the Apache License 2.0; see `LICENSE.txt` and
+`NOTICE.txt`. Imported ASF headers retain their original text, preceded by a
+2026 ADBC Drivers Contributors copyright and modification notice. Other bundled
+third-party notices remain intact.
 
 The MotherDuck name and logos (`docs/images/motherduck-logo*.svg`) are
 trademarks of MotherDuck, Inc. They are not licensed under the Apache License;
