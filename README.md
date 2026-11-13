@@ -383,3 +383,8 @@ pruned commits, is retained locally at `.git/filter-repo/commit-map`.
 Imported ASF headers retain their original text, preceded by a 2026 ADBC
 Drivers Contributors copyright and modification notice. Other bundled
 third-party notices remain intact. See `LICENSE.txt` and `NOTICE.txt`.
+
+The MotherDuck name and logos (`docs/images/motherduck-logo*.svg`) are
+trademarks of MotherDuck, Inc. They are not licensed under the Apache License;
+that license grants no trademark rights (section 6). Use them only to identify
+MotherDuck, not to imply endorsement of a fork or derived work.
