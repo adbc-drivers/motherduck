@@ -43,7 +43,7 @@ Policy](https://github.com/adbc-drivers/motherduck?tab=security-ov-file#readme).
 - **`src/postgres/` is the upstream PostgreSQL driver**, kept as close to
   Apache Arrow ADBC's as possible so upstream fixes merge cleanly. Change it
   only to add a hook the MotherDuck subclasses need, and keep the change small.
-  See [Code layout](README.md#code-layout) for the differences the fork already
+  See [Code layout](docs/DESIGN.md#code-layout) for the differences the fork already
   has. A fix that isn't specific to MotherDuck's endpoint may belong in
   [Apache Arrow ADBC](https://github.com/apache/arrow-adbc) instead.
 - **`third_party/`** holds vendored code. Don't edit it here.
@@ -56,18 +56,44 @@ update bundled third-party code, update `NOTICE.txt` and `LICENSE.txt` to match.
 
 ### Build
 
-You need CMake 3.24+, a C++20 compiler, and libpq 15 or newer. Build the
-driver by passing the configuration, platform, and architecture to the CI build
-script:
+Requires CMake 3.24+, a C++20 compiler, and libpq 15 or newer. The driver bundles the Apache common/framework code, nanoarrow,
+fmt, portable-snippets, and boost.int128 it needs. Test builds also require
+GoogleTest/GoogleMock; CMake downloads GoogleTest 1.15.2 if it is not installed.
 
-```bash
-./ci/scripts/build.sh [test|release] [linux|windows|macos] [amd64|arm64]
+For a native development build, set `PostgreSQL_ROOT` or `CMAKE_PREFIX_PATH`
+if CMake cannot find libpq, then run:
+
+```sh
+./ci/scripts/build.sh test macos arm64
+./ci/scripts/test.sh macos arm64
 ```
 
-The [README's Build section](README.md#build) explains how to point CMake at
-libpq, the vcpkg toolchain used for packaging, and direct CMake builds. The
-script builds under `build/ci-<config>-<platform>-<arch>` and copies the driver
-library to `build/libadbc_driver_motherduck.{so,dylib,dll}`.
+Use `linux` or `windows` and `amd64` or `arm64` as appropriate. With Homebrew,
+for example, set `PostgreSQL_ROOT="$(brew --prefix libpq)"` after installing
+`libpq`. An existing Homebrew PostgreSQL installation also supplies libpq.
+
+For a release build without test dependencies:
+
+```sh
+./ci/scripts/build.sh release macos arm64
+```
+
+The scripts copy the library to `build/libadbc_driver_motherduck.dylib` on
+macOS, `.so` on Linux, or `.dll` on Windows.
+
+For Foundry packaging, use the vcpkg toolchain through `CMAKE_TOOLCHAIN_FILE`,
+`VCPKG_ROOT`, or `VCPKG_INSTALLATION_ROOT`. The scripts choose static vcpkg
+triplets, including a static runtime on Windows. A native build with a system
+libpq is suitable for local development and retains that runtime dependency.
+
+Direct CMake builds are also supported:
+
+```sh
+cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/debug --parallel
+ctest --test-dir build/debug --output-on-failure
+cmake --install build/debug --prefix build/install
+```
 
 ### Test
 
@@ -83,7 +109,7 @@ MotherDuck account, since plain PostgreSQL isn't supported. Before opening a
 pull request that changes driver behavior, run them against MotherDuck
 yourself rather than relying on CI. The commands below need
 [pixi](https://pixi.prefix.dev/latest/) (`pixi install`); see
-[Inherited tests](README.md#inherited-tests) for the details:
+[Inherited Tests and Test Isolation](#inherited-tests-and-test-isolation) for the details:
 
 ```bash
 export MOTHERDUCK_TOKEN=...
@@ -114,6 +140,55 @@ $ pixi run gendocs --output generated/
 ```
 
 Then look at `./generated/motherduck.md`.
+
+### Inherited Tests and Test Isolation
+
+The complete upstream C++ test suites are compiled in test builds. The
+integration tests and the Python validation suite run against MotherDuck's
+Postgres endpoint; plain PostgreSQL isn't supported, because every connection
+sets `attach_mode`. Linux test builds enable the integration tests by default,
+and macOS and Windows run only server-independent tests unless you set
+`MOTHERDUCK_TEST_POSTGRESQL=ON` when building.
+
+Runs share one database, `adbc_driver_tests`, which the tests create if it's
+missing and never drop. Each test process gets its own schema in it,
+`adbc_test_<start time>_<pid>_<run>`, where `<run>` is the
+`MOTHERDUCK_TEST_RUN` that `ci/scripts/pre-test.sh` writes (the GitHub run,
+attempt and job in CI, or `local_<pid>`, followed by the platform and arch). The
+start time and process ID keep runs apart even when they source the same
+`.env.override`. Every test connection starts in the schema through
+`adbc.motherduck.db_schema`. Tests that need more schemas or databases name
+them after it, and the tests drop all of them when they finish, so concurrent
+jobs and runs don't share tables. Each run also drops any schema or database
+named `adbc_test_<time>_<pid>_...` (or `adbc_<time>_..._<platform>_<arch>`, as
+an earlier version of the tests named them) with a time a day or more ago,
+which an interrupted run left behind; only names of those shapes are dropped
+(`IsStaleTestName` in `tests/postgresql_test.cc`, mirrored in
+`validation/tests/naming.py`, with tests for both). Databases the old
+database-per-run setup left, `adbc_ci_<run>_...`, carry no time, so they can't
+be told from a live run's and have to be dropped by hand. A database
+per run would scale worse: each interrupted run would leave a database and its
+retained storage behind, and every workspace-mode connection in the account
+attaches every database.
+
+Set `MOTHERDUCK_TEST_DATABASE` to use another database. The tests treat it like
+`adbc_driver_tests`: they create it if it's missing, create and drop their
+schemas in it, and sweep stale test-named schemas from it and test-named
+databases from the account. So the token needs to be able to create databases
+and schemas, and a read-only or shared database won't work.
+`MOTHERDUCK_PG_HOST` overrides the default host
+(`pg.us-east-1-aws.motherduck.com`). Test connections use the driver's default
+`attach_mode=single`, so other databases in the account stay out of catalog
+queries.
+
+CI does the same, using the `MOTHERDUCK_TOKEN` secret from the `test` GitHub
+environment.
+
+The validation suite's quirks in `validation/tests/postgresql.py` describe
+MotherDuck: its catalog, the run's schema, no temporary tables, and the vendor
+name `MotherDuck`. The driver still reports itself as PostgreSQL (#15), so the
+vendor check fails until that's fixed. Published validation documentation will
+be configured separately.
 
 ## Opening a Pull Request
 
