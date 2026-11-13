@@ -303,7 +303,7 @@ struct BindStream {
     if (pg_status != PGRES_COMMAND_OK && pg_status != PGRES_TUPLES_OK) {
       Status status =
           MakeStatus(result, "[libpq] Failed to execute prepared statement: {} {}",
-                     PQresStatus(pg_status), PQerrorMessage(pg_conn));
+                     PqStatusName(pg_status), PqErrorText(result, pg_conn));
       PQclear(result);
       return status;
     }
@@ -355,9 +355,8 @@ struct BindStream {
       if (PQputCopyEnd(pg_conn, "ADBC bulk ingest failed") <= 0) {
         // The connection is still in COPY_IN; say so rather than hiding it
         // behind a confusing error on the next statement.
-        return Status::IO(write_status.message(),
-                          " (additionally, failed to end COPY: ", PQerrorMessage(pg_conn),
-                          ")");
+        return Status::IO(write_status.message(), " (additionally, failed to end COPY: ",
+                          PqErrorText(nullptr, pg_conn), ")");
       }
       while (PGresult* result = PQgetResult(pg_conn)) PQclear(result);
       return write_status;
@@ -365,7 +364,7 @@ struct BindStream {
 
     if (PQputCopyEnd(pg_conn, NULL) <= 0) {
       return Status::IO("Error message returned by PQputCopyEnd: ",
-                        PQerrorMessage(pg_conn));
+                        PqErrorText(nullptr, pg_conn));
     }
 
     PGresult* result = PQgetResult(pg_conn);
@@ -373,7 +372,7 @@ struct BindStream {
     if (pg_status != PGRES_COMMAND_OK) {
       Status status =
           MakeStatus(result, "[libpq] Failed to execute COPY statement: {} {}",
-                     PQresStatus(pg_status), PQerrorMessage(pg_conn));
+                     PqStatusName(pg_status), PqErrorText(result, pg_conn));
       PQclear(result);
       return status;
     }
@@ -408,9 +407,9 @@ struct BindStream {
 
       // check if not ENODATA at exit
       if (write_result != ENODATA) {
-        return Status::IO("Error occurred writing COPY data: ",
-                          na_error.message[0] != '\0' ? na_error.message
-                                                      : std::strerror(write_result));
+        return Status::IO(
+            "Error occurred writing COPY data: ",
+            na_error.message[0] != '\0' ? na_error.message : std::strerror(write_result));
       }
 
       UNWRAP_STATUS(FlushCopyWriterToConn(pg_conn, writer));
@@ -437,7 +436,8 @@ struct BindStream {
     while (remaining > 0) {
       int64_t to_write = std::min<int64_t>(remaining, kMaxCopyBufferSize);
       if (PQputCopyData(pg_conn, data, to_write) <= 0) {
-        return Status::IO("Error writing tuple field data: ", PQerrorMessage(pg_conn));
+        return Status::IO("Error writing tuple field data: ",
+                          PqErrorText(nullptr, pg_conn));
       }
       remaining -= to_write;
       data += to_write;

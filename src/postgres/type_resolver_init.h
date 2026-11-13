@@ -42,11 +42,14 @@ adbc::driver::Status InitializeTypeResolver(PostgresTypeResolver& resolver);
 }  // namespace adbcpq
 
 // exposed for testing
+//
+// Not ADBC_EXPORT: tests link adbc_driver_motherduck_impl statically. This file
+// is compiled without ADBC_EXPORTING, so on MSVC ADBC_EXPORT would mean
+// dllimport. Defining a dllimport function makes MSVC export it from the DLL
+// (C4273). The test binaries would then get each symbol twice (LNK2005).
 
-ADBC_EXPORT
 adbc::driver::Status InternalAdbcRebuildTypeResolver(
     PGconn* conn, adbcpq::PostgresTypeResolver& resolver);
 
-ADBC_EXPORT
 adbc::driver::Status InternalAdbcInitializeTypeResolver(
     adbcpq::PostgresTypeResolver& resolver);

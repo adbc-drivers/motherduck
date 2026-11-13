@@ -41,8 +41,11 @@ add_library(adbc_validation STATIC
             ${ADBC_UPSTREAM_C}/validation/adbc_validation_statement.cc
             ${ADBC_UPSTREAM_C}/validation/adbc_validation_util.cc)
 # The validation helpers call the ADBC API, which the driver library provides.
-target_link_libraries(adbc_validation PUBLIC adbc_driver_common adbc_driver_motherduck
-                                             GTest::gmock)
+# It's the static driver, so every test linking adbc_validation also gets the
+# driver internals from that one copy. Only motherduck_driver_test links the
+# shared library.
+target_link_libraries(adbc_validation PUBLIC adbc_driver_common
+                                             adbc_driver_motherduck_static GTest::gmock)
 
 add_executable(motherduck_common_test ${ADBC_UPSTREAM_C}/driver/common/utils_test.cc)
 target_link_libraries(motherduck_common_test PRIVATE adbc_driver_common GTest::gmock_main)
@@ -62,24 +65,22 @@ target_link_libraries(motherduck_driver_test PRIVATE adbc_driver_motherduck
 # configured. The default test run exercises their server-independent cases.
 add_executable(motherduck_unit_test motherduck_connection_test.cc motherduck_database_test.cc
                                     motherduck_error_test.cc motherduck_pipeline_test.cc
-                                    motherduck_statement_test.cc)
+                                    motherduck_redact_test.cc motherduck_statement_test.cc)
 target_link_libraries(motherduck_unit_test
-                      PRIVATE adbc_driver_motherduck adbc_driver_motherduck_impl
-                              adbc_validation GTest::gmock_main)
+                      PRIVATE adbc_validation GTest::gmock_main)
 gtest_discover_tests(motherduck_unit_test TEST_PREFIX motherduck.)
 
 # The upstream PostgreSQL driver's tests, retargeted at MotherDuck
 add_executable(motherduck_postgresql_test error_test.cc postgres_type_test.cc
                                           postgresql_test.cc)
 target_link_libraries(motherduck_postgresql_test
-                      PRIVATE adbc_driver_motherduck adbc_driver_motherduck_impl
-                              adbc_validation GTest::gmock_main)
+                      PRIVATE adbc_validation GTest::gmock_main)
 target_compile_definitions(motherduck_postgresql_test
                            PRIVATE ADBC_POSTGRESQL_TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/testdata"
 )
 add_test(NAME postgresql_unit
          COMMAND motherduck_postgresql_test
-                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:-${MOTHERDUCK_SKIPPED_UPSTREAM_TESTS}
+                 --gtest_filter=PostgresErrorTest.*:PostgresTypeTest.*:PostgresConnectionUnitTest.*:PostgresStatementUnitTest.*:-${MOTHERDUCK_SKIPPED_UPSTREAM_TESTS}
 )
 # Keep the server-independent run from creating a MotherDuck test database.
 set_tests_properties(postgresql_unit
@@ -89,8 +90,7 @@ set_tests_properties(postgresql_unit
 add_executable(motherduck_copy_test copy/postgres_copy_reader_test.cc
                                     copy/postgres_copy_writer_test.cc)
 target_link_libraries(motherduck_copy_test
-                      PRIVATE adbc_driver_motherduck adbc_driver_motherduck_impl
-                              adbc_validation GTest::gmock_main)
+                      PRIVATE adbc_validation GTest::gmock_main)
 add_test(NAME copy_unit COMMAND motherduck_copy_test)
 
 if(MOTHERDUCK_TEST_POSTGRESQL)
@@ -107,14 +107,11 @@ if(MOTHERDUCK_TEST_POSTGRESQL)
 endif()
 
 if(WIN32)
-  foreach(test_target motherduck_driver_test motherduck_unit_test
-                      motherduck_postgresql_test motherduck_copy_test)
-    add_custom_command(TARGET ${test_target}
-                       POST_BUILD
-                       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                               $<TARGET_FILE:adbc_driver_motherduck>
-                               $<TARGET_FILE_DIR:${test_target}>)
-  endforeach()
+  add_custom_command(TARGET motherduck_driver_test
+                     POST_BUILD
+                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                             $<TARGET_FILE:adbc_driver_motherduck>
+                             $<TARGET_FILE_DIR:motherduck_driver_test>)
 endif()
 
 gtest_discover_tests(motherduck_driver_test TEST_PREFIX driver.)

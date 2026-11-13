@@ -34,6 +34,7 @@ add_library(adbc_driver_motherduck_impl STATIC
             motherduck/motherduck_factory.cc
             motherduck/motherduck_get_objects.cc
             motherduck/motherduck_pipeline.cc
+            motherduck/motherduck_redact.cc
             motherduck/motherduck_statement.cc
             motherduck/motherduck_type_resolver.cc)
 target_include_directories(adbc_driver_motherduck_impl
@@ -46,6 +47,24 @@ target_link_libraries(adbc_driver_motherduck_impl PUBLIC adbc_driver_framework
 if(WIN32)
   target_link_libraries(adbc_driver_motherduck_impl PUBLIC wsock32 ws2_32)
 endif()
+if(MSVC)
+  # C4273 (inconsistent dll linkage) means a definition in this static library
+  # was declared ADBC_EXPORT, which MSVC silently exports from the DLL. Test
+  # binaries that also link this library then fail with LNK2005, so stop here.
+  target_compile_options(adbc_driver_motherduck_impl PRIVATE /we4273)
+endif()
+
+# The whole driver as one static library, for tests that need its internals.
+# Linking this instead of both the DLL and the impl library gives each test
+# binary a single copy of the driver. ADBC_EXPORT is empty so adbc.h doesn't
+# declare the Adbc* entry points dllimport for a static link.
+add_library(adbc_driver_motherduck_static STATIC postgres/postgresql.cc
+                                                 motherduck/motherduck.cc)
+target_link_libraries(adbc_driver_motherduck_static PUBLIC adbc_driver_motherduck_impl)
+target_include_directories(adbc_driver_motherduck_static
+                           PUBLIC ${PROJECT_SOURCE_DIR}/include
+                                  ${PROJECT_SOURCE_DIR}/third_party/arrow-adbc/include)
+target_compile_definitions(adbc_driver_motherduck_static PUBLIC "ADBC_EXPORT=")
 
 add_library(adbc_driver_motherduck SHARED postgres/postgresql.cc motherduck/motherduck.cc)
 target_link_libraries(adbc_driver_motherduck PRIVATE adbc_driver_motherduck_impl)

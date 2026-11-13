@@ -22,6 +22,8 @@
 
 #include "error.h"
 
+#include <atomic>
+#include <string>
 #include <string_view>
 
 #include <libpq-fe.h>
@@ -29,6 +31,50 @@
 #include "driver/common/utils.h"
 
 namespace adbcpq {
+
+namespace {
+std::atomic<TextRedactor> query_redactor{nullptr};
+std::atomic<TextRedactor> message_redactor{nullptr};
+}  // namespace
+
+void SetQueryRedactor(TextRedactor redactor) { query_redactor.store(redactor); }
+
+void SetMessageRedactor(TextRedactor redactor) { message_redactor.store(redactor); }
+
+namespace {
+
+// Cut to max_bytes, redact what is kept, and mark the cut.
+RedactedText TruncateAndRedact(std::string_view text, size_t max_bytes,
+                               TextRedactor redactor) {
+  bool truncated = false;
+  if (text.size() > max_bytes) {
+    size_t cut = max_bytes;
+    // Don't split a UTF-8 sequence.
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) cut--;
+    text = text.substr(0, cut);
+    truncated = true;
+  }
+  std::string out;
+  if (redactor != nullptr) {
+    out = redactor(text);
+  } else {
+    out = std::string(text);
+  }
+  if (truncated) out += "... [truncated]";
+  return RedactedText(std::move(out));
+}
+
+}  // namespace
+
+RedactedText RedactQuery(std::string_view query) {
+  return TruncateAndRedact(query, kMaxQueryBytes, query_redactor.load());
+}
+
+RedactedText RedactMessage(std::string_view message) {
+  TextRedactor redactor = message_redactor.load();
+  if (redactor == nullptr) redactor = query_redactor.load();
+  return TruncateAndRedact(message, kMaxMessageBytes, redactor);
+}
 
 AdbcStatusCode ClassifySqlState(const char* sqlstate) {
   if (!sqlstate) {
@@ -84,6 +130,27 @@ AdbcStatusCode ClassifySqlState(const char* sqlstate) {
   }
 
   return ADBC_STATUS_IO;
+}
+
+AdbcStatusCode EscapeIdentifier(PGconn* conn, std::string_view identifier,
+                                std::string* out, struct AdbcError* error) {
+  char* escaped = PQescapeIdentifier(conn, identifier.data(), identifier.size());
+  if (escaped == nullptr) {
+    // Keep the message bounded and free of embedded NULs, whatever the caller passed.
+    constexpr size_t kMaxShown = 64;
+    std::string shown(identifier.substr(0, kMaxShown));
+    shown.resize(std::strlen(shown.c_str()));
+    InternalAdbcSetError(error, "[libpq] Could not escape identifier %s%s: %s",
+                         shown.c_str(), identifier.size() > kMaxShown ? "..." : "",
+                         conn ? PqErrorText(nullptr, conn).c_str() : "no connection");
+    // Without a healthy connection the failure says nothing about the identifier.
+    return (conn != nullptr && PQstatus(conn) == CONNECTION_OK)
+               ? ADBC_STATUS_INVALID_ARGUMENT
+               : ADBC_STATUS_INTERNAL;
+  }
+  *out = escaped;
+  PQfreemem(escaped);
+  return ADBC_STATUS_OK;
 }
 
 }  // namespace adbcpq

@@ -1,0 +1,385 @@
+// Copyright (c) 2026 ADBC Drivers Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Tests for masking credentials in SQL text that appears in error messages.
+
+#include <cstdlib>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <gtest/gtest.h>
+#include <libpq-fe.h>
+
+#include "error.h"
+#include "motherduck_redact.h"
+
+namespace adbcpq {
+
+namespace {
+void ResetRedactors() {
+  SetQueryRedactor(nullptr);
+  SetMessageRedactor(nullptr);
+}
+}  // namespace
+
+TEST(MotherDuckRedactTest, ExactOutputs) {
+  const std::pair<const char*, const char*> kCases[] = {
+      {"CREATE SECRET s (TYPE s3, KEY_ID 'k', SECRET 'x')", "CREATE SECRET ..."},
+      {"create or replace persistent secret s IN motherduck (TYPE s3, SECRET 'x')",
+       "create or replace persistent secret ..."},
+      {"CREATE TEMP SECRET s (SECRET 'x')", "CREATE TEMP SECRET ..."},
+      {"ALTER SECRET s (SECRET 'x')", "ALTER SECRET ..."},
+      {"SET s3_secret_access_key = 'x'", "SET s3_secret_access_key ..."},
+      {"SET GLOBAL motherduck_token TO 'x'", "SET GLOBAL motherduck_token ..."},
+      {"SET memory.s3_secret_access_key = 'x'", "SET memory.s3_secret_access_key ..."},
+      {"ATTACH 'md:db?motherduck_token=abc&x=1'", "ATTACH 'md:db?motherduck_token ..."},
+      {"ATTACH 'postgresql://user:abc@host/db'", "ATTACH 'postgresql://user: ..."},
+      {"ATTACH 'host=h' AS p (TYPE postgres, PASSWORD 'abc')",
+       "ATTACH 'host=h' AS p (TYPE postgres, PASSWORD ..."},
+  };
+  for (const auto& [query, expected] : kCases) {
+    EXPECT_EQ(RedactSecretStatements(query), expected) << query;
+  }
+}
+
+// None of these may let the marker through, however the statement is dressed up.
+TEST(MotherDuckRedactTest, NeverLeaksTheSecret) {
+  const std::string kQueries[] = {
+      "CREATE /* see (note) */ SECRET s (TYPE s3, SECRET 'ZZ9')",
+      "CREATE -- (c)\n SECRET s (SECRET 'ZZ9')",
+      "CREATE SECRET s SECRET 'ZZ9' -- (forgot parens)",
+      "CREATE SECRET s SECRET 'ZZ9' FROM read_parquet('s3://b')",
+      "CREATE SECRET s -- (note)\n (SECRET 'ZZ9')",
+      "CREATE OR REPLACE TEMPORARY SECRET IF NOT EXISTS s IN motherduck (SECRET 'ZZ9')",
+      "SELECT 1; CREATE SECRET s (SECRET 'ZZ9')",
+      "SELECT $foo bar$ CREATE SECRET s (SECRET 'ZZ9')",
+      "CREATE MACRO m() AS $$ CREATE SECRET s (SECRET 'ZZ9') $$",
+      "-- CREATE SECRET s (SECRET 'ZZ9')\nSELECT 1",
+      "-- motherduck_token = ZZ9\nSELECT 1",
+      "/* token=\"ZZ9\" */ SELECT 1",
+      "/* password=ZZ9 */ SELECT 1",
+      "SET \"s3_secret_access_key\" = 'ZZ9'",
+      "SET t.\"s3_secret_access_key\" = 'ZZ9'",
+      // A quote that ends the previous literal is not part of a quoted name.
+      "CREATE USER 'u'PASSWORD'ZZ9'",
+      "CREATE USER ''PASSWORD'ZZ9'",
+      "SET 's3_secret_access_key' = 'ZZ9'",
+      "SET s3_secret_access_key\n  = 'ZZ9'",
+      "SET s3_secret_access_key /* c */ = 'ZZ9'",
+      "SET motherduck_token -- c\n TO 'ZZ9'",
+      "SET s3_access_key_id = 'ZZ9'",
+      "ATTACH 'md:db?motherduck_token=ZZ9&x=1'",
+      "ATTACH 'md:db?motherduck_token = ZZ9'",
+      "ATTACH 'md:db?motherduck_token=''ZZ9'''",
+      "ATTACH 'md:db?motherduck_token=my ZZ9 x'",
+      "ATTACH 'md:db?motherduck_token=abc;ZZ9'",
+      "ATTACH E'md:db?motherduck_token=abc\\'ZZ9'",
+      "SELECT 's3://b/o?access_key_id=ZZ9&secret_access_key=ZZ9'",
+      "SELECT \"md:db?token='ZZ9'\"",
+      "ATTACH 'postgresql://user:ZZ9@host/db'",
+      "ATTACH 'postgresql://user: ZZ9@host/db'",
+      "ATTACH 'postgresql://user:\tZZ9@host/db'",
+      "ATTACH 'postgresql://user:\n  ZZ9@host/db'",
+      "SELECT 's3://AKIA:ZZ9@bucket/path'",
+      "ATTACH 'host=h' AS p (TYPE postgres, PASSWORD 'ZZ9')",
+      "SELECT '{\"password\": \"ZZ9\"}'",
+      // DuckDB: Parquet and database file encryption.
+      "PRAGMA add_parquet_key('key128', 'ZZ9')",
+      "SET key = 'ZZ9'",
+      "SELECT '{\"key\": \"ZZ9\"}'",
+      "COPY t TO 'f' (KEY 'ZZ9')",
+      "CALL add_parquet_key('key128', 'ZZ9')",
+      "ATTACH 'enc.db' AS e (ENCRYPTION_KEY 'ZZ9')",
+      // Scanner connection strings.
+      "ATTACH 'host=h user=u password=ZZ9 dbname=d' AS p (TYPE postgres)",
+      "ATTACH 'host=h user=u passwd=ZZ9' AS m (TYPE mysql)",
+      "SELECT * FROM postgres_scan('host=h password=ZZ9', 'public', 't')",
+      "ATTACH 'host=h sslkey=/k.pem sslpassword=ZZ9' AS p (TYPE postgres)",
+      "ATTACH 'ducklake:postgres:host=h password=ZZ9' AS dl (DATA_PATH 's3://b/')",
+      // httpfs and Azure.
+      "SET s3_session_token = 'ZZ9'",
+      "SET http_proxy_password = 'ZZ9'",
+      "SET hf_token = 'ZZ9'",
+      "SET azure_storage_connection_string = 'AccountName=a;AccountKey=ZZ9'",
+      "SET VARIABLE pw = 'ZZ9'",
+      "ATTACH 'host=h user=u pass=ZZ9' AS m (TYPE mysql)",
+      "SET db_pass = 'ZZ9'",
+      // Column lists: the values come later.
+      "INSERT INTO creds (id, password) VALUES (1, 'ZZ9')",
+      "INSERT INTO creds (api_key, id) VALUES ('ZZ9', 1)",
+      "SET http_bearer = 'ZZ9'",
+      "SET session_jwt = 'ZZ9'",
+      "SET sticky_cookie = 'ZZ9'",
+      "ATTACH 'dsn=ZZ9' AS m (TYPE odbc)",
+      "CREATE USER u WITH PASSWORD 'ZZ9'",
+      // A string glued to the keyword, or double-quoted, is still the value.
+      "CREATE USER u WITH PASSWORD'ZZ9'",
+      "CREATE USER u WITH PASSWORD \"ZZ9\"",
+      "SET \"s3_secret_access_key\" = 'ZZ9'",
+      // An unclosed comment doesn't hide what follows it.
+      "SET s3_secret_access_key /* = 'ZZ9'",
+      "SET s3_secret_access_key -- = 'ZZ9'",
+      "CALL md_create_flight(source_code /* := 'ZZ9'",
+      // Credentials in URLs.
+      "SELECT * FROM read_parquet('https://a.blob.core.windows.net/f?sv=1&sig=ZZ9')",
+      "SELECT * FROM read_parquet('https://b.s3.amazonaws.com/f?X-Amz-Signature=ZZ9')",
+      "SELECT * FROM read_csv('https://x/f?apikey=ZZ9')",
+      "SELECT * FROM read_parquet('azure://c/f?AccountKey=ZZ9')",
+      "INSTALL x FROM 'https://u:ZZ9@repo.example.com'",
+      // MotherDuck connection strings.
+      "ATTACH 'md:ZZ9@mydb'",
+      "ATTACH 'md:ZZ9@mydb;attach_mode=single'",
+      "ATTACH 'md: ZZ9@mydb'",
+      // Tokens are JWTs, far longer than a password.
+      "ATTACH 'md:ZZ9" + std::string(900, 'x') + "@mydb'",
+      "INSTALL x FROM 'https://u:ZZ9" + std::string(900, 'x') + "@repo.example.com'",
+      "ATTACH 'md:/* c */ZZ9@mydb'",
+      "ATTACH 'motherduck:ZZ9@mydb'",
+      "ATTACH 'md:mydb?slt=ZZ9'",
+      "SET motherduck_slt = 'ZZ9'",
+      "SET motherduck_oauth_token = 'ZZ9'",
+      "PRAGMA md_connect('slt=ZZ9')",
+      "PRAGMA md_connect('token=ZZ9;host=h')",
+      // MotherDuck Flights carry free-form payloads.
+      "CALL md_create_flight(name := 'f', source_code := 'ZZ9')",
+      "CALL md_create_flight(name => 'f', source_code => 'ZZ9')",
+      "SELECT * FROM md_create_flight(name = 'f', source_code = 'x = \"ZZ9\"')",
+      "CALL md_run_flight(id => 'x', config => MAP {'A': 'ZZ9'})",
+      // Postgres-style unique violation detail echoes the column value.
+      "ERROR: duplicate key value violates unique constraint \"t_pkey\"\nDETAIL: Key "
+      "(token)=(ZZ9) already exists.",
+      "DETAIL: Key (id, api_key)=(1, ZZ9) already exists.",
+      "CALL md_run_flight(id := 'x', config := MAP {'A': 'ZZ9'})",
+      // HTTP headers.
+      "SELECT http_get('https://x', headers = {'Authorization': 'Bearer ZZ9'})",
+  };
+  for (const std::string& query : kQueries) {
+    const std::string out = RedactSecretStatements(query);
+    EXPECT_EQ(out.find("ZZ9"), std::string::npos) << query << "\n -> " << out;
+  }
+}
+
+TEST(MotherDuckRedactTest, OrdinaryQueriesAreUnchanged) {
+  const char* kQueries[] = {
+      "SELECT 1",
+      "SELECT key::int FROM t",
+      "SELECT config, source_code FROM flights WHERE config IS NOT NULL",
+      "ATTACH 'md:my_db' AS d (READ_ONLY)",
+      "SELECT * FROM md_list_flights()",
+      "SELECT author, designation FROM t",
+      "DROP SECRET s",
+      "SELECT count(*) FROM t GROUP BY key ORDER BY key",
+      "SELECT keyboard, key FROM t ORDER BY id",
+      "CREATE TABLE t (id INT, PRIMARY KEY (id))",
+      "Constraint Error: Duplicate key \"id: 1\" violates primary key constraint",
+      "DETAIL: Key (id)=(1) already exists.",
+      // Server messages that quote a credential-looking name keep their reason.
+      "Binder Error: Referenced column \"api_key\" not found in FROM clause!",
+      "Catalog Error: Table with name \"tokens\" does not exist!",
+      "SELECT \"password\", a FROM t",
+      "SELECT a, b FROM t WHERE monkey > 1 AND tokenizer IS NULL",
+      "SET threads = 4",
+      "SET memory_limit = '1GB'",
+      "COPY t TO 'x.csv' (FORMAT csv)",
+      "INSERT INTO t VALUES ('password reset requested')",
+  };
+  for (const char* query : kQueries) {
+    EXPECT_EQ(RedactSecretStatements(query), query);
+  }
+}
+
+// Masked although they hold no secret; pinned to keep the trade-off visible.
+TEST(MotherDuckRedactTest, OverMasksCredentialLookingSql) {
+  const std::pair<const char*, const char*> kCases[] = {
+      {"SELECT * FROM t WHERE key = 5 ORDER BY id", "SELECT * FROM t WHERE key ..."},
+      {"SELECT * FROM t WHERE monkey = 1", "SELECT * FROM t WHERE monkey ..."},
+      {"SELECT * FROM duckdb_secrets()", "SELECT * FROM duckdb_secrets ..."},
+      {"CREATE TABLE secrets (id INT)", "CREATE TABLE secrets ..."},
+      {"UPDATE settings SET config = 'x' WHERE id = 1", "UPDATE settings SET config ..."},
+      {"WHERE kind = 'password' AND x = 'y'", "WHERE kind = 'password ..."},
+  };
+  for (const auto& [query, expected] : kCases) {
+    EXPECT_EQ(RedactSecretStatements(query), expected) << query;
+  }
+}
+
+TEST(MotherDuckRedactTest, MalformedInputDoesNotCrash) {
+  for (const char* query :
+       {"", "'", "\"", "/*", "--", "E'\\", "$$", "$a$", "key", "key '",
+        "key =", "token TO", "://", "x://u:", "CREATE SECRET", "secret ("}) {
+    RedactSecretStatements(query);
+  }
+  // The largest input the driver hands over (server text), full of triggers.
+  for (const char* unit : {"md:", "://a:", "key ", "create ", "/*", "'", "secret "}) {
+    std::string text;
+    while (text.size() < kMaxMessageBytes) text += unit;
+    RedactSecretStatements(text);
+  }
+}
+
+TEST(MotherDuckRedactTest, InstalledRedactorAppliesToErrors) {
+  EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET s (SECRET 'x')");
+  InstallMotherDuckRedactors();
+  EXPECT_EQ(RedactQuery("CREATE SECRET s (SECRET 'x')"), "CREATE SECRET ...");
+  ResetRedactors();
+}
+
+// Text cut anywhere inside a secret must not leak the part that is left, including a
+// URL or md: token cut before its @.
+TEST(MotherDuckRedactTest, EveryPrefixOfAStatementHidesTheSecret) {
+  for (const char* query :
+       {"SELECT 1 FROM t WITH PASSWORD 'ZZZZZZZZ'",
+        "ATTACH 'postgresql://user:ZZZZZZZZ@host/db'", "ATTACH 'md:ZZZZZZZZ@db'",
+        "SET s3_secret_access_key = 'ZZZZZZZZ'", "ATTACH 'host=h password=ZZZZZZZZ'",
+        "COPY t TO 'f' (KEY 'ZZZZZZZZ')", "SET key = ZZZZZZZZ",
+        "CREATE SECRET s (SECRET 'ZZZZZZZZ')"}) {
+    const std::string text = query;
+    for (size_t n = 0; n <= text.size(); n++) {
+      const std::string out = RedactSecretStatements(text.substr(0, n));
+      EXPECT_EQ(out.find('Z'), std::string::npos) << out;
+    }
+  }
+}
+
+// The same through the real truncation, with the cut inside the secret.
+TEST(MotherDuckRedactTest, SecretAtTheTruncationPointIsNotLogged) {
+  InstallMotherDuckRedactors();
+  // One shape is enough (each cut is a full pass over 512 KiB); the prefix test above
+  // covers the rest.
+  for (const char* tail : {"' AS x; ATTACH 'postgresql://user:ZZ9ZZ9ZZ9@host/db'"}) {
+    const size_t secret = std::string(tail).find("ZZ9");
+    const std::string query =
+        "SELECT '" + std::string(kMaxQueryBytes - 8 - secret - 3, 'a') + tail;
+    const std::string out = RedactQuery(query);
+    EXPECT_NE(out.find("[truncated]"), std::string::npos);
+    EXPECT_EQ(out.find("ZZ9"), std::string::npos) << tail;
+  }
+  ResetRedactors();
+}
+
+// DuckDB writes the statement into the primary message, after a blank line.
+TEST(MotherDuckRedactTest, StripStatementEcho) {
+  const std::pair<const char*, const char*> kCases[] = {
+      // As libpq's terse form returns it from MotherDuck.
+      {"ERROR:  Parser Error: syntax error at or near \"WHERE\"\n\n"
+       "LINE 1: SELECT FROM WHERE 'ZZ9' +\n                    ^\n",
+       "ERROR:  Parser Error: syntax error at or near \"WHERE\" [statement omitted]"},
+      {"Binder Error: column \"x\" not found\nCandidate bindings: \"y\"\n\n"
+       "LINE 12: SELECT x FROM t WHERE k = 'ZZ9'\n               ^",
+       "Binder Error: column \"x\" not found\nCandidate bindings: \"y\" "
+       "[statement omitted]"},
+      {"err\r\n\r\nLINE 1: 'ZZ9'", "err [statement omitted]"},
+      {"LINE 1: SELECT 'ZZ9'", "[statement omitted]"},
+      // Cut short by truncation.
+      {"err\n\nLINE 1: SELECT 'ZZ", "err [statement omitted]"},
+      {"err\n\nLINE 1:", "err [statement omitted]"},
+      {"err\n\nLINE 1", "err\n\nLINE 1"},
+      // Not an echo.
+      {"syntax error at LINE 1: x", "syntax error at LINE 1: x"},
+      {"err\nLINES: 3", "err\nLINES: 3"},
+      {"err\nLINE x: 3", "err\nLINE x: 3"},
+      {"", ""},
+  };
+  for (const auto& [text, expected] : kCases) {
+    EXPECT_EQ(StripStatementEcho(text), expected) << text;
+  }
+}
+
+// Server text loses its echo; SQL that happens to contain such a line keeps it.
+TEST(MotherDuckRedactTest, InstalledRedactorStripsEchoFromMessagesOnly) {
+  const std::string message =
+      "ERROR:  Parser Error: syntax error at or near \"(\"\n\n"
+      "LINE 1: CREATE SECRET s (SECRET 'ZZ9'\n                        ^\n";
+  const std::string query = "SELECT 'a\nLINE 1: b'";
+  InstallMotherDuckRedactors();
+  EXPECT_EQ(RedactMessage(message),
+            "ERROR:  Parser Error: syntax error at or near \"(\" [statement omitted]");
+  EXPECT_EQ(RedactQuery(query), query);
+  ResetRedactors();
+}
+
+// A message cut anywhere, by hand or by the real truncation, must not leak the echo.
+TEST(MotherDuckRedactTest, EveryPrefixOfAnEchoHidesTheStatement) {
+  const std::string echo = "\n\nLINE 1: SELECT FROM WHERE 'ZZ9' +\n                ^\n";
+  InstallMotherDuckRedactors();
+  const std::string head = "ERROR:  Parser Error: syntax error";
+  const std::string message = head + echo;
+  for (size_t n = 0; n <= message.size(); n++) {
+    const std::string out = RedactMessage(message.substr(0, n));
+    EXPECT_EQ(out.find('Z'), std::string::npos) << out;
+  }
+  // The same with RedactMessage making the cut, at every point inside the echo.
+  for (size_t keep = 0; keep <= echo.size(); keep++) {
+    const std::string padded = std::string(kMaxMessageBytes - keep, 'a') + echo;
+    const std::string out = RedactMessage(padded);
+    EXPECT_EQ(out.find('Z'), std::string::npos) << keep;
+    if (keep < echo.size()) EXPECT_NE(out.find("[truncated]"), std::string::npos);
+  }
+  ResetRedactors();
+}
+
+// libpq's default error message echoes the statement ("LINE 1: ..."); ours must not.
+// MotherDuck also writes the echo into the primary message, which the redactor drops.
+TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  if (!uri) GTEST_SKIP() << "ADBC_POSTGRESQL_TEST_URI not set";
+  // The driver adds the token; so does this.
+  const char* token = std::getenv("MOTHERDUCK_TOKEN");
+  const char* keywords[] = {"dbname", "password", nullptr, nullptr};
+  const char* values[] = {uri, token != nullptr ? token : "", nullptr, nullptr};
+  PGconn* conn = PQconnectdbParams(keywords, values, /*expand_dbname=*/1);
+  if (PQstatus(conn) != CONNECTION_OK &&
+      std::string(PQerrorMessage(conn)).find("no database") != std::string::npos) {
+    // The URI's database may not exist yet (CI creates it in a later suite). Any
+    // database will do, so try the workspace; a later dbname overrides the URI's.
+    // Other failures, like a bad token, must fail the test rather than skip it.
+    PQfinish(conn);
+    keywords[2] = "dbname";
+    values[2] = "md:";
+    conn = PQconnectdbParams(keywords, values, /*expand_dbname=*/1);
+  }
+  if (PQstatus(conn) != CONNECTION_OK) {
+    const std::string message = PqErrorText(nullptr, conn);
+    PQfinish(conn);
+    FAIL() << "cannot connect with libpq directly: " << message;
+  }
+  PGresult* result = PQexec(conn, "SELECT FROM WHERE 'UNIQUEMARKER' +");
+  ASSERT_EQ(PQresultStatus(result), PGRES_FATAL_ERROR);
+  if (std::string(PQresultErrorMessage(result)).find("UNIQUEMARKER") ==
+      std::string::npos) {
+    PQclear(result);
+    PQfinish(conn);
+    GTEST_SKIP() << "server did not echo the statement; nothing to check";
+  }
+  InstallMotherDuckRedactors();
+  // Every way the driver puts this error into an AdbcError: the result's text, the
+  // connection's (pipeline paths, default verbosity), and MakeStatus's detail fields.
+  std::vector<std::string> texts = {PqErrorText(result, conn),
+                                    PqErrorText(nullptr, conn)};
+  for (const auto& field : kDetailFields) {
+    const char* value = PQresultErrorField(result, field.code);
+    if (value != nullptr) texts.push_back(RedactMessage(value));
+  }
+  ResetRedactors();
+  EXPECT_NE(texts[0].find("syntax error"), std::string::npos) << texts[0];
+  for (const std::string& text : texts) {
+    EXPECT_EQ(text.find("UNIQUEMARKER"), std::string::npos) << text;
+    EXPECT_EQ(text.find("LINE"), std::string::npos) << text;
+  }
+  PQclear(result);
+  PQfinish(conn);
+}
+
+}  // namespace adbcpq
