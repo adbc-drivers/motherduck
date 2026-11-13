@@ -155,6 +155,7 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
     other->cancel_requested_.store(false);
     other->own_txn_ = false;
     other->script_failed_ = false;
+    helper_.SetCancelFlag(&cancel_requested_);
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
   }
