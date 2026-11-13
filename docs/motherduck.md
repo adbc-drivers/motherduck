@@ -22,6 +22,14 @@
 
 This driver provides ADBC access to MotherDuck.
 
+:::{warning}
+This driver is **not** a drop-in replacement for the ADBC PostgreSQL driver,
+although it is built from it and talks to MotherDuck's PostgreSQL protocol
+endpoint. It is a separate driver with its own name, it only works with
+MotherDuck, and some of the PostgreSQL driver's options and features behave
+differently or don't work. See "Differences from the PostgreSQL Driver" below.
+:::
+
 ## Installation & Quickstart
 
 The driver can be installed with [dbc](https://docs.columnar.tech/dbc):
@@ -112,6 +120,30 @@ Without a token, connecting fails with `UNAUTHENTICATED`.
 | `adbc.motherduck.db_schema` | Database | The schema every new connection starts in. Connecting fails if it doesn't exist. |
 | `adbc.connection.db_schema` | Connection | Changes a single connection's schema, in its current database. |
 | `adbc.motherduck.token` | Database | Alias for the standard `password` option. |
+
+## Differences from the PostgreSQL Driver
+
+Code written for the ADBC PostgreSQL driver (`adbc_driver_postgresql`) needs
+changes to use this driver, and settings for this driver mean nothing to the
+PostgreSQL driver:
+
+- **A separate driver.** Load `motherduck`, not `postgresql`.
+- **MotherDuck only.** The driver connects only to MotherDuck's PostgreSQL
+  endpoint. Plain PostgreSQL servers aren't supported, because every connection
+  sets `attach_mode`.
+- **Connection settings.** The MotherDuck token is the password, and the user
+  defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
+  and connection service files are never used, and `sslmode` defaults to
+  `require`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
+- **Options that differ.** `adbc.postgresql.use_copy` defaults to `false`, and
+  setting it to `true` fails. `adbc.postgresql.type_resolver_mode` is accepted
+  and ignored. `adbc.connection.db_schema` names a schema, not an arbitrary
+  `search_path`; use `USE <database>` to change databases.
+- **Results and errors.** DML and DDL return an empty stream, and `rows_affected`
+  for `UPDATE` and `DELETE` is the number of rows changed. Data conversion
+  errors map to `INTERNAL` instead of `INVALID_DATA`.
+- **Missing features.** Bulk ingest, COPY result reads, statistics, and others
+  don't work; the feature table below shows what is supported.
 
 ## Feature & Type Support
 
