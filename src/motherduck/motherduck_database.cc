@@ -35,7 +35,9 @@
 
 #include "adbc_driver_motherduck_config.h"
 #include "driver/common/utils.h"
+#include "error.h"
 #include "motherduck_ascii.h"
+#include "motherduck_connection.h"
 #include "motherduck_trust_store.h"
 #include "motherduck_type_resolver.h"
 
@@ -192,6 +194,8 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
     optional = &session_name_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     optional = &region_;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
+    optional = &db_schema_;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     // The user the driver connects as.
     output = username_;
@@ -265,6 +269,9 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
     region_ = std::move(region);
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
+    // An empty value unsets it.
+    db_schema_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
     username_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0 ||
@@ -439,6 +446,9 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     if (!session_options.empty()) session_options += ' ';
     session_options += session_option;
   };
+  // Have the endpoint send PostgreSQL command tags with affected-row counts
+  // instead of DuckDB's Count and Success result sets.
+  add(SessionOption("return_pg_command_tags", "on"));
   if (attach_mode_.empty()) add(SessionOption("attach_mode", kDefaultAttachMode));
   add(options);
   if (!attach_mode_.empty()) add(SessionOption("attach_mode", attach_mode_));
@@ -472,6 +482,26 @@ AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* erro
     PQfinish(*conn);
     *conn = nullptr;
     return ADBC_STATUS_IO;
+  }
+
+  // The endpoint rejects search_path as a startup option, so set it once
+  // connected. A database the URI names is the connection's current database,
+  // which saves looking it up. Otherwise (md:, or no database, where libpq
+  // falls back to the user name) the server says which it is.
+  if (!db_schema_.empty()) {
+    std::string_view database;
+    for (const auto& [keyword, value] : params) {
+      if (keyword == "dbname" && !value.empty() && value.find(':') == std::string::npos) {
+        database = value;
+      }
+    }
+    AdbcStatusCode status = SetMotherduckSearchPath(
+        *conn, db_schema_, database, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, error);
+    if (status != ADBC_STATUS_OK) {
+      PQfinish(*conn);
+      *conn = nullptr;
+      return status;
+    }
   }
   open_connections_++;
   return ADBC_STATUS_OK;

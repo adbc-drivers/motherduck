@@ -31,8 +31,7 @@ The upstream PostgreSQL driver's approach credits [pgeon](https://github.com/0x0
 
 ## Build
 
-Requires CMake 3.24+, a C++20 compiler, and PostgreSQL's client library and
-headers (libpq). The driver bundles the Apache common/framework code, nanoarrow,
+Requires CMake 3.24+, a C++20 compiler, and libpq 15 or newer. The driver bundles the Apache common/framework code, nanoarrow,
 fmt, portable-snippets, and boost.int128 it needs. Test builds also require
 GoogleTest/GoogleMock; CMake downloads GoogleTest 1.15.2 if it is not installed.
 
@@ -56,8 +55,9 @@ For a release build without test dependencies:
 
 The scripts copy the library to `build/libadbc_driver_motherduck.dylib` on
 macOS, `.so` on Linux, or `.dll` on Windows. The entry point inferred by ADBC
-driver managers is `AdbcDriverMotherduckInit`. The original PostgreSQL entry
-point and the generic `AdbcDriverInit` remain available.
+driver managers is `AdbcDriverMotherduckInit`, and the generic `AdbcDriverInit`
+forwards to it. The original PostgreSQL entry point `AdbcDriverPostgresqlInit`
+remains available and does not install the MotherDuck error-message redaction.
 
 For Foundry packaging, use the vcpkg toolchain through `CMAKE_TOOLCHAIN_FILE`,
 `VCPKG_ROOT`, or `VCPKG_INSTALLATION_ROOT`. The scripts choose static vcpkg
@@ -87,6 +87,16 @@ nothing are rejected, since it would escape the space before the driver's
 options. Single mode needs a named database; to connect to `md:`, set
 `workspace`.
 
+The driver also adds `--return_pg_command_tags=on`, so the endpoint answers
+DML and DDL with a PostgreSQL command tag that carries the affected-row count
+(`INSERT 0 2`, `UPDATE 3`, `DELETE 0`, `CREATE TABLE`) instead of DuckDB's
+`Count` or `Success` result set. `ExecuteQuery` on such a statement therefore
+returns an empty stream, and `rows_affected` for `UPDATE` and `DELETE` is the
+number of rows changed rather than 1. For a statement that returns rows (a
+`SELECT`, or DML with `RETURNING`), `rows_affected` is the count in its command
+tag. The PostgreSQL driver reports -1 for these when it reads results with
+COPY, which MotherDuck doesn't support.
+
 `adbc.motherduck.session_name` (database option) sets MotherDuck's
 [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name),
 which routes connections with the same name to the same replica under read
@@ -94,6 +104,20 @@ scaling and appears in query history. The driver adds `--session_name=<name>`
 after the URI's session options, escaping whitespace and backslashes with a
 backslash; MotherDuck removes the escapes, so `my session` arrives as is. It's
 unset by default; an empty value unsets it.
+
+`adbc.motherduck.db_schema` (database option) sets the schema every new
+connection starts in. MotherDuck's endpoint doesn't accept `search_path` as a
+startup option, so the driver runs `SET search_path TO <database>.<schema>`
+once each connection is up, with the connection's current database. (DuckDB
+would take a bare name that's also an attached database's name as that
+database.) Connecting fails if the schema doesn't exist. It's unset by default, leaving
+MotherDuck's default (`main`); an empty value unsets it.
+`adbc.connection.db_schema` changes a single connection's schema the same way,
+in its current database, and replaces this option when set before `Init`.
+Both name a schema only: unlike the PostgreSQL driver's bare `SET search_path`,
+which DuckDB would take as an attached database's name when no such schema
+exists, a name that isn't a schema of the current database fails with the
+server's error. Use `USE <database>` to change databases.
 
 MotherDuck builds the user agent in query history and its logs from libpq's
 `application_name`. The driver adds `adbc_driver_motherduck/<version>` to it,
@@ -180,10 +204,11 @@ to fail.
   aren't available because the endpoint rejects `CREATE TEMP TABLE`.
 - **COPY result reads** fail: the endpoint rejects binary
   `COPY ... TO STDOUT`, so the driver defaults `adbc.postgresql.use_copy` to
-  `false` (#11); setting it to `true` fails. The non-COPY path fetches the
-  whole result at once, so it ignores `adbc.postgresql.batch_size_hint_bytes`,
-  the connection reports idle in a transaction rather than active while you
-  read (#11), and a running query can't be cancelled (#48).
+  `false` (#11); setting it to `true` fails. Results are read from libpq
+  instead. A multi-statement script such as `INSERT ...; SELECT 1` stays
+  uncommitted, and invisible to other connections, until its rows are read,
+  its stream is released, or another command runs on the same connection.
+  That wait lets a row that cannot be converted roll the script back.
 - **Parameter types:** the endpoint can't prepare a query whose result
   column types depend on its parameters, as in `SELECT $1`, and ignores the
   parameter types sent with the prepare (#17). When that happens with
@@ -192,9 +217,6 @@ to fail.
   bound parameters, `GetParameterSchema` and `ExecuteSchema` return
   `NOT_IMPLEMENTED` for them. An all-null parameter whose type the endpoint
   can't infer is cast to `TEXT`, so `SELECT 1 + $1` with a null fails.
-- **Rows affected** is wrong for `DELETE` (#19), and is the row count rather
-  than -1 for a `SELECT` on the non-COPY path (#50). `ExecuteQuery` on an
-  `INSERT` also returns the endpoint's `Count` row as a batch (#49).
 - **Metadata:** the current catalog reports `md:` rather than the current
   database when you connect to `md:` (#14), and `GetStatistics` and
   `GetStatisticNames` aren't supported, since MotherDuck has no `pg_stats`.

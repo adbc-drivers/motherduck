@@ -32,11 +32,13 @@
 
 #include <arrow-adbc/adbc.h>
 
+#include "adbc_driver_motherduck.h"
 #include "connection.h"
 #include "database.h"
 #include "driver/common/utils.h"
 #include "driver/framework/status.h"
 #include "motherduck_factory.h"
+#include "result_reader.h"
 #include "statement.h"
 
 using adbc::driver::Status;
@@ -66,8 +68,11 @@ using adbcpq::PostgresStatement;
 namespace {
 const struct AdbcError* PostgresErrorFromArrayStream(struct ArrowArrayStream* stream,
                                                      AdbcStatusCode* status) {
-  // Currently only valid for TupleReader
-  return adbcpq::TupleReader::ErrorFromArrayStream(stream, status);
+  if (const struct AdbcError* error =
+          adbcpq::TupleReader::ErrorFromArrayStream(stream, status)) {
+    return error;
+  }
+  return adbcpq::PqResultArrayReader::ErrorFromArrayStream(stream, status);
 }
 
 int PostgresErrorGetDetailCount(const struct AdbcError* error) {
@@ -973,7 +978,7 @@ AdbcStatusCode AdbcDriverPostgresqlInit(int version, void* raw_driver,
 #if !defined(ADBC_NO_COMMON_ENTRYPOINTS)
 ADBC_EXPORT
 AdbcStatusCode AdbcDriverInit(int version, void* raw_driver, struct AdbcError* error) {
-  return AdbcDriverPostgresqlInit(version, raw_driver, error);
+  return AdbcDriverMotherduckInit(version, raw_driver, error);
 }
 #endif  // ADBC_NO_COMMON_ENTRYPOINTS
 }

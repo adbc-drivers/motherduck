@@ -16,7 +16,10 @@
 
 #include <arrow-adbc/driver/postgresql.h>
 
+#include "motherduck_redact.h"
+
 extern "C" AdbcStatusCode AdbcDriverMotherduckInit(int version, void* raw_driver,
                                                    struct AdbcError* error) {
+  adbcpq::InstallMotherDuckRedactors();
   return AdbcDriverPostgresqlInit(version, raw_driver, error);
 }

@@ -355,34 +355,40 @@ TEST_F(MotherDuckConnectParamsTest, UsernameReplacesUriUser) {
 }
 
 TEST_F(MotherDuckConnectParamsTest, SessionOptions) {
-  // The default attach mode goes first, so the URI can override it; explicit
+  // The defaults go first, so the URI can override them; explicit
   // options go last, so they override the URI.
   SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy");
   SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "adbc_session");
+  EXPECT_THAT(Values("options"),
+              ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=single "
+                                     "-c x=y --session_name=adbc_session"));
+  SetOption(ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, "workspace");
   EXPECT_THAT(
       Values("options"),
-      ::testing::ElementsAre("--attach_mode=single -c x=y --session_name=adbc_session"));
-  SetOption(ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, "workspace");
-  EXPECT_THAT(Values("options"),
-              ::testing::ElementsAre(
-                  "-c x=y --attach_mode=workspace --session_name=adbc_session"));
+      ::testing::ElementsAre("--return_pg_command_tags=on -c x=y --attach_mode=workspace "
+                             "--session_name=adbc_session"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, PgoptionsBetweenDefaultsAndOptions) {
   ScopedEnv pgoptions("PGOPTIONS", "--attach_mode=workspace");
   SetOption("uri", "postgresql://localhost/db");
-  EXPECT_THAT(Values("options"),
-              ::testing::ElementsAre("--attach_mode=single --attach_mode=workspace"));
+  EXPECT_THAT(
+      Values("options"),
+      ::testing::ElementsAre(
+          "--return_pg_command_tags=on --attach_mode=single --attach_mode=workspace"));
   SetOption(ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, "single");
-  EXPECT_THAT(Values("options"),
-              ::testing::ElementsAre("--attach_mode=workspace --attach_mode=single"));
+  EXPECT_THAT(
+      Values("options"),
+      ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=workspace "
+                             "--attach_mode=single"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, SessionNameEscaped) {
   SetOption("uri", "postgresql://localhost/db");
   SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "my session");
   EXPECT_THAT(Values("options"),
-              ::testing::ElementsAre("--attach_mode=single --session_name=my\\ session"));
+              ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=single "
+                                     "--session_name=my\\ session"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, ApplicationName) {
@@ -651,7 +657,8 @@ TEST_F(MotherDuckConnectParamsTest, OptionsLoneBackslash) {
   // An escaped backslash is fine.
   SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy%5C%5C");
   EXPECT_THAT(Values("options"),
-              ::testing::ElementsAre("--attach_mode=single -c x=y\\\\ --session_name=s"));
+              ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=single "
+                                     "-c x=y\\\\ --session_name=s"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, NoRegionLeavesPort) {

@@ -29,6 +29,8 @@
 #define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
 #define ADBC_MOTHERDUCK_OPTION_SESSION_NAME "adbc.motherduck.session_name"
 #define ADBC_MOTHERDUCK_OPTION_REGION "adbc.motherduck.region"
+/// The schema new connections start in, set with SET search_path.
+#define ADBC_MOTHERDUCK_OPTION_DB_SCHEMA "adbc.motherduck.db_schema"
 /// An alias for the standard ADBC password option, which holds the token.
 #define ADBC_MOTHERDUCK_OPTION_TOKEN "adbc.motherduck.token"
 
@@ -81,6 +83,7 @@ class MotherduckDatabase : public PostgresDatabase {
   std::string attach_mode_;
   std::string session_name_;
   std::string region_;
+  std::string db_schema_;
   std::string username_;
   std::string password_;
   // Empty for FindCaBundle.
