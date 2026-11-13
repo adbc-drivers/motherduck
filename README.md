@@ -22,6 +22,13 @@
   under the License.
 -->
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/motherduck-logo-dark.svg">
+    <img src="docs/images/motherduck-logo.svg" alt="MotherDuck" width="320">
+  </picture>
+</p>
+
 # ADBC Driver for MotherDuck
 
 A C++ ADBC driver for MotherDuck's PostgreSQL protocol endpoint, forked from
