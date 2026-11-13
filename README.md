@@ -80,6 +80,21 @@ ctest --test-dir build/debug --output-on-failure
 cmake --install build/debug --prefix build/install
 ```
 
+## Connection URI
+
+The `uri` database option takes a PostgreSQL URI or connection string. Per the
+[ADBC driver manager convention](https://arrow.apache.org/adbc/current/format/driver_manifests.html#resolving-a-driver-from-a-connection-uri),
+it can also start with `motherduck://`, so a driver manager that is given no
+`driver` loads this driver from the URI's scheme alone and passes the whole
+URI on. The driver reads `motherduck://` as `postgresql://`, so the rest of the
+URI is the same: `motherduck://[user[:token]@][host][:port]/[database][?params]`.
+A `motherduck://` URI must name a host, or set `adbc.motherduck.region` (see
+below), since libpq would otherwise fall back to `PGHOST` or a local socket;
+without either, connecting fails. For example, with `region` set to
+`us-east-1`, `motherduck:///my_db` connects to `my_db`. The scheme is
+lowercase, as libpq's `postgresql://` is. `postgresql://`, `postgres://` and
+keyword/value strings still work.
+
 ## Options
 
 `adbc.motherduck.attach_mode` (database option) sets the MotherDuck

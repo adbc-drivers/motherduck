@@ -46,6 +46,9 @@ namespace {
 constexpr char kDefaultAttachMode[] = "single";
 // MotherDuck's endpoint expects the user postgres.
 constexpr char kDefaultUser[] = "postgres";
+// The URI scheme an ADBC driver manager selects this driver by. Matched case-sensitively,
+// like libpq matches postgresql://.
+constexpr std::string_view kMotherduckScheme = "motherduck://";
 
 // An environment variable, or empty if it's unset. On Windows this reads the
 // process environment rather than this DLL's own (static) C runtime copy, which
@@ -134,6 +137,13 @@ std::string EscapeOptionValue(std::string_view value) {
   return escaped;
 }
 }  // namespace
+
+std::string NormalizeUri(std::string_view uri) {
+  if (uri.starts_with(kMotherduckScheme)) {
+    return "postgresql://" + std::string(uri.substr(kMotherduckScheme.size()));
+  }
+  return std::string(uri);
+}
 
 std::string RegionHost(std::string_view region) {
   if (!IsHostLabel(region)) return "";
@@ -276,6 +286,11 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
   } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0 ||
              std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
     password_ = value;
+  } else if (std::strcmp(key, "uri") == 0) {
+    // Keep the URI in the form libpq parses, so nothing that reads uri_ sees
+    // motherduck://.
+    motherduck_scheme_ = std::string_view(value).starts_with(kMotherduckScheme);
+    return PostgresDatabase::SetOption(key, NormalizeUri(value).c_str(), error);
   } else {
     return PostgresDatabase::SetOption(key, value, error);
   }
@@ -355,6 +370,17 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     }
   }
 
+  bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
+  // A motherduck:// URI names MotherDuck, so without a host libpq mustn't fall
+  // back to PGHOST or a local socket, which would send the token elsewhere.
+  if (motherduck_scheme_ && region_.empty() && uri_host.empty() && uri_hostaddr.empty() &&
+      !names_service) {
+    InternalAdbcSetError(error,
+                         "[libpq] A motherduck:// URI needs a host, or the database "
+                         "option '%s'",
+                         ADBC_MOTHERDUCK_OPTION_REGION);
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  }
   if (!region_.empty()) {
     // A different host, or any hostaddr (which libpq connects to instead of the
     // host), would send the connection elsewhere.
@@ -383,7 +409,6 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   // Certificate verification still needs sslmode=verify-full (#34). A named
   // service may set sslmode itself, which this would override; with a region,
   // a service is already an error.
-  bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
   if (!names_service && DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
     params->emplace_back("sslmode", "require");
   }

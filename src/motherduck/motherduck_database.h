@@ -34,6 +34,14 @@
 
 namespace adbcpq {
 
+/// \brief The URI in a form libpq parses. ADBC driver managers pick this driver
+/// from a motherduck:// URI and pass it through unchanged, so a leading
+/// motherduck:// (lowercase, like libpq's postgresql://) becomes postgresql://: the rest
+/// of the URI, [user[:token]@][host][:port]/[database][?params], is the same. Anything
+/// else, including postgresql://, postgres:// and keyword/value strings, is returned as
+/// is.
+std::string NormalizeUri(std::string_view uri);
+
 /// \brief The Postgres endpoint host for a MotherDuck region, e.g.
 /// pg.us-east-1-aws.motherduck.com for us-east-1 or
 /// pg.eastus2-azure.motherduck.com for eastus2, or empty if region can't be
@@ -78,6 +86,8 @@ class MotherduckDatabase : public PostgresDatabase {
   std::string db_schema_;
   std::string username_;
   std::string password_;
+  // Whether the uri option started with motherduck://.
+  bool motherduck_scheme_ = false;
 };
 
 }  // namespace adbcpq
