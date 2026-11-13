@@ -33,6 +33,12 @@
 #define ADBC_MOTHERDUCK_OPTION_DB_SCHEMA "adbc.motherduck.db_schema"
 /// An alias for the standard ADBC password option, which holds the token.
 #define ADBC_MOTHERDUCK_OPTION_TOKEN "adbc.motherduck.token"
+/// A PEM file of root certificates to verify the server with, instead of the
+/// ones the driver finds. Implies sslmode=verify-full.
+#define ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH "adbc.motherduck.tls_root_cert_path"
+/// "false" encrypts the connection without verifying the server's
+/// certificate (sslmode=require). Defaults to "true".
+#define ADBC_MOTHERDUCK_OPTION_TLS_VERIFY "adbc.motherduck.tls_verify"
 
 namespace adbcpq {
 
@@ -86,6 +92,8 @@ class MotherduckDatabase : public PostgresDatabase {
   std::string db_schema_;
   std::string username_;
   std::string password_;
+  std::string tls_root_cert_path_;
+  bool tls_verify_ = true;
   // Empty for FindCaBundle.
   std::function<std::string()> find_ca_bundle_;
 };

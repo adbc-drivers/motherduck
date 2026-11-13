@@ -196,6 +196,10 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
     optional = &region_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
     optional = &db_schema_;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH) == 0) {
+    optional = &tls_root_cert_path_;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY) == 0) {
+    output = tls_verify_ ? ADBC_OPTION_VALUE_ENABLED : ADBC_OPTION_VALUE_DISABLED;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     // The user the driver connects as.
     output = username_;
@@ -272,6 +276,20 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
     // An empty value unsets it.
     db_schema_ = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH) == 0) {
+    // An empty value unsets it. The file is checked when connecting.
+    tls_root_cert_path_ = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY) == 0) {
+    if (std::strcmp(value, ADBC_OPTION_VALUE_ENABLED) == 0) {
+      tls_verify_ = true;
+    } else if (std::strcmp(value, ADBC_OPTION_VALUE_DISABLED) == 0) {
+      tls_verify_ = false;
+    } else {
+      InternalAdbcSetError(
+          error, "[libpq] Invalid value for option %s=%s: expected %s or %s", key, value,
+          ADBC_OPTION_VALUE_ENABLED, ADBC_OPTION_VALUE_DISABLED);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
   } else if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
     username_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0 ||
@@ -342,17 +360,58 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   }
   PQconninfoFree(conninfo);
 
-  // On Windows the driver reads the process environment, but libpq reads its
-  // own C runtime copy, which can be stale. Pass the TLS settings the driver
-  // acts on, so libpq uses the same ones.
-  if (uri_sslmode.empty()) {
-    if (std::string env = GetEnv("PGSSLMODE"); !env.empty()) {
-      params->emplace_back("sslmode", std::move(env));
+  // The TLS options settle sslmode and sslrootcert themselves, so the URI may
+  // only repeat them. Passed explicitly, they outrank PGSSLMODE, PGSSLROOTCERT
+  // and a connection service file.
+  const bool pinned_roots = !tls_root_cert_path_.empty();
+  const bool tls_options = pinned_roots || !tls_verify_;
+  if (tls_options) {
+    const char* tls_option = pinned_roots ? ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH
+                                          : ADBC_MOTHERDUCK_OPTION_TLS_VERIFY;
+    if (pinned_roots && !tls_verify_) {
+      InternalAdbcSetError(error,
+                           "[libpq] Set either database option '%s' or %s=%s, not both",
+                           ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH,
+                           ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, ADBC_OPTION_VALUE_DISABLED);
+      return ADBC_STATUS_INVALID_ARGUMENT;
     }
-  }
-  if (uri_sslrootcert.empty()) {
-    if (std::string env = GetEnv("PGSSLROOTCERT"); !env.empty()) {
-      params->emplace_back("sslrootcert", std::move(env));
+    // With sslmode=require, a root file would make libpq verify the CA after all.
+    if (!uri_sslrootcert.empty()) {
+      InternalAdbcSetError(error,
+                           "[libpq] Set either database option '%s' or sslrootcert in "
+                           "the URI, not both",
+                           tls_option);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    const char* tls_sslmode = pinned_roots ? "verify-full" : "require";
+    if (!uri_sslmode.empty() && uri_sslmode != tls_sslmode) {
+      InternalAdbcSetError(error,
+                           "[libpq] Database option '%s' uses sslmode=%s, but the URI "
+                           "sets sslmode=%s",
+                           tls_option, tls_sslmode, uri_sslmode.c_str());
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    if (pinned_roots && !IsReadableFile(tls_root_cert_path_)) {
+      InternalAdbcSetError(error, "[libpq] Can't read database option '%s': %s",
+                           ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH,
+                           tls_root_cert_path_.c_str());
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    if (pinned_roots) params->emplace_back("sslrootcert", tls_root_cert_path_);
+    if (uri_sslmode.empty()) params->emplace_back("sslmode", tls_sslmode);
+  } else {
+    // On Windows the driver reads the process environment, but libpq reads
+    // its own C runtime copy, which can be stale. Pass the TLS settings the
+    // driver acts on, so libpq uses the same ones.
+    if (uri_sslmode.empty()) {
+      if (std::string env = GetEnv("PGSSLMODE"); !env.empty()) {
+        params->emplace_back("sslmode", std::move(env));
+      }
+    }
+    if (uri_sslrootcert.empty()) {
+      if (std::string env = GetEnv("PGSSLROOTCERT"); !env.empty()) {
+        params->emplace_back("sslrootcert", std::move(env));
+      }
     }
   }
 
@@ -385,7 +444,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   // sslrootcert itself, which defaults here would override; with a region, a
   // service is already an error.
   bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
-  if (!names_service) {
+  if (!tls_options && !names_service) {
     std::string sslmode = uri_sslmode.empty() ? GetEnv("PGSSLMODE") : uri_sslmode;
     std::string sslrootcert =
         uri_sslrootcert.empty() ? GetEnv("PGSSLROOTCERT") : uri_sslrootcert;
@@ -413,8 +472,11 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
         std::fprintf(stderr,
                      "[motherduck] warning: no trusted CA certificates found, so the "
                      "driver can't verify the server's certificate; using "
-                     "sslmode=require. Set SSL_CERT_FILE, or sslrootcert in the URI, "
-                     "to a PEM CA bundle\n");
+                     "sslmode=require. Set database option '%s' (or "
+                     "SSL_CERT_FILE) to a PEM CA bundle, or %s=false to skip "
+                     "verification\n",
+                     ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH,
+                     ADBC_MOTHERDUCK_OPTION_TLS_VERIFY);
       }
     }
   }

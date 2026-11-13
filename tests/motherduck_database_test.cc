@@ -439,8 +439,11 @@ TEST_F(MotherDuckConnectParamsTest, NoCaBundleRequiresTls) {
               ::testing::AnyOf("",
                                "[motherduck] warning: no trusted CA certificates found, "
                                "so the driver can't verify the server's certificate; "
-                               "using sslmode=require. Set SSL_CERT_FILE, or "
-                               "sslrootcert in the URI, to a PEM CA bundle\n"));
+                               "using sslmode=require. Set database option "
+                               "'adbc.motherduck.tls_root_cert_path' (or "
+                               "SSL_CERT_FILE) to a PEM CA bundle, or "
+                               "adbc.motherduck.tls_verify=false to skip "
+                               "verification\n"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, EmptySslmodeVerifiesServer) {
@@ -486,6 +489,158 @@ TEST_F(MotherDuckConnectParamsTest, CaBundleForVerifyingModes) {
               (std::string("postgresql://localhost/db?sslmode=") + sslmode).c_str());
     EXPECT_THAT(Values("sslrootcert"), ::testing::IsEmpty());
   }
+}
+
+TEST(MotherDuckTlsOptionsTest, OptionSetGet) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  EXPECT_THAT(
+      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, &error),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+  ASSERT_THAT(
+      AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH,
+                            "/etc/roots.pem", &error),
+      IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, &error),
+              ::testing::Optional("/etc/roots.pem"s));
+  // An empty value unsets it.
+  ASSERT_THAT(AdbcDatabaseSetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, "", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(
+      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, &error),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+
+  // Verification is on by default.
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, &error),
+              ::testing::Optional("true"s));
+  for (const std::string value : {"false", "true"}) {
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY,
+                                      value.c_str(), &error),
+                IsOkStatus(&error));
+    EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                    &database.value, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, &error),
+                ::testing::Optional(value));
+  }
+  for (const char* value : {"", "no", "FALSE", "0"}) {
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY,
+                                      value, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+}
+
+// A PEM file for adbc.motherduck.tls_root_cert_path, removed afterwards.
+class MotherDuckTlsRootCertPathTest : public MotherDuckConnectParamsTest {
+ protected:
+  void SetUp() override {
+    MotherDuckConnectParamsTest::SetUp();
+    dir_ = std::filesystem::temp_directory_path() /
+           ("motherduck_test_roots_" +
+            std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+    std::filesystem::create_directories(dir_);
+    roots_ = (dir_ / "roots.pem").string();
+    std::ofstream(roots_) << "not checked\n";
+  }
+  void TearDown() override {
+    std::filesystem::remove_all(dir_);
+    MotherDuckConnectParamsTest::TearDown();
+  }
+
+  std::filesystem::path dir_;
+  std::string roots_;
+};
+
+TEST_F(MotherDuckTlsRootCertPathTest, VerifiesWithTheFile) {
+  SetOption(ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, roots_.c_str());
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslrootcert"), ::testing::ElementsAre(roots_));
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+  // The URI may repeat the mode.
+  SetOption("uri", "postgresql://localhost/db?sslmode=verify-full");
+  EXPECT_THAT(Values("sslrootcert"), ::testing::ElementsAre(roots_));
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+  // It outranks the environment and a connection service, so it alone is passed.
+  {
+    ScopedEnv pgsslmode("PGSSLMODE", "require");
+    ScopedEnv pgsslrootcert("PGSSLROOTCERT", "/tmp/other.crt");
+    ScopedEnv pgservice("PGSERVICE", "md");
+    SetOption("uri", "postgresql://localhost/db");
+    EXPECT_THAT(Values("sslrootcert"), ::testing::ElementsAre(roots_));
+    EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+  }
+  // So does a region.
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  SetOption("uri", "postgresql:///db");
+  EXPECT_THAT(Values("sslrootcert"), ::testing::ElementsAre(roots_));
+}
+
+TEST_F(MotherDuckTlsRootCertPathTest, Conflicts) {
+  SetOption(ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, roots_.c_str());
+  for (const char* uri : {"postgresql://localhost/db?sslrootcert=/tmp/other.crt",
+                          "postgresql://localhost/db?sslrootcert=system",
+                          "postgresql://localhost/db?sslmode=require",
+                          "postgresql://localhost/db?sslmode=verify-ca"}) {
+    SCOPED_TRACE(uri);
+    SetOption("uri", uri);
+    EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
+  }
+  SetOption("uri", "postgresql://localhost/db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, "false");
+  EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
+}
+
+TEST_F(MotherDuckTlsRootCertPathTest, UnreadableFile) {
+  SetOption("uri", "postgresql://localhost/db");
+  for (const std::string& path : {(dir_ / "missing.pem").string(), dir_.string()}) {
+    SCOPED_TRACE(path);
+    SetOption(ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, path.c_str());
+    std::vector<std::pair<std::string, std::string>> params;
+    EXPECT_THAT(database_.ConnectParams(&params, &error_),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error_));
+    EXPECT_THAT(error_.message,
+                ::testing::HasSubstr(ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH));
+    if (error_.release) error_.release(&error_);
+  }
+}
+
+TEST_F(MotherDuckConnectParamsTest, TlsVerifyFalse) {
+  SetOption(ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, "false");
+  // Encrypted, but nothing to verify with: no found bundle, no warning.
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+  EXPECT_EQ(stderr_, "");
+  EXPECT_THAT(Values("sslrootcert"), ::testing::IsEmpty());
+  SetOption("uri", "postgresql://localhost/db?sslmode=require");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+  // It outranks the environment and a connection service.
+  {
+    ScopedEnv pgsslmode("PGSSLMODE", "verify-full");
+    ScopedEnv pgsslrootcert("PGSSLROOTCERT", "/tmp/other.crt");
+    ScopedEnv pgservice("PGSERVICE", "md");
+    SetOption("uri", "postgresql://localhost/db");
+    EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+    EXPECT_THAT(Values("sslrootcert"), ::testing::IsEmpty());
+  }
+  // A weaker or stronger mode, or root certificates, in the URI conflict.
+  for (const char* uri : {"postgresql://localhost/db?sslmode=disable",
+                          "postgresql://localhost/db?sslmode=prefer",
+                          "postgresql://localhost/db?sslmode=verify-full",
+                          "postgresql://localhost/db?sslrootcert=/tmp/other.crt"}) {
+    SCOPED_TRACE(uri);
+    SetOption("uri", uri);
+    EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
+  }
+  // true restores the default.
+  SetOption(ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, "true");
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+  EXPECT_THAT(Values("sslrootcert"), ::testing::ElementsAre(kBundle));
 }
 
 TEST_F(MotherDuckConnectParamsTest, DefaultRootCertFile) {
