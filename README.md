@@ -22,6 +22,13 @@
   under the License.
 -->
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/motherduck-logo-dark.svg">
+    <img src="docs/images/motherduck-logo.svg" alt="MotherDuck" width="320">
+  </picture>
+</p>
+
 # ADBC Driver for MotherDuck
 
 A C++ ADBC driver for MotherDuck's PostgreSQL protocol endpoint, forked from
@@ -252,10 +259,32 @@ MOTHERDUCK_TEST_POSTGRESQL=ON ./ci/scripts/build.sh test macos arm64
 pixi run validate
 ```
 
-By default each run gets a fresh database, `adbc_ci_<run>_<job>_<platform>_<arch>`,
-which the tests create before they start and drop when they finish, so
-concurrent jobs and runs don't share tables. Set `MOTHERDUCK_TEST_DATABASE` to
-an existing database to use it instead; the tests leave it in place.
+Runs share one database, `adbc_driver_tests`, which the tests create if it's
+missing and never drop. Each test process gets its own schema in it,
+`adbc_test_<start time>_<pid>_<run>`, where `<run>` is the
+`MOTHERDUCK_TEST_RUN` that `ci/scripts/pre-test.sh` writes (the GitHub run,
+attempt and job in CI, or `local_<pid>`, followed by the platform and arch). The
+start time and process ID keep runs apart even when they source the same
+`.env.override`. Every test connection starts in the schema through
+`adbc.motherduck.db_schema`. Tests that need more schemas or databases name
+them after it, and the tests drop all of them when they finish, so concurrent
+jobs and runs don't share tables. Each run also drops any schema or database
+named `adbc_test_<time>_<pid>_...` (or `adbc_<time>_..._<platform>_<arch>`, as
+an earlier version of the tests named them) with a time a day or more ago,
+which an interrupted run left behind; only names of those shapes are dropped
+(`IsStaleTestName` in `tests/postgresql_test.cc`, mirrored in
+`validation/tests/naming.py`, with tests for both). Databases the old
+database-per-run setup left, `adbc_ci_<run>_...`, carry no time, so they can't
+be told from a live run's and have to be dropped by hand. A database
+per run would scale worse: each interrupted run would leave a database and its
+retained storage behind, and every workspace-mode connection in the account
+attaches every database.
+
+Set `MOTHERDUCK_TEST_DATABASE` to use another database. The tests treat it like
+`adbc_driver_tests`: they create it if it's missing, create and drop their
+schemas in it, and sweep stale test-named schemas from it and test-named
+databases from the account. So the token needs to be able to create databases
+and schemas, and a read-only or shared database won't work.
 `MOTHERDUCK_PG_HOST` overrides the default host
 (`pg.us-east-1-aws.motherduck.com`). Test connections use the driver's default
 `attach_mode=single`, so other databases in the account stay out of catalog
@@ -265,7 +294,7 @@ CI does the same, using the `MOTHERDUCK_TOKEN` secret from the `test` GitHub
 environment.
 
 The validation suite's quirks in `validation/tests/postgresql.py` describe
-MotherDuck: its catalog, `main` schema, no temporary tables, and the vendor
+MotherDuck: its catalog, the run's schema, no temporary tables, and the vendor
 name `MotherDuck`. The driver still reports itself as PostgreSQL (#15), so the
 vendor check fails until that's fixed. Published validation documentation will
 be configured separately.
