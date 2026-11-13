@@ -394,10 +394,11 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
       sslrootcert = DefaultRootCertPath(GetEnv);
     }
     // libpq can't find the OS's trusted roots (sslrootcert=system needs a
-    // libpq and OpenSSL that can), so pass them as a file. Not for modes that
-    // don't verify: a root file would make require verify the CA.
-    if (sslrootcert.empty() &&
-        (sslmode.empty() || sslmode == "verify-ca" || sslmode == "verify-full")) {
+    // libpq and OpenSSL that can), so pass them as a file. Only for modes that
+    // check the host name: verify-ca with every public CA would accept any
+    // public certificate for any host, and a root file would make require
+    // verify the CA.
+    if (sslrootcert.empty() && (sslmode.empty() || sslmode == "verify-full")) {
       sslrootcert = find_ca_bundle_ ? find_ca_bundle_() : FindCaBundle(GetEnv);
       if (!sslrootcert.empty()) params->emplace_back("sslrootcert", sslrootcert);
     }

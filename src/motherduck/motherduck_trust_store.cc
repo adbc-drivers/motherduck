@@ -167,9 +167,11 @@ std::string ExportNativeRoots() {
   std::string directory = CacheDirectory();
   if (directory.empty()) return "";
   std::string path = (std::filesystem::path(directory) / kRootsFileName).string();
-  // If another process holds the file open, Windows can't replace it, but its
-  // last export is still usable.
-  if (!WriteFileAtomically(path, pem) && !IsReadableFile(path)) return "";
+  // If another process holds the file open, Windows can't replace it.
+  // WriteFileAtomically still succeeds when the file already holds these
+  // roots; anything else at that path is not trusted, since the directory may
+  // be shared (a service's temporary directory) and the name is predictable.
+  if (!WriteFileAtomically(path, pem)) return "";
   return path;
 #else
   return "";

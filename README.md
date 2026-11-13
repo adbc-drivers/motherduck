@@ -185,10 +185,11 @@ Root certificates named by `sslrootcert` in the URI, `PGSSLROOTCERT`, or
 libpq's default file (`~/.postgresql/root.crt`, or
 `%APPDATA%\postgresql\root.crt` on Windows) are used instead. With
 `sslrootcert=system`, libpq 16 and later already default to `verify-full`, so
-the driver leaves `sslmode` alone. An explicit `sslmode=verify-ca` or
-`verify-full` without root certificates also gets the found bundle; other
-explicit modes don't, since root certificates would make libpq verify the
-server's CA. If the driver finds no root certificates, it uses
+the driver leaves `sslmode` alone. An explicit `sslmode=verify-full`
+without root certificates also gets the found bundle. Other explicit modes
+don't: `verify-ca` doesn't check the host name, so a bundle of public CAs would
+accept any public certificate, and root certificates would make the weaker
+modes verify the server's CA. If the driver finds no root certificates, it uses
 `sslmode=require`, which encrypts but doesn't verify, and prints a warning
 once per process. Naming a connection service turns these defaults off, since
 the service file may set `sslmode` and `sslrootcert` itself.
