@@ -29,16 +29,9 @@
 #include "bind_stream.h"
 #include "driver/framework/status.h"
 #include "result_helper.h"
+#include "statement_split.h"
 
 namespace adbcpq {
-
-// Split a query on the semicolons between its statements, skipping those inside
-// string literals, quoted identifiers, dollar quotes and comments. Statements
-// with nothing but whitespace or comments are dropped. backslash_escapes says
-// whether backslashes escape quotes in every literal, as they do when
-// standard_conforming_strings is off, rather than only in E'' literals.
-std::vector<std::string> SplitStatements(std::string_view query,
-                                         bool backslash_escapes = false);
 
 // Whether a statement is a COPY, ignoring leading whitespace and comments.
 bool IsCopyStatement(std::string_view statement);
@@ -55,13 +48,10 @@ std::string CastParameters(std::string_view query, const std::vector<std::string
 std::string UncastParameters(std::string_view name,
                              const std::vector<std::string>& types);
 
-// Whether every string literal on this connection takes backslash escapes
-// (standard_conforming_strings is off).
-bool BackslashEscapes(PGconn* conn);
-
-// Whether a statement that isn't a COPY succeeded. MotherDuck answers DDL with
-// an empty result set (a Count or Success column) instead of a command tag, so
-// PGRES_TUPLES_OK counts as success alongside PGRES_COMMAND_OK.
+// Whether a statement that isn't a COPY succeeded. Without
+// return_pg_command_tags, MotherDuck answers DDL with an empty result set (a
+// Count or Success column) instead of a command tag, so PGRES_TUPLES_OK counts
+// as success alongside PGRES_COMMAND_OK.
 inline bool IsResultOk(const PGresult* result) {
   ExecStatusType status = PQresultStatus(result);
   return status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK;

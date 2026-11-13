@@ -22,11 +22,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -219,6 +221,10 @@ class PqResultHelper {
       : PqResultHelper(other.conn_, std::move(other.query_)) {
     result_ = other.result_;
     other.result_ = nullptr;
+    pending_ = std::move(other.pending_);
+    other.pending_.clear();
+    streaming_ = other.streaming_;
+    other.streaming_ = false;
   }
 
   ~PqResultHelper();
@@ -231,6 +237,29 @@ class PqResultHelper {
   Status DescribePrepared();
   Status Execute(const std::vector<std::string>& params = {},
                  PostgresType* param_types = nullptr);
+  // Simple-protocol execution that notices a cancel between packets.
+  Status ExecuteCancellable(const std::string& sql);
+  // Send the query and have libpq return rows as they arrive, instead of
+  // buffering the whole result the way Execute() does.
+  Status BeginRowStream();
+  const std::string& query() const { return query_; }
+  void set_query(std::string query) { query_ = std::move(query); }
+  // Replace result_ with the next chunk. A finished query leaves no result.
+  Status NextPacket();
+  // If the command-complete after this chunk is already buffered, drop it so
+  // the caller can commit without waiting for the stream to be read.
+  void PullBufferedTail();
+  bool streaming() const { return streaming_; }
+  void SetCancelFlag(const std::atomic<bool>* flag) { cancel_flag_ = flag; }
+  // Discard an open read. cancel_if_blocked stops a read the server has not
+  // finished. Leaving it false lets that read finish so an owned transaction
+  // can commit.
+  bool Finish(bool cancel_if_blocked) {
+    stop_if_blocked_ = cancel_if_blocked;
+    return AbandonStream();
+  }
+  // Free result memory without talking to the server. Used after PQfinish.
+  void DiscardLocal();
   Status ExecuteCopy();
   Status ResolveParamTypes(PostgresTypeResolver& type_resolver,
                            PostgresType* param_types);
@@ -299,12 +328,26 @@ class PqResultHelper {
 
  private:
   PGresult* result_ = nullptr;
+  // Packets already taken off the connection, so a buffered command-complete
+  // can be dropped and the transaction closed without waiting for the caller.
+  std::deque<PGresult*> pending_;
   PGconn* conn_;
   std::string query_;
+  bool streaming_ = false;
+  bool cancel_sent_ = false;
+  // Set for a cleanup that may cancel a blocked read. An owned transaction
+  // leaves this false so the server can finish the script and commit.
+  bool stop_if_blocked_ = false;
+  const std::atomic<bool>* cancel_flag_ = nullptr;
   Format param_format_ = Format::kText;
   Format output_format_ = Format::kText;
 
   Status PrepareInternal(int n_params, const Oid* param_oids) const;
+  // Drop an open row stream. True if a discarded result was a failure.
+  bool AbandonStream();
+  // Block until a packet is buffered or the cancel flag is set. Sends the
+  // cancel from this thread, and only when the next read would block.
+  void WaitUntilReady();
 };
 
 }  // namespace adbcpq

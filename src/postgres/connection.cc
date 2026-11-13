@@ -27,6 +27,8 @@
 
 #include "connection.h"
 
+#include "result_reader.h"
+
 #include <array>
 #include <cassert>
 #include <cinttypes>
@@ -485,6 +487,7 @@ AdbcStatusCode PostgresConnection::Commit(struct AdbcError* error) {
     return ADBC_STATUS_INVALID_STATE;
   }
 
+  RAISE_ADBC(FinishActiveReader(error));
   PGTransactionStatusType txn_status = PQtransactionStatus(conn_);
   if (txn_status == PQTRANS_IDLE) {
     // https://github.com/apache/arrow-adbc/issues/2673: don't rollback if the
@@ -496,7 +499,7 @@ AdbcStatusCode PostgresConnection::Commit(struct AdbcError* error) {
   PGresult* result = PQexec(conn_, "COMMIT");
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
     AdbcStatusCode code =
-        MakeStatus(result, "[libpq] Failed to commit: {}", PQerrorMessage(conn_))
+        MakeStatus(result, "[libpq] Failed to commit: {}", PqErrorText(result, conn_))
             .ToAdbc(error);
     PQclear(result);
     return code;
@@ -505,7 +508,31 @@ AdbcStatusCode PostgresConnection::Commit(struct AdbcError* error) {
   return ADBC_STATUS_OK;
 }
 
+AdbcStatusCode PostgresConnection::RollbackAbandonedTransaction(struct AdbcError* error) {
+  if (!abandoned_txn_) return ADBC_STATUS_OK;
+  if (conn_ == nullptr || PQtransactionStatus(conn_) == PQTRANS_IDLE) {
+    abandoned_txn_ = false;
+    return ADBC_STATUS_OK;
+  }
+  PGresult* result = PQexec(conn_, "ROLLBACK");
+  const ExecStatusType status =
+      result == nullptr ? PGRES_FATAL_ERROR : PQresultStatus(result);
+  const bool ok = status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK;
+  if (!ok) {
+    if (error != nullptr) {
+      InternalAdbcSetError(error, "%s%s", "[libpq] Failed to rollback: ",
+                           PqErrorText(result, conn_).c_str());
+    }
+    PQclear(result);
+    return ADBC_STATUS_IO;
+  }
+  PQclear(result);
+  abandoned_txn_ = false;
+  return ADBC_STATUS_OK;
+}
+
 AdbcStatusCode PostgresConnection::EnsureTransaction(struct AdbcError* error) {
+  RAISE_ADBC(FinishActiveReader(error));
   if (autocommit_) {
     return ADBC_STATUS_OK;
   }
@@ -521,8 +548,8 @@ AdbcStatusCode PostgresConnection::EnsureTransaction(struct AdbcError* error) {
 
   PGresult* result = PQexec(conn_, "BEGIN TRANSACTION");
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
-    InternalAdbcSetError(error, "%s%s",
-                         "[libpq] Failed to begin transaction: ", PQerrorMessage(conn_));
+    InternalAdbcSetError(error, "%s%s", "[libpq] Failed to begin transaction: ",
+                         PqErrorText(nullptr, conn_).c_str());
     PQclear(result);
     return ADBC_STATUS_IO;
   }
@@ -594,6 +621,7 @@ AdbcStatusCode PostgresConnection::GetObjects(
     struct AdbcConnection* connection, int c_depth, const char* catalog,
     const char* db_schema, const char* table_name, const char** table_type,
     const char* column_name, struct ArrowArrayStream* out, struct AdbcError* error) {
+  RAISE_ADBC(FinishActiveReader(error));
   std::unique_ptr<adbc::driver::GetObjectsHelper> helper = MakeGetObjectsHelper();
 
   const auto catalog_filter =
@@ -988,6 +1016,7 @@ AdbcStatusCode PostgresConnection::GetStatistics(const char* catalog,
     return ADBC_STATUS_NOT_IMPLEMENTED;
   }
 
+  RAISE_ADBC(FinishActiveReader(error));
   RAISE_ADBC(EnsureTransaction(error));
 
   struct ArrowSchema schema;
@@ -1068,6 +1097,7 @@ AdbcStatusCode PostgresConnection::GetTableSchema(const char* catalog,
     return ADBC_STATUS_INVALID_ARGUMENT;
   }
 
+  RAISE_ADBC(FinishActiveReader(error));
   RAISE_ADBC(EnsureTransaction(error));
 
   AdbcStatusCode final_status = ADBC_STATUS_OK;
@@ -1176,7 +1206,35 @@ AdbcStatusCode PostgresConnection::Init(struct AdbcDatabase* database,
   return ADBC_STATUS_OK;
 }
 
+void PostgresConnection::TrackActiveReader(
+    const std::shared_ptr<PqResultArrayReader>& reader) {
+  std::lock_guard<std::mutex> lock(active_reader_mu_);
+  active_reader_ = reader;
+}
+
+std::shared_ptr<PqResultArrayReader> PostgresConnection::ActiveReader() const {
+  std::lock_guard<std::mutex> lock(active_reader_mu_);
+  return active_reader_.lock();
+}
+
+AdbcStatusCode PostgresConnection::FinishActiveReader(struct AdbcError* error) {
+  std::shared_ptr<PqResultArrayReader> reader;
+  {
+    std::lock_guard<std::mutex> lock(active_reader_mu_);
+    reader = active_reader_.lock();
+    active_reader_.reset();
+  }
+  // A script's commit failure stays on that reader. Only a transaction this
+  // connection still cannot roll back fails the caller.
+  if (reader) reader->ReleaseConnection();
+  return RollbackAbandonedTransaction(error);
+}
+
 AdbcStatusCode PostgresConnection::Release(struct AdbcError* error) {
+  // Finish a server read on this thread before PQfinish. Disconnect drops any
+  // transaction the script could not end, so that failure is not reported.
+  FinishActiveReader(nullptr);
+  disconnected_.store(true);
   if (cancel_) {
     PQfreeCancel(cancel_);
     cancel_ = nullptr;
@@ -1194,6 +1252,7 @@ AdbcStatusCode PostgresConnection::Rollback(struct AdbcError* error) {
     return ADBC_STATUS_INVALID_STATE;
   }
 
+  RAISE_ADBC(FinishActiveReader(error));
   PGTransactionStatusType txn_status = PQtransactionStatus(conn_);
   if (txn_status == PQTRANS_IDLE) {
     // https://github.com/apache/arrow-adbc/issues/2673: don't rollback if the
@@ -1204,8 +1263,8 @@ AdbcStatusCode PostgresConnection::Rollback(struct AdbcError* error) {
 
   PGresult* result = PQexec(conn_, "ROLLBACK");
   if (PQresultStatus(result) != PGRES_COMMAND_OK) {
-    InternalAdbcSetError(error, "%s%s",
-                         "[libpq] Failed to rollback: ", PQerrorMessage(conn_));
+    InternalAdbcSetError(error, "%s%s", "[libpq] Failed to rollback: ",
+                         PqErrorText(nullptr, conn_).c_str());
     PQclear(result);
     return ADBC_STATUS_IO;
   }
@@ -1237,11 +1296,12 @@ AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
     }
 
     if (autocommit != autocommit_) {
+      RAISE_ADBC(FinishActiveReader(error));
       if (autocommit && PQtransactionStatus(conn_) != PQTRANS_IDLE) {
         PGresult* result = PQexec(conn_, "COMMIT");
         if (PQresultStatus(result) != PGRES_COMMAND_OK) {
           InternalAdbcSetError(error, "%s%s", "[libpq] Failed to update autocommit: ",
-                               PQerrorMessage(conn_));
+                               PqErrorText(nullptr, conn_).c_str());
           PQclear(result);
           return ADBC_STATUS_IO;
         }
@@ -1261,6 +1321,7 @@ AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
     RAISE_ADBC(EscapeIdentifier(conn_, value, &value_esc, error));
     std::string query = fmt::format("SET search_path TO {}", value_esc);
 
+    RAISE_ADBC(FinishActiveReader(error));
     PqResultHelper result_helper{conn_, query};
     RAISE_STATUS(error, result_helper.Execute());
     return ADBC_STATUS_OK;
@@ -1288,6 +1349,7 @@ AdbcStatusCode PostgresConnection::SetOption(const char* key, const char* value,
 
     std::string query = fmt::format(
         "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {}", pg_level);
+    RAISE_ADBC(FinishActiveReader(error));
     PqResultHelper result_helper{conn_, query};
     RAISE_STATUS(error, result_helper.Execute());
     return ADBC_STATUS_OK;
