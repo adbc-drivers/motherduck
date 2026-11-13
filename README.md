@@ -37,6 +37,14 @@ MotherDuck's PostgreSQL protocol endpoint and is forked from Apache Arrow ADBC's
 libpq-based PostgreSQL driver. The upstream PostgreSQL driver's approach credits
 [pgeon](https://github.com/0x0L/pgeon).
 
+> [!IMPORTANT]
+> This driver is **not** a drop-in replacement for the ADBC PostgreSQL driver,
+> although it is built from it and talks to MotherDuck's PostgreSQL protocol
+> endpoint. It is a separate driver with its own name and entry point, it only
+> works with MotherDuck, and some of the PostgreSQL driver's options and
+> features behave differently or don't work. See
+> [Differences from the PostgreSQL driver](#differences-from-the-postgresql-driver).
+
 ## Installation
 
 Released builds are published for various platforms on the
@@ -193,6 +201,31 @@ libpq connection service files (`~/.pg_service.conf`, `service=`, or
 replaces any `options` a service file sets, doesn't default `sslmode` when
 one is named, and can't combine one with a `region`. Put connection settings
 in the URI instead.
+
+## Differences from the PostgreSQL driver
+
+Code written for the ADBC PostgreSQL driver (`adbc_driver_postgresql`) needs
+changes to use this driver, and settings for this driver mean nothing to the
+PostgreSQL driver:
+
+- **A separate driver.** Load `motherduck`, not `postgresql`. The entry point is
+  `AdbcDriverMotherduckInit`, not `AdbcDriverPostgresqlInit`.
+- **MotherDuck only.** The driver connects only to MotherDuck's PostgreSQL
+  endpoint. Plain PostgreSQL servers aren't supported, because every connection
+  sets `attach_mode`.
+- **Connection settings.** The MotherDuck token is the password, and the user
+  defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
+  and connection service files are never used, and `sslmode` defaults to
+  `require`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
+- **Options that differ.** `adbc.postgresql.use_copy` defaults to `false`, and
+  setting it to `true` fails. `adbc.postgresql.type_resolver_mode` is accepted
+  and ignored. `adbc.connection.db_schema` names a schema, not an arbitrary
+  `search_path`; use `USE <database>` to change databases.
+- **Results and errors.** DML and DDL return an empty stream, and `rows_affected`
+  for `UPDATE` and `DELETE` is the number of rows changed. Data conversion
+  errors map to `INTERNAL` instead of `INVALID_DATA`.
+- **Missing features.** Bulk ingest, COPY result reads, statistics, and others
+  don't work; see the list below.
 
 ## Unsupported PostgreSQL driver features
 
