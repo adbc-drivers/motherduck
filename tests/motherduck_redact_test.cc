@@ -23,6 +23,7 @@
 #include <libpq-fe.h>
 
 #include "error.h"
+#include "motherduck_database.h"
 #include "motherduck_redact.h"
 
 namespace adbcpq {
@@ -333,8 +334,11 @@ TEST(MotherDuckRedactTest, EveryPrefixOfAnEchoHidesTheStatement) {
 // libpq's default error message echoes the statement ("LINE 1: ..."); ours must not.
 // MotherDuck also writes the echo into the primary message, which the redactor drops.
 TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
-  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
-  if (!uri) GTEST_SKIP() << "ADBC_POSTGRESQL_TEST_URI not set";
+  const char* env_uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  if (!env_uri) GTEST_SKIP() << "ADBC_POSTGRESQL_TEST_URI not set";
+  // libpq connects directly here, so it needs the URI in its own form.
+  const std::string normalized_uri = adbcpq::NormalizeUri(env_uri);
+  const char* uri = normalized_uri.c_str();
   // The driver adds the token; so does this.
   const char* token = std::getenv("MOTHERDUCK_TOKEN");
   const char* keywords[] = {"dbname", "password", nullptr, nullptr};

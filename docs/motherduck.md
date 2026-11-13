@@ -52,7 +52,7 @@ from adbc_driver_manager import dbapi
 with dbapi.connect(
     driver="motherduck",
     db_kwargs={
-        "uri": "postgresql:///my_db",
+        "uri": "motherduck:///my_db",
         "adbc.motherduck.region": "us-east-1",
     },
 ) as conn:
@@ -63,11 +63,10 @@ with dbapi.connect(
 
 The region sets the host, so the URI can leave it out. `us-east-1` connects to
 `pg.us-east-1-aws.motherduck.com`. Without the option, put the host in the URI
-instead: `postgresql://pg.us-east-1-aws.motherduck.com/my_db`.
+instead: `motherduck://pg.us-east-1-aws.motherduck.com/my_db`.
 
-The URI can also use the `motherduck://` scheme, such as `motherduck:///my_db`.
-Passed in place of the driver name, an ADBC driver manager loads the driver
-named by the URI's scheme, so `motherduck://` alone selects this driver:
+The URI's scheme names the driver, so an ADBC driver manager can pick this
+driver from the URI alone. Pass the URI in place of the driver name:
 
 ```python
 from adbc_driver_manager import dbapi
@@ -85,20 +84,19 @@ connect to `md:` and set `adbc.motherduck.attach_mode` to `workspace`.
 
 ### Connection String Format
 
-The URI uses the libpq connection URI syntax, with either scheme:
+The URI is a `motherduck://` URI:
 
 ```text
-postgresql://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
 motherduck://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
 ```
 
-The driver reads `motherduck://` as `postgresql://`, so everything below
-applies to both. Write the scheme in lowercase, as libpq's must be. The ADBC
-driver manager passes the whole URI to the driver, and takes the driver's name
-from the scheme when the URI is given in place of a driver name. A
-`motherduck://` URI must name a host or be used with `adbc.motherduck.region`;
-without either, connecting fails instead of falling back to `PGHOST` or a local
-socket, as libpq would.
+The driver accepts no other scheme. A `postgresql://` or `postgres://` URI, or a
+libpq keyword/value string, fails with `INVALID_ARGUMENT`, so the driver doesn't
+commit to libpq's connection syntax. Write the scheme in lowercase. The URI
+must name a host or be used with `adbc.motherduck.region`; without either,
+connecting fails instead of falling back to `PGHOST` or a local socket, as
+libpq would. The parameters after the `?` are libpq's, because the driver hands
+libpq the same URI with `postgresql://` in place of `motherduck://`.
 
 Components:
 
@@ -154,6 +152,8 @@ PostgreSQL driver:
 - **MotherDuck only.** The driver connects only to MotherDuck's PostgreSQL
   endpoint. Plain PostgreSQL servers aren't supported, because every connection
   sets `attach_mode`.
+- **Connection URI.** The URI must use the `motherduck://` scheme, not
+  `postgresql://`, and must name a host or be used with `adbc.motherduck.region`.
 - **Connection settings.** The MotherDuck token is the password, and the user
   defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
   and connection service files are never used, and `sslmode` defaults to

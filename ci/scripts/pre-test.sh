@@ -74,7 +74,7 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 
 uri_for() {
-  printf 'postgresql://postgres@%s:5432/%s?sslmode=verify-full&sslrootcert=%s' \
+  printf 'motherduck://postgres@%s:5432/%s?sslmode=verify-full&sslrootcert=%s' \
     "$host" "${1//:/%3A}" "$ca_bundle"
 }
 

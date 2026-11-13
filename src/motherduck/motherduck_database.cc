@@ -46,8 +46,9 @@ namespace {
 constexpr char kDefaultAttachMode[] = "single";
 // MotherDuck's endpoint expects the user postgres.
 constexpr char kDefaultUser[] = "postgres";
-// The URI scheme an ADBC driver manager selects this driver by. Matched case-sensitively,
-// like libpq matches postgresql://.
+// The URI scheme an ADBC driver manager selects this driver by, and the only one the
+// driver accepts, so it doesn't commit to libpq's connection syntax. Matched
+// case-sensitively, like libpq matches postgresql://.
 constexpr std::string_view kMotherduckScheme = "motherduck://";
 
 // An environment variable, or empty if it's unset. On Windows this reads the
@@ -287,9 +288,15 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
              std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
     password_ = value;
   } else if (std::strcmp(key, "uri") == 0) {
-    // Keep the URI in the form libpq parses, so nothing that reads uri_ sees
-    // motherduck://.
-    motherduck_scheme_ = std::string_view(value).starts_with(kMotherduckScheme);
+    // An empty value unsets it. Keep the URI in the form libpq parses, so nothing
+    // that reads uri_ sees motherduck://.
+    if (*value != '\0' && !std::string_view(value).starts_with(kMotherduckScheme)) {
+      InternalAdbcSetError(error,
+                           "[libpq] Invalid database option 'uri': expected a "
+                           "motherduck:// URI, such as motherduck:///my_db or "
+                           "motherduck://pg.us-east-1-aws.motherduck.com/my_db");
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
     return PostgresDatabase::SetOption(key, NormalizeUri(value).c_str(), error);
   } else {
     return PostgresDatabase::SetOption(key, value, error);
@@ -371,12 +378,11 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   }
 
   bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
-  // A motherduck:// URI names MotherDuck, so without a host libpq mustn't fall
-  // back to PGHOST or a local socket, which would send the token elsewhere.
-  if (motherduck_scheme_ && region_.empty() && uri_host.empty() && uri_hostaddr.empty() &&
-      !names_service) {
+  // Without a host libpq would fall back to PGHOST or a local socket, which
+  // would send the token somewhere other than MotherDuck.
+  if (region_.empty() && uri_host.empty() && uri_hostaddr.empty() && !names_service) {
     InternalAdbcSetError(error,
-                         "[libpq] A motherduck:// URI needs a host, or the database "
+                         "[libpq] The URI needs a host, or set the database "
                          "option '%s'",
                          ADBC_MOTHERDUCK_OPTION_REGION);
     return ADBC_STATUS_INVALID_ARGUMENT;

@@ -776,7 +776,7 @@ TEST_F(PostgresDatabaseTest, RegionOption) {
   // Take the region from the test URI's host, then drop the host.
   std::string hostless = uri;
   size_t start = hostless.find('@');
-  ASSERT_NE(start, std::string::npos) << "Test URI must be postgresql://user@host...";
+  ASSERT_NE(start, std::string::npos) << "Test URI must be motherduck://user@host...";
   start++;
   size_t end = hostless.find_first_of(":/?", start);
   std::string host = hostless.substr(start, end - start);
@@ -829,18 +829,24 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
   char* parse_error = nullptr;
-  PQconninfoOption* conninfo = PQconninfoParse(uri, &parse_error);
+  PQconninfoOption* conninfo =
+      PQconninfoParse(adbcpq::NormalizeUri(uri).c_str(), &parse_error);
   ASSERT_NE(conninfo, nullptr) << (parse_error ? parse_error : "out of memory");
-  std::string base;
+  std::string user, host, port, dbname;
   std::string rootcert;
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
     if (option->val == nullptr || *option->val == '\0') continue;
     std::string_view keyword = option->keyword;
     if (keyword == "sslrootcert") {
       rootcert = option->val;
-    } else if (keyword == "host" || keyword == "port" || keyword == "dbname" ||
-               keyword == "user") {
-      base += std::string(keyword) + "='" + option->val + "' ";
+    } else if (keyword == "user") {
+      user = option->val;
+    } else if (keyword == "host") {
+      host = option->val;
+    } else if (keyword == "port") {
+      port = option->val;
+    } else if (keyword == "dbname") {
+      dbname = option->val;
     }
   }
   PQconninfoFree(conninfo);
@@ -867,9 +873,11 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   ScopedEnv pgsslmode("PGSSLMODE", nullptr);
   ScopedEnv pgsslrootcert("PGSSLROOTCERT", nullptr);
   for (const Case& test_case : kCases) {
-    std::string conn_uri = base + "sslmode=" + test_case.sslmode;
+    // The database name has no characters that need escaping, such as md:.
+    std::string conn_uri = "motherduck://" + user + "@" + host + ":" + port + "/" +
+                           dbname + "?sslmode=" + test_case.sslmode;
     if (!test_case.sslrootcert.empty()) {
-      conn_uri += " sslrootcert='" + test_case.sslrootcert + "'";
+      conn_uri += "&sslrootcert=" + test_case.sslrootcert;
     }
     SCOPED_TRACE(std::string("sslmode=") + test_case.sslmode +
                  " sslrootcert=" + test_case.sslrootcert);

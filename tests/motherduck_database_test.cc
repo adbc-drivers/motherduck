@@ -182,11 +182,11 @@ TEST(MotherDuckRegionTest, OptionInvalid) {
 TEST(MotherDuckRegionTest, ConflictsWithHost) {
   // Fails before connecting, so this needs no server.
   for (const char* uri :
-       {"postgresql://postgres@localhost:1/db", "host=localhost dbname=db",
-        "hostaddr=127.0.0.1 dbname=db", "dbname=db"}) {
+       {"motherduck://postgres@localhost:1/db", "motherduck://localhost/db",
+        "motherduck:///db?hostaddr=127.0.0.1", "motherduck:///db"}) {
     // Without a host in the URI, PGHOSTADDR conflicts.
-    ScopedEnv pghostaddr("PGHOSTADDR",
-                         std::strcmp(uri, "dbname=db") == 0 ? "127.0.0.1" : nullptr);
+    ScopedEnv pghostaddr(
+        "PGHOSTADDR", std::strcmp(uri, "motherduck:///db") == 0 ? "127.0.0.1" : nullptr);
     struct AdbcError error = {};
     adbc_validation::Handle<struct AdbcDatabase> database;
     ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
@@ -212,7 +212,7 @@ TEST(MotherDuckUsernameTest, OptionSetGet) {
       adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
       ::testing::Optional("postgres"s));
   ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri",
-                                    "postgresql://alice@localhost/db", &error),
+                                    "motherduck://alice@localhost/db", &error),
               IsOkStatus(&error));
   EXPECT_THAT(
       adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
@@ -234,7 +234,7 @@ TEST(MotherDuckUsernameTest, MotherduckScheme) {
   EXPECT_THAT(
       adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
       ::testing::Optional("alice"s));
-  // A URI that doesn't parse is reported the same way as a postgresql:// one.
+  // A URI that doesn't parse is reported as such.
   ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", "motherduck://[bad", &error),
               IsOkStatus(&error));
   EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_USERNAME, &error),
@@ -246,7 +246,7 @@ TEST(MotherDuckUsernameTest, UnparseableUri) {
   struct AdbcError error = {};
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", "postgresql://[bad", &error),
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", "motherduck://[bad", &error),
               IsOkStatus(&error));
   EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_USERNAME, &error),
               IsStatus(ADBC_STATUS_INVALID_STATE, &error));
@@ -261,7 +261,7 @@ TEST(MotherDuckPasswordTest, RequiresToken) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri",
-                                    "postgresql://postgres@localhost:1/db", &error),
+                                    "motherduck://postgres@localhost:1/db", &error),
               IsOkStatus(&error));
   EXPECT_THAT(AdbcDatabaseInit(&database.value, &error),
               IsStatus(ADBC_STATUS_UNAUTHENTICATED, &error));
@@ -328,7 +328,7 @@ class MotherDuckConnectParamsTest : public ::testing::Test {
 };
 
 TEST_F(MotherDuckConnectParamsTest, TokenAlias) {
-  SetOption("uri", "postgresql://localhost/db?password=uri");
+  SetOption("uri", "motherduck://localhost/db?password=uri");
   SetOption(ADBC_MOTHERDUCK_OPTION_TOKEN, "alias");
   EXPECT_THAT(Values("password"), ::testing::ElementsAre("alias"));
   // It's the same option, so the last one set wins.
@@ -340,12 +340,12 @@ TEST_F(MotherDuckConnectParamsTest, TokenAlias) {
 }
 
 TEST_F(MotherDuckConnectParamsTest, UserDefaultsToPostgres) {
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("user"), ::testing::ElementsAre("postgres"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, UriUser) {
-  SetOption("uri", "postgresql://alice@localhost/db");
+  SetOption("uri", "motherduck://alice@localhost/db");
   EXPECT_THAT(Values("user"), ::testing::ElementsAre("alice"));
 }
 
@@ -355,7 +355,7 @@ TEST(MotherDuckUriTest, NormalizeUri) {
   EXPECT_EQ("postgresql://a:b@h:1/db?x=y",
             adbcpq::NormalizeUri("motherduck://a:b@h:1/db?x=y"));
   EXPECT_EQ("postgresql:///", adbcpq::NormalizeUri("motherduck:///"));
-  // Other URIs and connection strings are left alone.
+  // Anything else is returned as is.
   for (const char* uri : {"postgresql://localhost/db", "postgres://localhost/db",
                           "host=localhost dbname=db", "md:db", "motherduck:db",
                           "motherduck:/", "", "motherduck:/x",
@@ -365,7 +365,28 @@ TEST(MotherDuckUriTest, NormalizeUri) {
   }
 }
 
-TEST_F(MotherDuckConnectParamsTest, MotherduckScheme) {
+TEST(MotherDuckUriTest, RejectsOtherSchemes) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const char* uri : {"postgresql://localhost/db", "postgres://localhost/db",
+                          "host=localhost dbname=db", "md:db",
+                          "MotherDuck://localhost/db", "motherduck:/db"}) {
+    SCOPED_TRACE(uri);
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, "uri", uri, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    EXPECT_THAT(error.message, ::testing::HasSubstr("expected a motherduck:// URI"));
+    if (error.release) error.release(&error);
+    error = {};
+  }
+  // An empty value unsets the URI, as it did before.
+  EXPECT_THAT(AdbcDatabaseSetOption(&database.value, "uri", "", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(AdbcDatabaseSetOption(&database.value, "uri", "motherduck:///db", &error),
+              IsOkStatus(&error));
+}
+
+TEST_F(MotherDuckConnectParamsTest, UriParts) {
   SetOption("uri", "motherduck://alice:secret@localhost:5000/db?application_name=dbt");
   EXPECT_THAT(Values("host"), ::testing::ElementsAre("localhost"));
   EXPECT_THAT(Values("port"), ::testing::ElementsAre("5000"));
@@ -378,7 +399,7 @@ TEST_F(MotherDuckConnectParamsTest, MotherduckScheme) {
                   "dbt adbc_driver_motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION));
 }
 
-TEST_F(MotherDuckConnectParamsTest, MotherduckSchemeNeedsHost) {
+TEST_F(MotherDuckConnectParamsTest, UriNeedsHost) {
   // Without a host, libpq would use PGHOST or a local socket.
   ScopedEnv pghost("PGHOST", "elsewhere.example.com");
   SetOption("uri", "motherduck:///db");
@@ -393,19 +414,15 @@ TEST_F(MotherDuckConnectParamsTest, MotherduckSchemeNeedsHost) {
   SetOption("uri", "motherduck:///db");
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
   EXPECT_EQ(ADBC_STATUS_OK, Status());
-  // Other URIs are unchanged: PGHOST still fills a missing host.
-  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "");
-  SetOption("uri", "postgresql:///db");
-  EXPECT_EQ(ADBC_STATUS_OK, Status());
 }
 
-TEST_F(MotherDuckConnectParamsTest, MotherduckSchemeRegionConflictsWithHost) {
+TEST_F(MotherDuckConnectParamsTest, RegionConflictsWithUriHost) {
   SetOption("uri", "motherduck://localhost/db");
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
   EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT, Status());
 }
 
-TEST_F(MotherDuckConnectParamsTest, MotherduckSchemeRegion) {
+TEST_F(MotherDuckConnectParamsTest, RegionWithoutUriHost) {
   SetOption("uri", "motherduck:///db");
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
   EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
@@ -413,7 +430,7 @@ TEST_F(MotherDuckConnectParamsTest, MotherduckSchemeRegion) {
 }
 
 TEST_F(MotherDuckConnectParamsTest, UsernameReplacesUriUser) {
-  SetOption("uri", "postgresql://alice@localhost/db");
+  SetOption("uri", "motherduck://alice@localhost/db");
   SetOption(ADBC_OPTION_USERNAME, "bob");
   EXPECT_THAT(Values("user"), ::testing::ElementsAre("bob"));
 }
@@ -421,7 +438,7 @@ TEST_F(MotherDuckConnectParamsTest, UsernameReplacesUriUser) {
 TEST_F(MotherDuckConnectParamsTest, SessionOptions) {
   // The defaults go first, so the URI can override them; explicit
   // options go last, so they override the URI.
-  SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy");
+  SetOption("uri", "motherduck://localhost/db?options=-c%20x%3Dy");
   SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "adbc_session");
   EXPECT_THAT(Values("options"),
               ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=single "
@@ -435,7 +452,7 @@ TEST_F(MotherDuckConnectParamsTest, SessionOptions) {
 
 TEST_F(MotherDuckConnectParamsTest, PgoptionsBetweenDefaultsAndOptions) {
   ScopedEnv pgoptions("PGOPTIONS", "--attach_mode=workspace");
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(
       Values("options"),
       ::testing::ElementsAre(
@@ -448,7 +465,7 @@ TEST_F(MotherDuckConnectParamsTest, PgoptionsBetweenDefaultsAndOptions) {
 }
 
 TEST_F(MotherDuckConnectParamsTest, SessionNameEscaped) {
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "my session");
   EXPECT_THAT(Values("options"),
               ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=single "
@@ -457,69 +474,69 @@ TEST_F(MotherDuckConnectParamsTest, SessionNameEscaped) {
 
 TEST_F(MotherDuckConnectParamsTest, ApplicationName) {
   const std::string driver = "adbc_driver_motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION;
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("application_name"), ::testing::ElementsAre(driver));
-  SetOption("uri", "postgresql://localhost/db?fallback_application_name=fallback");
+  SetOption("uri", "motherduck://localhost/db?fallback_application_name=fallback");
   EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("fallback " + driver));
   EXPECT_THAT(Values("fallback_application_name"), ::testing::IsEmpty());
-  SetOption("uri", "postgresql://localhost/db?application_name=dbt");
+  SetOption("uri", "motherduck://localhost/db?application_name=dbt");
   EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("dbt " + driver));
   // PGAPPNAME is never used.
   ScopedEnv pgappname("PGAPPNAME", "env");
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("application_name"), ::testing::ElementsAre(driver));
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionRequiresTls) {
-  SetOption("uri", "postgresql:///db");
+  SetOption("uri", "motherduck:///db");
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
   EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, RequiresTls) {
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
-  SetOption("uri", "host=localhost dbname=db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, EmptySslmodeRequiresTls) {
   // libpq uses the last value given for a keyword, so require wins.
-  SetOption("uri", "postgresql://localhost/db?sslmode=");
+  SetOption("uri", "motherduck://localhost/db?sslmode=");
   EXPECT_EQ(Values("sslmode").back(), "require");
-  SetOption("uri", "host=localhost dbname=db sslmode=''");
+  SetOption("uri", "motherduck://localhost/db?sslmode=");
   EXPECT_EQ(Values("sslmode").back(), "require");
   ScopedEnv pgsslmode("PGSSLMODE", "");
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, KeepsUriSslmode) {
-  SetOption("uri", "postgresql://localhost/db?sslmode=verify-full");
+  SetOption("uri", "motherduck://localhost/db?sslmode=verify-full");
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
-  SetOption("uri", "host=localhost dbname=db sslmode=disable");
+  SetOption("uri", "motherduck://localhost/db?sslmode=disable");
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("disable"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, KeepsRequiressl) {
   // libpq translates the deprecated requiressl=1 into sslmode=require.
-  SetOption("uri", "host=localhost dbname=db requiressl=1");
+  SetOption("uri", "motherduck://localhost/db?requiressl=1");
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, KeepsPgsslmode) {
   ScopedEnv pgsslmode("PGSSLMODE", "verify-full");
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, KeepsServiceSslmode) {
   // The service file may set sslmode, which a default here would override.
-  SetOption("uri", "service=md dbname=db");
+  SetOption("uri", "motherduck:///db?service=md");
   EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
   ScopedEnv pgservice("PGSERVICE", "md");
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
 }
 
@@ -552,7 +569,9 @@ TEST_F(MotherDuckConnectParamsTest, SslmodeMatrix) {
           std::string query;
           if (*uri_mode != '\0') query += std::string("&sslmode=") + uri_mode;
           if (*rootcert.uri != '\0') query += std::string("&sslrootcert=") + rootcert.uri;
-          std::string uri = "postgresql:///db";
+          // A region supplies the host; without one, the URI needs it.
+          std::string uri =
+              *region != '\0' ? "motherduck:///db" : "motherduck://localhost/db";
           if (!query.empty()) uri += "?" + query.substr(1);
           SCOPED_TRACE(uri + " region=" + region +
                        " PGSSLMODE=" + (env_mode ? env_mode : "(unset)") +
@@ -577,24 +596,24 @@ TEST_F(MotherDuckConnectParamsTest, SslmodeMatrix) {
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionPort) {
-  SetOption("uri", "postgresql:///db");
+  SetOption("uri", "motherduck:///db");
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
   EXPECT_THAT(Values("port"), ::testing::ElementsAre("5432"));
-  SetOption("uri", "postgresql://:6543/db");
+  SetOption("uri", "motherduck://:6543/db");
   EXPECT_THAT(Values("port"), ::testing::ElementsAre("6543"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionMatchingHost) {
-  SetOption("uri", "postgresql://pg.us-east-1-aws.motherduck.com/db");
+  SetOption("uri", "motherduck://pg.us-east-1-aws.motherduck.com/db");
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
   EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
   // Hostnames ignore case and a trailing dot.
-  SetOption("uri", "host=PG.US-EAST-1-AWS.MOTHERDUCK.COM. dbname=db");
+  SetOption("uri", "motherduck://PG.US-EAST-1-AWS.MOTHERDUCK.COM./db");
   EXPECT_THAT(Values("host"), ::testing::ElementsAre("PG.US-EAST-1-AWS.MOTHERDUCK.COM."));
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionLowercased) {
-  SetOption("uri", "postgresql:///db");
+  SetOption("uri", "motherduck:///db");
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "US-East-1");
   EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
   char region[32];
@@ -608,9 +627,9 @@ TEST_F(MotherDuckConnectParamsTest, RegionLowercased) {
 TEST_F(MotherDuckConnectParamsTest, RegionRejectsService) {
   // libpq would fill hostaddr from the service, connecting elsewhere.
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
-  SetOption("uri", "service=local dbname=db");
+  SetOption("uri", "motherduck:///db?service=local");
   EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
-  SetOption("uri", "postgresql:///db");
+  SetOption("uri", "motherduck:///db");
   {
     ScopedEnv pgservice("PGSERVICE", "local");
     EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
@@ -620,20 +639,20 @@ TEST_F(MotherDuckConnectParamsTest, RegionRejectsService) {
 
 TEST_F(MotherDuckConnectParamsTest, OptionsLoneBackslash) {
   // With nothing appended after them, a trailing backslash is harmless.
-  SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy%5C");
+  SetOption("uri", "motherduck://localhost/db?options=-c%20x%3Dy%5C");
   EXPECT_EQ(Status(), ADBC_STATUS_OK);
   // It would escape the space before an explicit option.
   SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME, "s");
   EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
   // An escaped backslash is fine.
-  SetOption("uri", "postgresql://localhost/db?options=-c%20x%3Dy%5C%5C");
+  SetOption("uri", "motherduck://localhost/db?options=-c%20x%3Dy%5C%5C");
   EXPECT_THAT(Values("options"),
               ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=single "
                                      "-c x=y\\\\ --session_name=s"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, NoRegionLeavesPort) {
-  SetOption("uri", "postgresql://localhost/db");
+  SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("port"), ::testing::IsEmpty());
 }
 
