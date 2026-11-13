@@ -516,11 +516,11 @@ TEST_F(CredentialsFileTest, IgnoresInvalidFiles) {
 TEST_F(CredentialsFileTest, LoginAnnouncement) {
   EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
   const auto until = std::chrono::system_clock::now() + 90s;
-  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, 1234, until).ok());
+  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, until).ok());
   std::optional<adbcpq::auth::LoginAnnouncement> read =
       adbcpq::auth::ReadLoginAnnouncement(path_);
   ASSERT_TRUE(read.has_value());
-  EXPECT_EQ(read->pid, 1234);
+  EXPECT_GT(read->pid, 0);
   EXPECT_EQ(std::chrono::floor<std::chrono::milliseconds>(read->until),
             std::chrono::floor<std::chrono::milliseconds>(until));
   adbcpq::auth::RemoveLoginAnnouncement(path_);
@@ -528,17 +528,15 @@ TEST_F(CredentialsFileTest, LoginAnnouncement) {
 
   fs::path announcement = path_;
   announcement += ".login";
+  WriteFile(announcement, "1234 5\n");
+  read = adbcpq::auth::ReadLoginAnnouncement(path_);
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->pid, 1234);
+  EXPECT_EQ(read->until, std::chrono::system_clock::time_point(5ms));
   for (const char* contents : {"", "1234", "x 5", "0 5", "-3 5", "12 5 extra", "12 x"}) {
     WriteFile(announcement, contents);
     EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt) << contents;
   }
-}
-
-TEST(MotherDuckProcessTest, ProcessIsRunning) {
-  EXPECT_TRUE(adbcpq::auth::ProcessIsRunning(adbcpq::auth::CurrentProcessId()));
-  EXPECT_FALSE(adbcpq::auth::ProcessIsRunning(0));
-  EXPECT_FALSE(adbcpq::auth::ProcessIsRunning(-1));
-  EXPECT_FALSE(adbcpq::auth::ProcessIsRunning(0x7ffffff0));
 }
 
 TEST_F(CredentialsFileTest, RemoveOnlyMatchingToken) {
@@ -619,9 +617,8 @@ TEST_F(TokenCacheTest, UsesTokenFromLoginInAnotherProcess) {
   // is logging in.
   std::unique_ptr<adbcpq::auth::CredentialsLock> other;
   ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
-  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, adbcpq::auth::CurrentProcessId(),
-                                          std::chrono::system_clock::now() + 1h)
-                  .ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() + 1h).ok());
   TokenCache cache = MakeCache();
   Credentials credentials;
   std::future<Status> result = std::async(
@@ -651,9 +648,8 @@ TEST_F(TokenCacheTest, WaitsPastTimeoutForAnnouncedLogin) {
   // this database's own login timeout, then use its token.
   std::unique_ptr<adbcpq::auth::CredentialsLock> other;
   ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
-  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, adbcpq::auth::CurrentProcessId(),
-                                          std::chrono::system_clock::now() + 1h)
-                  .ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() + 1h).ok());
   options_.timeout = 5s;
   const auto start = now_;
   env_.sleep = [&](std::chrono::milliseconds duration) {
@@ -675,31 +671,66 @@ TEST_F(TokenCacheTest, WaitsPastTimeoutForAnnouncedLogin) {
 TEST_F(TokenCacheTest, TimesOutWhenAnnouncedLoginIsOverdue) {
   std::unique_ptr<adbcpq::auth::CredentialsLock> other;
   ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
-  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, adbcpq::auth::CurrentProcessId(),
-                                          std::chrono::system_clock::now() - 1h)
-                  .ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() - 1h).ok());
   TokenCache cache = MakeCache();
   Credentials credentials;
+  const auto start = now_;
   const Status status = cache.Get(/*need_host=*/false, &credentials);
   EXPECT_EQ(Code(status), ADBC_STATUS_TIMEOUT);
   EXPECT_THAT(status.message(), HasSubstr("longer than its timeout"));
-  EXPECT_TRUE(sleeps_.empty());
+  // Overdue for 10s of polling, not just once.
+  EXPECT_GE(now_ - start, 10s);
+  EXPECT_LT(now_ - start, 13s);
 }
 
-TEST_F(TokenCacheTest, IgnoresAnnouncementOfEndedProcess) {
-  // A crashed process's announcement is left behind; the lock holder is a
-  // process that isn't logging in, so wait the login timeout.
+TEST_F(TokenCacheTest, ToleratesStaleAnnouncementBriefly) {
+  // A crashed login left an overdue announcement, and a new holder has the lock
+  // until it removes it: not a stuck login.
   std::unique_ptr<adbcpq::auth::CredentialsLock> other;
   ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
-  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, /*pid=*/0x7ffffff0,
-                                          std::chrono::system_clock::now() + 1h)
-                  .ok());
-  options_.timeout = 5s;
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() - 1h).ok());
+  const auto start = now_;
+  env_.sleep = [&](std::chrono::milliseconds duration) {
+    now_ += duration;
+    adbcpq::auth::RemoveLoginAnnouncement(path_);
+    if (other && now_ - start > 2s) {
+      ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "other-token").ok());
+      other.reset();
+    }
+  };
   TokenCache cache = MakeCache();
   Credentials credentials;
-  const Status status = cache.Get(/*need_host=*/false, &credentials);
-  EXPECT_EQ(Code(status), ADBC_STATUS_TIMEOUT);
-  EXPECT_THAT(status.message(), HasSubstr("waiting for another MotherDuck login"));
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "other-token");
+}
+
+TEST_F(TokenCacheTest, RemovesStaleAnnouncementWhenLocking) {
+  ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "saved-token").ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() + 1h).ok());
+  http_->Respond(kLookupUserWithTokenUrl, 401, R"({"errMessage":"Invalid token"})");
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  // Forgetting the token takes the lock.
+  EXPECT_TRUE(cache.Reject("saved-token"));
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
+}
+
+TEST_F(TokenCacheTest, BacksOffPollingTheLock) {
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  options_.timeout = 10s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
+  ASSERT_GE(sleeps_.size(), 6);
+  EXPECT_EQ(sleeps_[0], 100ms);
+  EXPECT_EQ(sleeps_[1], 200ms);
+  EXPECT_EQ(sleeps_.back(), 2000ms);
+  EXPECT_LT(sleeps_.size(), 12);
 }
 
 TEST_F(TokenCacheTest, BoundsUnannouncedWaitWithoutTimeout) {
@@ -712,7 +743,7 @@ TEST_F(TokenCacheTest, BoundsUnannouncedWaitWithoutTimeout) {
   const auto start = now_;
   EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
   EXPECT_GE(now_ - start, 30s);
-  EXPECT_LT(now_ - start, 31s);
+  EXPECT_LT(now_ - start, 33s);
 }
 
 TEST_F(TokenCacheTest, AnnouncesLoginWhileLoggingIn) {
@@ -728,7 +759,7 @@ TEST_F(TokenCacheTest, AnnouncesLoginWhileLoggingIn) {
   const auto before = std::chrono::system_clock::now();
   ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
   ASSERT_TRUE(during.has_value());
-  EXPECT_EQ(during->pid, adbcpq::auth::CurrentProcessId());
+  EXPECT_GT(during->pid, 0);
   EXPECT_GE(during->until, std::chrono::floor<std::chrono::milliseconds>(
                                before + adbcpq::auth::MaxLoginDuration(options_)));
   EXPECT_LE(during->until,
@@ -795,9 +826,8 @@ TEST_F(TokenCacheTest, WaitsWhileAnnouncedLoginSavesItsToken) {
   // then keeps the lock a little longer to save its token.
   std::unique_ptr<adbcpq::auth::CredentialsLock> other;
   ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
-  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, adbcpq::auth::CurrentProcessId(),
-                                          std::chrono::system_clock::now() + 1h)
-                  .ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() + 1h).ok());
   options_.timeout = 5s;
   const auto start = now_;
   env_.sleep = [&](std::chrono::milliseconds duration) {

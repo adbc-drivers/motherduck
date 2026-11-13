@@ -174,8 +174,8 @@ Like the MotherDuck DuckDB extension's login, it doesn't use an HTTP proxy.
   that use the same file take turns logging in, through `credentials.json.lock`
   next to it, so they share one login. The process logging in writes its
   process ID and when its login ends at the latest to `credentials.json.login`.
-  The others wait for that login as long as it takes, and give up once it's
-  10 seconds overdue, naming the stuck process. They wait at most
+  The others wait for that login as long as it takes, and give up once it has
+  been overdue for 10 seconds, naming the stuck process. They wait at most
   `login_timeout` (or 30 seconds with `0`) for a process that holds the lock
   without logging in.
 - Connections opened at the same time in one process, such as one per thread,

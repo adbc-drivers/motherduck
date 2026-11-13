@@ -127,25 +127,23 @@ class CredentialsLock {
 /// \brief A login in progress, announced in credentials.json.login by the process
 ///   holding the credentials lock, so waiters know how long to wait.
 struct LoginAnnouncement {
+  /// \brief For error messages only: in another PID namespace it means nothing.
   int64_t pid = 0;
   /// \brief When the login ends at the latest.
   std::chrono::system_clock::time_point until;
+
+  bool operator==(const LoginAnnouncement&) const = default;
 };
 
-/// \brief Announce that process pid is logging in through the credentials file
+/// \brief Announce that this process is logging in through the credentials file
 ///   at path until at most until.
-Status AnnounceLogin(const std::filesystem::path& path, int64_t pid,
+Status AnnounceLogin(const std::filesystem::path& path,
                      std::chrono::system_clock::time_point until);
 
 /// \brief The announced login, or nullopt if there's none or it's unreadable.
 std::optional<LoginAnnouncement> ReadLoginAnnouncement(const std::filesystem::path& path);
 
 void RemoveLoginAnnouncement(const std::filesystem::path& path);
-
-/// \brief Whether a process with this ID is running.
-bool ProcessIsRunning(int64_t pid);
-
-int64_t CurrentProcessId();
 
 /// \brief $MOTHERDUCK_HOME/credentials.json, or ~/.motherduck/credentials.json.
 Status CredentialsPath(std::filesystem::path* path);
