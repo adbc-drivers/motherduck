@@ -22,6 +22,7 @@
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import adbc_driver_manager.dbapi
@@ -37,6 +38,7 @@ from adbc_drivers_validation.tests.conftest import (  # noqa: F401
     pytest_collection_modifyitems,
 )
 
+from .naming import is_stale_test_name
 from .postgresql import TEST_SCHEMA, get_quirks
 
 
@@ -58,20 +60,6 @@ def driver_path(driver: adbc_drivers_validation.model.DriverQuirks) -> str:
     }.get(sys.platform, "so")
     base = Path(__file__).resolve().parent.parent.parent
     return str(base / f"build/libadbc_driver_motherduck.{ext}")
-
-
-# How a run's schema (see TEST_SCHEMA), and every schema or database named after
-# it, starts, with the run's Unix time as group 1. Matches kTestNamePattern in
-# tests/postgresql_test.cc, which names the C++ suite's schemas the same way.
-_TEST_NAME_PATTERN = "^adbc_test_([0-9]{10})_[0-9]+_"
-
-
-def _stale(column: str) -> str:
-    """'stale' for a test-shaped name in column with a time a day or more ago."""
-    return (
-        f"CASE WHEN TRY_CAST(regexp_extract({column}, '{_TEST_NAME_PATTERN}', 1) "
-        "AS BIGINT) < CAST(epoch(now()) AS BIGINT) - 86400 THEN 'stale' ELSE '' END"
-    )
 
 
 @pytest.fixture(scope="session")
@@ -111,14 +99,14 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
     def own(name: str) -> bool:
         return name == schema or name.startswith(schema + "_")
 
-    def drop(cursor, name: str, stale: str, query: str) -> None:
+    def drop(cursor, name: str, query: str) -> None:
         # This run's own objects must go. Stale ones belong to a dead run, and
         # concurrent runs may drop the same one at once, which MotherDuck
         # rejects as a write-write conflict for all but one, so their drops
         # are best-effort.
         if own(name):
             cursor.execute(query)
-        elif stale == "stale":
+        elif is_stale_test_name(name, int(time.time())):
             try:
                 cursor.execute(query)
             except adbc_driver_manager.dbapi.Error as e:
@@ -128,22 +116,17 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
 
     def drop_leftovers(cursor) -> None:
         cursor.execute(
-            f"SELECT schema_name, {_stale('schema_name')} "
-            "FROM duckdb_schemas() WHERE database_name = current_database()"
+            "SELECT schema_name FROM duckdb_schemas() "
+            "WHERE database_name = current_database()"
         )
-        for name, stale in cursor.fetchall():
+        for (name,) in cursor.fetchall():
             drop(
-                cursor,
-                name,
-                stale,
-                f"DROP SCHEMA IF EXISTS {database}.{quote(name)} CASCADE",
+                cursor, name, f"DROP SCHEMA IF EXISTS {database}.{quote(name)} CASCADE"
             )
-        cursor.execute(
-            f"SELECT database_name, {_stale('database_name')} FROM duckdb_databases()"
-        )
-        for name, stale in cursor.fetchall():
+        cursor.execute("SELECT database_name FROM duckdb_databases()")
+        for (name,) in cursor.fetchall():
             if name != catalog:
-                drop(cursor, name, stale, f"DROP DATABASE IF EXISTS {quote(name)}")
+                drop(cursor, name, f"DROP DATABASE IF EXISTS {quote(name)}")
 
     with connect() as c, c.cursor() as cursor:
         create = f"CREATE DATABASE IF NOT EXISTS {database}"

@@ -35,6 +35,7 @@
 #include <limits>
 #include <optional>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -79,7 +80,7 @@ namespace {
 // This process's own schema, adbc_test_<Unix time>_<process ID>_<run>, where
 // <run> is MOTHERDUCK_TEST_RUN (see ci/scripts/pre-test.sh). The time is when
 // the process started, which later runs go by to drop what an interrupted run
-// left behind (kTestNamePattern), and the process ID keeps runs that source
+// left behind (IsStaleTestName), and the process ID keeps runs that source
 // the same .env.override apart. Empty without the variable.
 const std::string& RunSchema() {
   static const std::string schema = [] {
@@ -359,10 +360,25 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
   bool supports_statistics() const override { return false; }
 };
 
-// How a run's schema (see RunSchema), and every schema or database named
-// after it, starts, with the run's Unix time as group 1. The validation suite
-// (validation/tests/conftest.py) names its schemas the same way.
-constexpr std::string_view kTestNamePattern = "^adbc_test_([0-9]{10})_[0-9]+_";
+// Whether name is a test run's schema or database, or one named after it, from
+// a run that started a day or more before now (a Unix time): one an
+// interrupted run left behind. Runs name them adbc_test_<time>_<pid>_...
+// (RunSchema); earlier versions of the tests named them
+// adbc_<time>_..._<os>_<arch>[_...]. Databases from the database-per-run
+// setup, adbc_ci_<run>_..., carry no time, so they can't be told apart from a
+// live run's and are left alone. validation/tests/naming.py has the same rule;
+// keep the two, and their tests, in step.
+bool IsStaleTestName(const std::string& name, int64_t now) {
+  static const std::regex kCurrent("^adbc_test_([0-9]{10})_[0-9]+_.+$");
+  static const std::regex kEarlier(
+      "^adbc_([0-9]{10})_.+_(linux|macos|windows)_(amd64|arm64)(_.+)?$");
+  std::smatch match;
+  if (!std::regex_match(name, match, kCurrent) &&
+      !std::regex_match(name, match, kEarlier)) {
+    return false;
+  }
+  return std::stoll(match[1].str()) <= now - 86400;
+}
 
 // Gives the test run a schema of its own in the shared test database (see
 // ci/scripts/pre-test.sh), and afterwards drops it, the other schemas and the
@@ -426,26 +442,20 @@ class MotherDuckTestDatabase : public ::testing::Environment {
   }
 
   // Drops, in the current database, this run's schemas, and in the account,
-  // the databases named after them, along with any schema or database named
-  // like a test run's (kTestNamePattern) for a time a day or more ago.
+  // the databases named after them, along with any schema or database an
+  // interrupted run left behind (IsStaleTestName).
   void DropLeftovers(struct AdbcConnection* connection) {
-    auto stale = [](const char* column) {
-      return std::string("CASE WHEN TRY_CAST(regexp_extract(") + column + ", '" +
-             std::string(kTestNamePattern) +
-             "', 1) AS BIGINT) < CAST(epoch(now()) AS BIGINT) - "
-             "86400 THEN 'stale' ELSE '' END";
-    };
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
     auto own = [&](const std::string& name) {
       return name == schema_ || name.rfind(schema_ + "_", 0) == 0;
     };
     // This run's own objects must go. Stale ones belong to a dead run, and
     // concurrent runs may drop the same one at once, which MotherDuck rejects
     // as a write-write conflict for all but one, so their drops are best-effort.
-    auto drop = [&](const std::string& name, const std::string& stale,
-                    const std::string& query) {
+    auto drop = [&](const std::string& name, const std::string& query) {
       if (own(name)) {
         ASSERT_NO_FATAL_FAILURE(Execute(connection, query));
-      } else if (stale == "stale") {
+      } else if (IsStaleTestName(name, now)) {
         Handle<struct AdbcError> error;
         if (Run(connection, query, &error.value) != ADBC_STATUS_OK) {
           // Only a conflict means another run got there first.
@@ -459,25 +469,22 @@ class MotherDuckTestDatabase : public ::testing::Environment {
 
     std::vector<std::vector<std::string>> schemas;
     ASSERT_NO_FATAL_FAILURE(Query(connection,
-                                  "SELECT schema_name, " + stale("schema_name") +
-                                      " FROM duckdb_schemas() "
-                                      "WHERE database_name = current_database()",
+                                  "SELECT schema_name FROM duckdb_schemas() "
+                                  "WHERE database_name = current_database()",
                                   &schemas));
     for (const auto& row : schemas) {
-      ASSERT_NO_FATAL_FAILURE(drop(row[0], row[1],
-                                   "DROP SCHEMA IF EXISTS " + catalog_ + "." +
-                                       quirks_.QuoteIdentifier(row[0]) + " CASCADE"));
+      ASSERT_NO_FATAL_FAILURE(drop(row[0], "DROP SCHEMA IF EXISTS " + catalog_ + "." +
+                                               quirks_.QuoteIdentifier(row[0]) +
+                                               " CASCADE"));
     }
 
     std::vector<std::vector<std::string>> databases;
-    ASSERT_NO_FATAL_FAILURE(Query(
-        connection,
-        "SELECT database_name, " + stale("database_name") + " FROM duckdb_databases()",
-        &databases));
+    ASSERT_NO_FATAL_FAILURE(
+        Query(connection, "SELECT database_name FROM duckdb_databases()", &databases));
     for (const auto& row : databases) {
       if (row[0] == catalog_name_) continue;
-      ASSERT_NO_FATAL_FAILURE(drop(
-          row[0], row[1], "DROP DATABASE IF EXISTS " + quirks_.QuoteIdentifier(row[0])));
+      ASSERT_NO_FATAL_FAILURE(
+          drop(row[0], "DROP DATABASE IF EXISTS " + quirks_.QuoteIdentifier(row[0])));
     }
   }
 
@@ -532,6 +539,30 @@ class MotherDuckTestDatabase : public ::testing::Environment {
 
 [[maybe_unused]] static const auto* kMotherDuckTestDatabase =
     ::testing::AddGlobalTestEnvironment(new MotherDuckTestDatabase);
+
+// The cleanup drops whatever IsStaleTestName accepts, from a shared account, so
+// pin down what it accepts. validation/tests/test_naming.py checks the Python
+// copy against the same names.
+TEST(MotherDuckTestNamesTest, IsStaleTestName) {
+  const int64_t now = 1800000000;
+  // A run that's still going, and the schemas and databases named after it.
+  EXPECT_FALSE(IsStaleTestName("adbc_test_1799990000_123_local_1_macos_arm64", now));
+  EXPECT_FALSE(
+      IsStaleTestName("adbc_test_1799990000_123_local_1_macos_arm64_other_db", now));
+  // Interrupted runs, a day or more ago.
+  EXPECT_TRUE(IsStaleTestName("adbc_test_1799913600_123_local_1_macos_arm64", now));
+  EXPECT_TRUE(IsStaleTestName("adbc_test_1700000000_12_backup", now));
+  EXPECT_TRUE(IsStaleTestName("adbc_1700000000_local_1_linux_amd64_99", now));
+  EXPECT_TRUE(IsStaleTestName("adbc_1700000000_1_1_test_windows_amd64_7_other_db", now));
+  // Everything else stays.
+  EXPECT_FALSE(IsStaleTestName("adbc_driver_tests", now));
+  EXPECT_FALSE(IsStaleTestName("adbc_1000000000_unrelated", now));
+  EXPECT_FALSE(IsStaleTestName("adbc_ci_18473920123_1_test_linux_amd64", now));
+  EXPECT_FALSE(IsStaleTestName("adbc_test_", now));
+  EXPECT_FALSE(IsStaleTestName("adbc_test_1700000000_12_", now));
+  EXPECT_FALSE(IsStaleTestName("my_adbc_test_1700000000_12_x", now));
+  EXPECT_FALSE(IsStaleTestName("main", now));
+}
 
 class PostgresDatabaseTest : public ::testing::Test,
                              public adbc_validation::DatabaseTest {

@@ -30,7 +30,7 @@ PostgreSQL itself is not a goal of this repository.
 
 ## Testing
 
-You need a MotherDuck token whose account can create and drop databases, and a
+You need a MotherDuck token whose account can create databases and schemas, and a
 build of the driver in `build/`:
 
 ```shell
@@ -39,11 +39,13 @@ $ export MOTHERDUCK_TOKEN=...
 ```
 
 `ci/scripts/pre-test.sh` writes the connection settings to `.env.override`.
-Pass your platform and architecture; they only go into the database name.
-Setting `GITHUB_JOB=validate` keeps the name distinct from the C++ tests'.
+Pass your platform and architecture; they go into the run label,
+`MOTHERDUCK_TEST_RUN`. The suite's schema adds its own start time and process
+ID to that label, so it never shares a schema with the C++ tests or another
+run, even one that sources the same `.env.override`.
 
 ```shell
-$ GITHUB_JOB=validate ./ci/scripts/pre-test.sh macos arm64
+$ ./ci/scripts/pre-test.sh macos arm64
 $ set -a; source .env.override; set +a
 ```
 

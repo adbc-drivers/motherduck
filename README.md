@@ -242,8 +242,13 @@ start time and process ID keep runs apart even when they source the same
 `adbc.motherduck.db_schema`. Tests that need more schemas or databases name
 them after it, and the tests drop all of them when they finish, so concurrent
 jobs and runs don't share tables. Each run also drops any schema or database
-named `adbc_test_<time>_<pid>_...` with a time a day or more ago, which an
-interrupted run left behind; only names of that shape are dropped. A database
+named `adbc_test_<time>_<pid>_...` (or `adbc_<time>_..._<platform>_<arch>`, as
+an earlier version of the tests named them) with a time a day or more ago,
+which an interrupted run left behind; only names of those shapes are dropped
+(`IsStaleTestName` in `tests/postgresql_test.cc`, mirrored in
+`validation/tests/naming.py`, with tests for both). Databases the old
+database-per-run setup left, `adbc_ci_<run>_...`, carry no time, so they can't
+be told from a live run's and have to be dropped by hand. A database
 per run would scale worse: each interrupted run would leave a database and its
 retained storage behind, and every workspace-mode connection in the account
 attaches every database.
