@@ -5772,6 +5772,20 @@ TEST_F(PostgresStatementTest, BindStreamErrorRestoresTimeZoneWithoutAutocommit) 
                                       &time_zone, &error));
   ASSERT_EQ("America/New_York", time_zone);
   ASSERT_THAT(AdbcConnectionCommit(&connection, &error), IsOkStatus(&error));
+
+  // The stream sent its row before it failed. Rolling the user's transaction
+  // back would drop it, and Commit succeeds with nothing open, so count the
+  // row from another connection.
+  adbc_validation::Handle<struct AdbcConnection> other;
+  adbc_validation::Handle<struct AdbcStatement> other_statement;
+  ASSERT_THAT(AdbcConnectionNew(&other.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&other.value, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&other.value, &other_statement.value, &error),
+              IsOkStatus(&error));
+  std::string rows;
+  ASSERT_NO_FATAL_FAILURE(
+      CountRows(&other_statement.value, "test_bind_error_tz_txn", &rows, &error));
+  ASSERT_EQ("1", rows);
 }
 
 TEST_F(PostgresStatementTest, IngestReplaceKeepsTableOnBadColumnName) {
