@@ -235,7 +235,6 @@ TEST(MotherDuckJsonTest, ReadsLargeNumbers) {
 }
 
 TEST(MotherDuckJsonTest, CredentialsJson) {
-  // The same text as the MotherDuck CLI's JSON.stringify(credentials, null, 2).
   EXPECT_EQ(adbcpq::auth::CredentialsJson("a.b/c\"d"),
             "{\n  \"version\": 1,\n  \"motherduck_token\": \"a.b/c\\\"d\"\n}\n");
   EXPECT_EQ(adbcpq::auth::CredentialsJson("\xff"), std::nullopt);
@@ -486,10 +485,10 @@ TEST_F(CredentialsFileTest, SaveReplacesPlantedSymlink) {
 }
 #endif
 
-TEST_F(CredentialsFileTest, ReadsCliFile) {
+TEST_F(CredentialsFileTest, TrimsSavedToken) {
   WriteFile(path_,
-            "{\n  \"version\": 1,\n  \"motherduck_token\": \" cli-token\\n\"\n}\n");
-  EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), "cli-token");
+            "{\n  \"version\": 1,\n  \"motherduck_token\": \" saved-token\\n\"\n}\n");
+  EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), "saved-token");
 }
 
 TEST_F(CredentialsFileTest, IgnoresInvalidFiles) {

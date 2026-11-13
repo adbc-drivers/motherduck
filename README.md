@@ -154,9 +154,8 @@ in the URI instead.
 
 `adbc.motherduck.auth_type` (database option) chooses how the driver gets the
 MotherDuck token it sends as the password: `token` (the default) takes it as
-described above, and `browser` logs in through the browser, like
-`motherduck login` and dbt-motherduck's `externalbrowser`, so organizations that
-enforce SSO get their identity provider's login page. With `browser`, set no
+described above, and `browser` logs in through the browser, so organizations
+that enforce SSO get their identity provider's login page. With `browser`, set no
 token (no `password` or `adbc.motherduck.token` option, and no password in the
 URI; `MOTHERDUCK_TOKEN` is ignored), and the URI may leave out the host, for
 example `postgresql:///my_db`.
@@ -171,11 +170,9 @@ Like the MotherDuck DuckDB extension's login, it doesn't use an HTTP proxy.
   that, the next connection logs in again.
 - The token is saved to `~/.motherduck/credentials.json` (or
   `$MOTHERDUCK_HOME/credentials.json`, which must be absolute), readable only
-  by the user. The MotherDuck CLI and dbt-motherduck use the same file, so
-  logging in with any of them logs in the others, and a saved token is used
-  without opening a browser. Processes that use the same file take turns
-  logging in, through `credentials.json.lock` next to it, so they share one
-  login.
+  by the user, and a saved token is used without opening a browser. Processes
+  that use the same file take turns logging in, through `credentials.json.lock`
+  next to it, so they share one login.
 - Without a host from the URI, `PGHOST`, `PGHOSTADDR`, `adbc.motherduck.region`
   or a connection service, the driver connects to the Postgres endpoint of the
   user's organization, which it looks up at
@@ -190,7 +187,7 @@ Related options and environment variables:
 | --- | --- |
 | `adbc.motherduck.login_timeout` (database option) | Seconds to wait for the login (default `120`); `0` waits until the code expires, after 15 minutes. |
 | `adbc.motherduck.oauth_client_id` (database option) | The Auth0 application to log in through; defaults to MotherDuck's DuckDB extension. |
-| `motherduck_host` (environment) | The MotherDuck API host, for example `api.staging.motherduck.com`, as for the CLI. |
+| `motherduck_host` (environment) | The MotherDuck API host, for example `api.staging.motherduck.com`. |
 | `sslrootcert` (URI) or `PGSSLROOTCERT` (environment) | A CA bundle that the login's HTTPS requests trust too. Otherwise they use the system's trust store. |
 
 Options are read when the database is initialized.

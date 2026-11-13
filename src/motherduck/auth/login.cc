@@ -125,8 +125,8 @@ Status PollForIdToken(const LoginEnvironment& env, const LoginOptions& options,
                 "browser");
 }
 
-// Exchange an Auth0 ID token for a MotherDuck token. Retries for a while, as other
-// MotherDuck clients do, since the account may still be getting set up.
+// Exchange an Auth0 ID token for a MotherDuck token. Retries for a while, since
+// the account may still be getting set up.
 Status ExchangeIdToken(const LoginEnvironment& env, const LoginOptions& options,
                        const std::string& id_token, LoginResult* result) {
   const auto deadline = env.now() + kExchangeDeadline;
@@ -310,7 +310,7 @@ Status LookupPgEndpoint(const LoginEnvironment& env, const LoginOptions& options
   const JsonObject body = JsonObject::Parse(response.body);
   // Only an authentication failure rejects the token. A 404 (a deleted user, or
   // a wrong motherduck_host) isn't fixed by logging in again, which would also
-  // delete the token the MotherDuck CLI and dbt-motherduck share.
+  // delete the saved token.
   if (response.status == 401 || response.status == 403) {
     return Status(
         ADBC_STATUS_UNAUTHENTICATED,

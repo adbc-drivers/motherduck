@@ -50,7 +50,7 @@ class JsonObject {
   std::unique_ptr<yyjson_doc, Deleter> doc_;
 };
 
-/// \brief The contents of the credentials file the MotherDuck CLI writes, or
+/// \brief The contents of the credentials file, or
 ///   nullopt if the token isn't valid UTF-8.
 std::optional<std::string> CredentialsJson(std::string_view token);
 

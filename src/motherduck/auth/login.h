@@ -61,7 +61,7 @@ struct LoginOptions {
 };
 
 /// \brief The MotherDuck API origin: https://api.motherduck.com, or the host in
-///   motherduck_host (or MOTHERDUCK_HOST), as the MotherDuck CLI and extension use.
+///   motherduck_host (or MOTHERDUCK_HOST).
 std::string ApiOrigin();
 
 struct LoginResult {

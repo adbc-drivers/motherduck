@@ -29,9 +29,7 @@
 
 /// \file token_cache.h
 /// Where browser login's MotherDuck token comes from: memory, then the credentials
-/// file that the MotherDuck CLI and dbt-motherduck share, then a login. The file
-/// holds {"version": 1, "motherduck_token": "<token>"}, so logging in with any of
-/// these tools logs in all of them.
+/// file, then a login. The file holds {"version": 1, "motherduck_token": "<token>"}.
 
 namespace adbcpq::auth {
 using adbc::driver::Status;

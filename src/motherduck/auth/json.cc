@@ -75,7 +75,7 @@ std::optional<std::string> CredentialsJson(std::string_view token) {
   yyjson_mut_obj_add_int(doc.get(), root, "version", 1);
   yyjson_mut_obj_add_strncpy(doc.get(), root, "motherduck_token", token.data(),
                              token.size());
-  // Formatted like the MotherDuck CLI's JSON.stringify(credentials, null, 2).
+  // Two-space indentation and a final newline.
   size_t length = 0;
   std::unique_ptr<char, decltype(&std::free)> text(
       yyjson_mut_write(doc.get(), YYJSON_WRITE_PRETTY_TWO_SPACES, &length), std::free);
