@@ -747,12 +747,18 @@ TEST_F(TokenCacheTest, PausesAfterDeniedLogin) {
   EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)),
             ADBC_STATUS_UNAUTHENTICATED);
 
-  // A new connection attempt within a minute fails without opening the browser.
+  // A new connection attempt within a minute fails without opening the
+  // browser, in this database and in a new one for the same account, as dbt
+  // may create.
   now_ += 30s;
   const Status status = cache.Get(/*need_host=*/false, &credentials);
   EXPECT_EQ(Code(status), ADBC_STATUS_UNAUTHENTICATED);
   EXPECT_THAT(status.message(), HasSubstr("User denied"));
-  EXPECT_THAT(status.message(), HasSubstr("not opening the browser again"));
+  EXPECT_THAT(status.message(),
+              HasSubstr("not opening the browser again for 30 seconds"));
+  TokenCache other = MakeCache();
+  EXPECT_EQ(Code(other.Get(/*need_host=*/false, &credentials)),
+            ADBC_STATUS_UNAUTHENTICATED);
   EXPECT_EQ(http_->Count(kDeviceCodeUrl), 1);
   EXPECT_EQ(opened_.size(), 1);
 
@@ -761,6 +767,71 @@ TEST_F(TokenCacheTest, PausesAfterDeniedLogin) {
   ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
   EXPECT_EQ(credentials.token, "md-token");
   EXPECT_EQ(http_->Count(kDeviceCodeUrl), 2);
+}
+
+TEST_F(TokenCacheTest, FailuresAreKeptPerAccount) {
+  // A database with another Auth0 application neither shares the failure of a
+  // login it overlapped nor pauses after it.
+  http_->Respond(kDeviceCodeUrl, 200, kDeviceCode);
+  http_->Respond(kTokenUrl, 401,
+                 R"({"error":"invalid_client","error_description":"Unknown client"})");
+  http_->Respond(kTokenUrl, 200, kIdToken);
+  http_->Respond(kLookupUserUrl, 200, kLookupUser);
+  const uint64_t since = TokenCache::LoginsFinished();
+  options_.client_id = "wrong-client";
+  TokenCache wrong = MakeCache();
+  options_.client_id = adbcpq::auth::kDefaultClientId;
+  TokenCache right = MakeCache();
+  Credentials credentials;
+  const Status failed = wrong.Get(/*need_host=*/false, &credentials, since);
+  EXPECT_EQ(Code(failed), ADBC_STATUS_UNAUTHENTICATED);
+  EXPECT_THAT(failed.message(), HasSubstr("Unknown client"));
+  ASSERT_TRUE(right.Get(/*need_host=*/false, &credentials, since).ok());
+  EXPECT_EQ(credentials.token, "md-token");
+  EXPECT_EQ(http_->Count(kDeviceCodeUrl), 2);
+}
+
+TEST_F(TokenCacheTest, WaitsWhileAnnouncedLoginSavesItsToken) {
+  // The other process's login ends after this database's login timeout; it
+  // then keeps the lock a little longer to save its token.
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, adbcpq::auth::CurrentProcessId(),
+                                          std::chrono::system_clock::now() + 1h)
+                  .ok());
+  options_.timeout = 5s;
+  const auto start = now_;
+  env_.sleep = [&](std::chrono::milliseconds duration) {
+    now_ += duration;
+    if (now_ - start > 20s) adbcpq::auth::RemoveLoginAnnouncement(path_);
+    if (other && now_ - start > 25s) {
+      ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "other-token").ok());
+      other.reset();
+    }
+  };
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "other-token");
+  EXPECT_TRUE(http_->requests.empty());
+}
+
+TEST_F(TokenCacheTest, KeepsAnnouncementUntilTokenIsSaved) {
+  // Saving fails (a directory is in the way), so Login prints a warning right
+  // after trying to save: the announcement must still be there then.
+  RespondWithLogin();
+  fs::create_directories(path_);
+  std::optional<adbcpq::auth::LoginAnnouncement> while_saving;
+  env_.print = [&](const std::string& message) {
+    if (message.find("log in again next time") != std::string::npos) {
+      while_saving = adbcpq::auth::ReadLoginAnnouncement(path_);
+    }
+  };
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_TRUE(while_saving.has_value());
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
 }
 
 TEST_F(TokenCacheTest, NoPauseAfterTimedOutLogin) {

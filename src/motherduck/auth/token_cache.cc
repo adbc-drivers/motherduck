@@ -19,6 +19,7 @@
 
 #include "auth/token_cache.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <charconv>
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -209,17 +211,27 @@ Status WaitTimedOut() {
                 "[motherduck] Timed out waiting for another MotherDuck login to finish");
 }
 
-// The process's logins: one at a time, and how the latest failed one ended.
+// How an account's latest login failed, if it did.
+struct FailedLogin {
+  // The login's number in SharedLogin::finished.
+  uint64_t number = 0;
+  AdbcStatusCode code = ADBC_STATUS_OK;
+  std::string message;
+  // After a denied login: until when to fail instead of logging in again.
+  std::optional<std::chrono::steady_clock::time_point> paused_until;
+};
+
+// The process's logins: one at a time, and how each account's latest login
+// failed.
 struct SharedLogin {
   // Held while a TokenCache reads or changes its token, including while it logs
   // in, so that other connections wait for that login instead of starting one.
   std::mutex mutex;
   std::atomic<uint64_t> finished{0};
-  // Guarded by mutex: the number (in finished) of the latest failed login, and
-  // its failure.
-  uint64_t failed = 0;
-  AdbcStatusCode failure_code = ADBC_STATUS_OK;
-  std::string failure_message;
+  // Guarded by mutex. Keyed by account: the credentials file, the Auth0
+  // application and the MotherDuck API, so that databases set up differently
+  // don't fail with each other's errors.
+  std::map<std::string, FailedLogin> failures;
 };
 
 SharedLogin& Shared() {
@@ -515,8 +527,7 @@ Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadlin
                                    std::unique_ptr<CredentialsLock>* lock) const {
   // A process that holds the lock without announcing a login is saving or
   // deleting a token: wait the login timeout for it, or a while without one.
-  const auto unannounced_deadline =
-      deadline ? *deadline : env_.now() + kUnannouncedHoldWait;
+  auto unannounced_deadline = deadline ? *deadline : env_.now() + kUnannouncedHoldWait;
   while (true) {
     UNWRAP_STATUS(CredentialsLock::Acquire(path, lock, /*block=*/false));
     if (*lock != nullptr) return Status::Ok();
@@ -532,6 +543,11 @@ Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadlin
                           "timeout and still holds " +
                           PathString(LockPath(path)) + "; end it to log in here");
       }
+      // Once its login ends, the process only saves the token before it
+      // releases the lock: give it a while for that from now, even if this
+      // waited past the login timeout for its login.
+      unannounced_deadline =
+          std::max(unannounced_deadline, env_.now() + kUnannouncedHoldWait);
     } else if (env_.now() >= unannounced_deadline) {
       return WaitTimedOut();
     }
@@ -555,21 +571,24 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
     return Status::Ok();
   }
 
-  // A login that ended during this connection attempt and failed (it timed
-  // out, or the user denied it) answers for this attempt too: another browser
-  // prompt would most likely end the same way.
   SharedLogin& shared = Shared();
-  if (shared.failed > since) {
-    return Status(shared.failure_code, shared.failure_message);
-  }
+  const std::string account =
+      PathString(path) + '\n' + options_.client_id + '\n' + options_.api_origin;
+  FailedLogin& failure = shared.failures[account];
+  // A login of this account that ended during this connection attempt and
+  // failed (it timed out, or the user denied it) answers for this attempt too:
+  // another browser prompt would most likely end the same way.
+  if (failure.number > since) return Status(failure.code, failure.message);
   // After a login was denied, or found no MotherDuck account, another one would
-  // most likely end the same way, so don't open the browser again for a while.
-  // Timeouts and network errors don't count: the next login may well work.
-  if (denied_until_ && env_.now() < *denied_until_) {
+  // most likely end the same way, so no database of the account opens the
+  // browser again for a while. Timeouts and network errors don't count: the
+  // next login may well work.
+  if (failure.paused_until && env_.now() < *failure.paused_until) {
+    const auto wait =
+        std::chrono::ceil<std::chrono::seconds>(*failure.paused_until - env_.now());
     return Status(ADBC_STATUS_UNAUTHENTICATED,
-                  denied_message_ + " (not opening the browser again within " +
-                      std::to_string(kDeniedLoginBackoff.count()) +
-                      " seconds of that; initialize the database again to retry now)");
+                  failure.message + " (not opening the browser again for " +
+                      std::to_string(wait.count()) + " seconds)");
   }
 
   // Tell processes waiting for the lock how long this login may take.
@@ -580,19 +599,19 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
           .ok();
   LoginResult result;
   Status status = DeviceLogin(env_, options_, &result);
-  if (announced) RemoveLoginAnnouncement(path);
   const uint64_t number = ++shared.finished;
   if (!status.ok()) {
-    shared.failed = number;
-    shared.failure_code = status.ToAdbc(nullptr);
-    shared.failure_message = status.message();
-    if (shared.failure_code == ADBC_STATUS_UNAUTHENTICATED) {
-      denied_until_ = env_.now() + kDeniedLoginBackoff;
-      denied_message_ = status.message();
+    if (announced) RemoveLoginAnnouncement(path);
+    failure.number = number;
+    failure.code = status.ToAdbc(nullptr);
+    failure.message = status.message();
+    failure.paused_until.reset();
+    if (failure.code == ADBC_STATUS_UNAUTHENTICATED) {
+      failure.paused_until = env_.now() + kDeniedLoginBackoff;
     }
     return status;
   }
-  denied_until_.reset();
+  shared.failures.erase(account);
   token_ = std::move(result.token);
   host_ = std::move(result.pg_endpoint);
   *fresh = true;
@@ -600,6 +619,9 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
   if (!saved.ok()) {
     env_.print(saved.message() + ". You'll be asked to log in again next time.");
   }
+  // Only now, with the token saved, so that processes waiting for the lock
+  // never see it held without either an announced login or a saved token.
+  if (announced) RemoveLoginAnnouncement(path);
   return Status::Ok();
 }
 

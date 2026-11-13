@@ -54,7 +54,9 @@ struct Credentials {
 /// rather than each starting their own. Within the process, a connection waits
 /// for a login in progress however long it takes (the login ends by its own
 /// timeout), and shares its outcome: its token, or its failure, so that a
-/// login that times out or is denied doesn't open another browser.
+/// login that times out or is denied doesn't open another browser. After a
+/// denied login, no database logging in to the same account (credentials file,
+/// Auth0 application and MotherDuck API) opens the browser for a minute.
 class TokenCache {
  public:
   TokenCache(LoginEnvironment env, LoginOptions options)
@@ -69,8 +71,9 @@ class TokenCache {
   ///
   /// \param need_host Also look up the organization's Postgres endpoint.
   /// \param since LoginsFinished() when the connection attempt began. If a login
-  ///   that finished since then (one in progress then, or started later)
-  ///   failed, Get returns its failure instead of logging in again.
+  ///   of the same account that finished since then (one in progress then, or
+  ///   started later) failed, Get returns its failure instead of logging in
+  ///   again.
   Status Get(bool need_host, Credentials* credentials, uint64_t since);
 
   /// \brief Get, for a connection attempt that begins now.
@@ -104,9 +107,6 @@ class TokenCache {
   const LoginOptions options_;
   std::string token_;
   std::string host_;
-  // After a denied login: when to open the browser again, and the failure.
-  std::optional<std::chrono::steady_clock::time_point> denied_until_;
-  std::string denied_message_;
 };
 
 /// \brief The lock that serializes logins across processes sharing a credentials

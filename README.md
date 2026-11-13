@@ -182,10 +182,12 @@ Like the MotherDuck DuckDB extension's login, it doesn't use an HTTP proxy.
   share one login: they wait for it as long as it takes, then use its token. If
   it fails (it times out or is denied), they all fail with its error instead of
   opening the browser again.
-- After a login is denied, or finds no MotherDuck account, new connections of
-  the same database fail with that error for 60 seconds instead of opening the
-  browser again. Initializing the database again retries right away. A login
-  that times out doesn't pause anything.
+- After a login is denied, or finds no MotherDuck account, new connections in
+  the process that log in to the same account (the same credentials file,
+  `oauth_client_id` and API host), from any database, fail with that error
+  for 60 seconds instead of opening the browser again. A login that times out
+  doesn't pause anything, and databases set up differently don't share each
+  other's failures.
 - Without a host from the URI, `PGHOST`, `PGHOSTADDR`, `adbc.motherduck.region`
   or a connection service, the driver connects to the Postgres endpoint of the
   user's organization, which it looks up at
