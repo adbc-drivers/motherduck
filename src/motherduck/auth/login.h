@@ -26,8 +26,7 @@
 namespace adbcpq::auth {
 using adbc::driver::Status;
 
-/// \brief The Auth0 application of MotherDuck's DuckDB extension, which is set up
-///   for SSO and for MotherDuck's sign-up and organization prompts.
+/// \brief Auth0 application
 inline constexpr std::string_view kDefaultClientId = "gfGhV0YsVtE7J7CSYgTquHwHLE9uGBMm";
 
 /// \brief MotherDuck's Auth0 tenant, shared by production and staging.

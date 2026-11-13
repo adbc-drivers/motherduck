@@ -186,7 +186,7 @@ Related options and environment variables:
 | Name | Purpose |
 | --- | --- |
 | `adbc.motherduck.login_timeout` (database option) | Seconds to wait for the login (default `120`); `0` waits until the code expires, after 15 minutes. |
-| `adbc.motherduck.oauth_client_id` (database option) | The Auth0 application to log in through; defaults to MotherDuck's DuckDB extension. |
+| `adbc.motherduck.oauth_client_id` (database option) | The Auth0 application to log in through |
 | `motherduck_host` (environment) | The MotherDuck API host, for example `api.staging.motherduck.com`. |
 | `sslrootcert` (URI) or `PGSSLROOTCERT` (environment) | A CA bundle that the login's HTTPS requests trust too. Otherwise they use the system's trust store. |
 
