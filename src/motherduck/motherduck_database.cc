@@ -171,14 +171,14 @@ Status OpenConnection(const LibpqParams& params, PGconn** conn) {
 // The parameters with browser login's token as the password and, if nothing names
 // a host, the organization's Postgres endpoint as the host.
 Result<LibpqParams> WithBrowserLogin(auth::TokenCache& token_cache,
-                                     const LibpqParams& params,
+                                     const LibpqParams& params, uint64_t logins,
                                      auth::Credentials* credentials) {
   // Without a host, libpq would try a local socket. MotherDuck's endpoints are
   // regional, so use the one of the user's organization.
   const bool need_host = !HasParam(params, "host") && !HasParam(params, "hostaddr") &&
                          !HasParam(params, "service") && GetEnv("PGHOST").empty() &&
                          GetEnv("PGHOSTADDR").empty() && GetEnv("PGSERVICE").empty();
-  UNWRAP_STATUS(token_cache.Get(need_host, credentials));
+  UNWRAP_STATUS(token_cache.Get(need_host, credentials, logins));
   return AddCredentials(params, *credentials, need_host);
 }
 
@@ -590,16 +590,19 @@ AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* erro
   RAISE_ADBC(ConnectParams(&params, error));
   LibpqParams connect_params = params;
   auth::Credentials credentials;
+  // A failed login during this attempt, such as one the retry below would wait
+  // for, fails this attempt rather than opening another browser.
+  const uint64_t logins = auth::TokenCache::LoginsFinished();
   if (token_cache_) {
     RAISE_RESULT(error, connect_params,
-                 WithBrowserLogin(*token_cache_, params, &credentials));
+                 WithBrowserLogin(*token_cache_, params, logins, &credentials));
   }
   Status status = OpenConnection(connect_params, conn);
   if (!status.ok() && token_cache_ && !credentials.fresh &&
       IsAuthFailure(status.message()) && token_cache_->Reject(credentials.token)) {
     // The saved token expired or was revoked: log in again, once.
     RAISE_RESULT(error, connect_params,
-                 WithBrowserLogin(*token_cache_, params, &credentials));
+                 WithBrowserLogin(*token_cache_, params, logins, &credentials));
     status = OpenConnection(connect_params, conn);
   }
   RAISE_STATUS(error, status);

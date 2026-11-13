@@ -19,6 +19,7 @@
 
 #include "auth/token_cache.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -188,8 +189,6 @@ std::string_view Trim(std::string_view text) {
   return text.substr(start, text.find_last_not_of(kWhitespace) - start + 1);
 }
 
-// Logins share the credentials file, so one lock for the process lets a second
-// database wait for the first one's login and then use its token.
 constexpr std::chrono::milliseconds kLockPollInterval{100};
 
 // Retry try_acquire until it succeeds or the deadline passes.
@@ -207,9 +206,22 @@ Status WaitTimedOut() {
                 "[motherduck] Timed out waiting for another MotherDuck login to finish");
 }
 
-std::mutex& LoginMutex() {
-  static std::mutex mutex;
-  return mutex;
+// The process's logins: one at a time, and how the latest failed one ended.
+struct SharedLogin {
+  // Held while a TokenCache reads or changes its token, including while it logs
+  // in, so that other connections wait for that login instead of starting one.
+  std::mutex mutex;
+  std::atomic<uint64_t> finished{0};
+  // Guarded by mutex: the number (in finished) of the latest failed login, and
+  // its failure.
+  uint64_t failed = 0;
+  AdbcStatusCode failure_code = ADBC_STATUS_OK;
+  std::string failure_message;
+};
+
+SharedLogin& Shared() {
+  static SharedLogin shared;
+  return shared;
 }
 
 // Create the credentials directory, readable only by the user, if it's missing.
@@ -352,10 +364,14 @@ void RemoveSavedToken(const fs::path& path, std::string_view token) {
   fs::remove(path, ec);
 }
 
-Status TokenCache::Get(bool need_host, Credentials* credentials) {
+uint64_t TokenCache::LoginsFinished() { return Shared().finished.load(); }
+
+Status TokenCache::Get(bool need_host, Credentials* credentials, uint64_t since) {
+  // Wait for a login in progress however long it takes: it ends by its own
+  // timeout, and its token is the one this connection needs. Waiting only
+  // login_timeout from now would give up just before a slow login finishes.
+  std::lock_guard<std::mutex> lock(Shared().mutex);
   const Deadline deadline = LockDeadline();
-  std::unique_lock<std::mutex> lock(LoginMutex(), std::defer_lock);
-  if (!LockWithin(&lock, deadline)) return WaitTimedOut();
   fs::path path;
   UNWRAP_STATUS(CredentialsPath(&path));
 
@@ -367,7 +383,7 @@ Status TokenCache::Get(bool need_host, Credentials* credentials) {
     if (saved) {
       token_ = std::move(*saved);
     } else {
-      UNWRAP_STATUS(Login(path, /*rejected=*/"", deadline, &fresh));
+      UNWRAP_STATUS(Login(path, /*rejected=*/"", deadline, since, &fresh));
     }
   }
 
@@ -377,7 +393,7 @@ Status TokenCache::Get(bool need_host, Credentials* credentials) {
       // The saved token expired or was revoked.
       const std::string rejected = token_;
       ForgetLocked(path, deadline);
-      UNWRAP_STATUS(Login(path, rejected, deadline, &fresh));
+      UNWRAP_STATUS(Login(path, rejected, deadline, since, &fresh));
       status =
           host_.empty() ? LookupPgEndpoint(env_, options_, token_, &host_) : Status::Ok();
     }
@@ -391,9 +407,8 @@ Status TokenCache::Get(bool need_host, Credentials* credentials) {
 }
 
 bool TokenCache::Reject(const std::string& token) {
+  std::lock_guard<std::mutex> lock(Shared().mutex);
   const Deadline deadline = LockDeadline();
-  std::unique_lock<std::mutex> lock(LoginMutex(), std::defer_lock);
-  if (!LockWithin(&lock, deadline)) return false;
   if (token != token_) return true;
   // Keep the token if the API accepts it, or can't be reached: the failure has
   // another cause, which logging in again wouldn't fix.
@@ -417,15 +432,6 @@ TokenCache::Deadline TokenCache::LockDeadline() const {
   return env_.now() + options_.timeout;
 }
 
-bool TokenCache::LockWithin(std::unique_lock<std::mutex>* lock,
-                            const Deadline& deadline) const {
-  if (!deadline) {
-    lock->lock();
-    return true;
-  }
-  return Poll(env_, *deadline, [lock] { return lock->try_lock(); });
-}
-
 Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadline,
                                    std::unique_ptr<CredentialsLock>* lock) const {
   if (!deadline) return CredentialsLock::Acquire(path, lock);
@@ -440,7 +446,7 @@ Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadlin
 }
 
 Status TokenCache::Login(const fs::path& path, const std::string& rejected,
-                         const Deadline& deadline, bool* fresh) {
+                         const Deadline& deadline, uint64_t since, bool* fresh) {
   // Wait for a login another process is running through the same file, and use
   // its token. Without the lock, such as in a read-only home directory, log in
   // anyway.
@@ -455,8 +461,22 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
     return Status::Ok();
   }
 
+  // A login that ended during this connection attempt and failed (it timed
+  // out, or the user denied it) answers for this attempt too: another browser
+  // prompt would most likely end the same way.
+  SharedLogin& shared = Shared();
+  if (shared.failed > since) {
+    return Status(shared.failure_code, shared.failure_message);
+  }
   LoginResult result;
-  UNWRAP_STATUS(DeviceLogin(env_, options_, &result));
+  Status status = DeviceLogin(env_, options_, &result);
+  const uint64_t number = ++shared.finished;
+  if (!status.ok()) {
+    shared.failed = number;
+    shared.failure_code = status.ToAdbc(nullptr);
+    shared.failure_message = status.message();
+    return status;
+  }
   token_ = std::move(result.token);
   host_ = std::move(result.pg_endpoint);
   *fresh = true;

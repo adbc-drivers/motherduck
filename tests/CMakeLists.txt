@@ -60,7 +60,8 @@ target_link_libraries(motherduck_driver_test PRIVATE adbc_driver_motherduck
 
 # Compile the complete inherited test suites even when no PostgreSQL server is
 # configured. The default test run exercises their server-independent cases.
-add_executable(motherduck_unit_test motherduck_auth_test.cc motherduck_connection_test.cc
+add_executable(motherduck_unit_test motherduck_auth_test.cc motherduck_auth_stress_test.cc
+                                    motherduck_connection_test.cc
                                     motherduck_database_test.cc
                                     motherduck_error_test.cc motherduck_pipeline_test.cc
                                     motherduck_redact_test.cc motherduck_statement_test.cc)
