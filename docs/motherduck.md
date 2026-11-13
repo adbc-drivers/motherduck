@@ -32,11 +32,86 @@ dbc install --pre motherduck
 
 ## Connecting
 
-TBD
+The driver connects to MotherDuck's PostgreSQL protocol endpoint and uses your
+MotherDuck token as the password. Set the token in the `MOTHERDUCK_TOKEN`
+environment variable, which keeps it out of connection strings and logs, and
+give the database to connect to and your account's region. Find your region
+with `md_user_info()`.
+
+```python
+from adbc_driver_manager import dbapi
+
+with dbapi.connect(
+    driver="motherduck",
+    db_kwargs={
+        "uri": "postgresql:///my_db",
+        "adbc.motherduck.region": "us-east-1",
+    },
+) as conn:
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT 42")
+        print(cursor.fetch_arrow_table())
+```
+
+The region sets the host, so the URI can leave it out. `us-east-1` connects to
+`pg.us-east-1-aws.motherduck.com`. Without the option, put the host in the URI
+instead: `postgresql://pg.us-east-1-aws.motherduck.com/my_db`.
+
+By default the driver connects in `single` attach mode, which attaches only the
+database named in the connection. To work across every database in the account,
+connect to `md:` and set `adbc.motherduck.attach_mode` to `workspace`.
 
 ### Connection String Format
 
-TBD
+The URI uses the libpq connection URI syntax:
+
+```text
+postgresql://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
+```
+
+Components:
+
+- `DATABASE`: the MotherDuck database to connect to, or `md:` (written `md%3A`
+  in a URI) in `workspace` attach mode.
+- `HOST` and `PORT`: the endpoint, such as `pg.us-east-1-aws.motherduck.com`.
+  Optional when `adbc.motherduck.region` is set; the port is then 5432 unless
+  the URI sets one.
+- `USER`: optional. The default is `postgres`, which MotherDuck expects.
+- `TOKEN`: the MotherDuck token. Prefer `MOTHERDUCK_TOKEN` or a database option
+  to putting it in the URI.
+- `sslmode`: defaults to `require`, which encrypts the connection without
+  verifying the server's certificate. Use `verify-full` to verify it, with
+  `sslrootcert` naming a CA bundle (or `system`, on libpq 16 and later).
+- `options`: MotherDuck [session options](https://motherduck.com/docs/sql-reference/postgres-endpoint/#session-options),
+  which the driver passes to libpq's `options` along with its own.
+- `application_name`: your application's name. The driver appends
+  `adbc_driver_motherduck/<version>` to it, so it appears in MotherDuck's query
+  history.
+
+The driver never reads `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, or password files
+(`~/.pgpass`), and doesn't support libpq connection service files. Put
+connection settings in the URI or the driver options instead.
+
+### Authentication
+
+The driver takes the token from the first of these that is set:
+
+1. The `password` database option, or its alias `adbc.motherduck.token`.
+2. The password in the URI.
+3. The `MOTHERDUCK_TOKEN` environment variable.
+
+Without a token, connecting fails with `UNAUTHENTICATED`.
+
+### Driver Options
+
+| Option | Level | Description |
+| --- | --- | --- |
+| `adbc.motherduck.attach_mode` | Database | `single` (default) attaches only the named database; `workspace` attaches every database in the account. |
+| `adbc.motherduck.region` | Database | The MotherDuck region, such as `us-east-1` or `eastus2`, which sets the host. |
+| `adbc.motherduck.session_name` | Database | MotherDuck's [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name), which routes connections with the same name to the same replica under read scaling. |
+| `adbc.motherduck.db_schema` | Database | The schema every new connection starts in. Connecting fails if it doesn't exist. |
+| `adbc.connection.db_schema` | Connection | Changes a single connection's schema, in its current database. |
+| `adbc.motherduck.token` | Database | Alias for the standard `password` option. |
 
 ## Feature & Type Support
 
