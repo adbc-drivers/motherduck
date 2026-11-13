@@ -22,6 +22,13 @@
   under the License.
 -->
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/motherduck-logo-dark.svg">
+    <img src="docs/images/motherduck-logo.svg" alt="MotherDuck" width="320">
+  </picture>
+</p>
+
 # ADBC Driver for MotherDuck
 
 A C++ ADBC driver for MotherDuck's PostgreSQL protocol endpoint, forked from
@@ -31,8 +38,7 @@ The upstream PostgreSQL driver's approach credits [pgeon](https://github.com/0x0
 
 ## Build
 
-Requires CMake 3.24+, a C++20 compiler, and PostgreSQL's client library and
-headers (libpq). The driver bundles the Apache common/framework code, nanoarrow,
+Requires CMake 3.24+, a C++20 compiler, and libpq 15 or newer. The driver bundles the Apache common/framework code, nanoarrow,
 fmt, portable-snippets, and boost.int128 it needs. Test builds also require
 GoogleTest/GoogleMock; CMake downloads GoogleTest 1.15.2 if it is not installed.
 
@@ -56,8 +62,9 @@ For a release build without test dependencies:
 
 The scripts copy the library to `build/libadbc_driver_motherduck.dylib` on
 macOS, `.so` on Linux, or `.dll` on Windows. The entry point inferred by ADBC
-driver managers is `AdbcDriverMotherduckInit`. The original PostgreSQL entry
-point and the generic `AdbcDriverInit` remain available.
+driver managers is `AdbcDriverMotherduckInit`, and the generic `AdbcDriverInit`
+forwards to it. The original PostgreSQL entry point `AdbcDriverPostgresqlInit`
+remains available and does not install the MotherDuck error-message redaction.
 
 For Foundry packaging, use the vcpkg toolchain through `CMAKE_TOOLCHAIN_FILE`,
 `VCPKG_ROOT`, or `VCPKG_INSTALLATION_ROOT`. The scripts choose static vcpkg
@@ -87,6 +94,16 @@ nothing are rejected, since it would escape the space before the driver's
 options. Single mode needs a named database; to connect to `md:`, set
 `workspace`.
 
+The driver also adds `--return_pg_command_tags=on`, so the endpoint answers
+DML and DDL with a PostgreSQL command tag that carries the affected-row count
+(`INSERT 0 2`, `UPDATE 3`, `DELETE 0`, `CREATE TABLE`) instead of DuckDB's
+`Count` or `Success` result set. `ExecuteQuery` on such a statement therefore
+returns an empty stream, and `rows_affected` for `UPDATE` and `DELETE` is the
+number of rows changed rather than 1. For a statement that returns rows (a
+`SELECT`, or DML with `RETURNING`), `rows_affected` is the count in its command
+tag. The PostgreSQL driver reports -1 for these when it reads results with
+COPY, which MotherDuck doesn't support.
+
 `adbc.motherduck.session_name` (database option) sets MotherDuck's
 [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name),
 which routes connections with the same name to the same replica under read
@@ -94,6 +111,20 @@ scaling and appears in query history. The driver adds `--session_name=<name>`
 after the URI's session options, escaping whitespace and backslashes with a
 backslash; MotherDuck removes the escapes, so `my session` arrives as is. It's
 unset by default; an empty value unsets it.
+
+`adbc.motherduck.db_schema` (database option) sets the schema every new
+connection starts in. MotherDuck's endpoint doesn't accept `search_path` as a
+startup option, so the driver runs `SET search_path TO <database>.<schema>`
+once each connection is up, with the connection's current database. (DuckDB
+would take a bare name that's also an attached database's name as that
+database.) Connecting fails if the schema doesn't exist. It's unset by default, leaving
+MotherDuck's default (`main`); an empty value unsets it.
+`adbc.connection.db_schema` changes a single connection's schema the same way,
+in its current database, and replaces this option when set before `Init`.
+Both name a schema only: unlike the PostgreSQL driver's bare `SET search_path`,
+which DuckDB would take as an attached database's name when no such schema
+exists, a name that isn't a schema of the current database fails with the
+server's error. Use `USE <database>` to change databases.
 
 MotherDuck builds the user agent in query history and its logs from libpq's
 `application_name`. The driver adds `adbc_driver_motherduck/<version>` to it,
@@ -160,10 +191,11 @@ to fail.
   aren't available because the endpoint rejects `CREATE TEMP TABLE`.
 - **COPY result reads** fail: the endpoint rejects binary
   `COPY ... TO STDOUT`, so the driver defaults `adbc.postgresql.use_copy` to
-  `false` (#11); setting it to `true` fails. The non-COPY path fetches the
-  whole result at once, so it ignores `adbc.postgresql.batch_size_hint_bytes`,
-  the connection reports idle in a transaction rather than active while you
-  read (#11), and a running query can't be cancelled (#48).
+  `false` (#11); setting it to `true` fails. Results are read from libpq
+  instead. A multi-statement script such as `INSERT ...; SELECT 1` stays
+  uncommitted, and invisible to other connections, until its rows are read,
+  its stream is released, or another command runs on the same connection.
+  That wait lets a row that cannot be converted roll the script back.
 - **Parameter types:** the endpoint can't prepare a query whose result
   column types depend on its parameters, as in `SELECT $1`, and ignores the
   parameter types sent with the prepare (#17). When that happens with
@@ -172,9 +204,6 @@ to fail.
   bound parameters, `GetParameterSchema` and `ExecuteSchema` return
   `NOT_IMPLEMENTED` for them. An all-null parameter whose type the endpoint
   can't infer is cast to `TEXT`, so `SELECT 1 + $1` with a null fails.
-- **Rows affected** is wrong for `DELETE` (#19), and is the row count rather
-  than -1 for a `SELECT` on the non-COPY path (#50). `ExecuteQuery` on an
-  `INSERT` also returns the endpoint's `Count` row as a batch (#49).
 - **Metadata:** the current catalog reports `md:` rather than the current
   database when you connect to `md:` (#14), and `GetStatistics` and
   `GetStatisticNames` aren't supported, since MotherDuck has no `pg_stats`.
@@ -210,10 +239,32 @@ MOTHERDUCK_TEST_POSTGRESQL=ON ./ci/scripts/build.sh test macos arm64
 pixi run validate
 ```
 
-By default each run gets a fresh database, `adbc_ci_<run>_<job>_<platform>_<arch>`,
-which the tests create before they start and drop when they finish, so
-concurrent jobs and runs don't share tables. Set `MOTHERDUCK_TEST_DATABASE` to
-an existing database to use it instead; the tests leave it in place.
+Runs share one database, `adbc_driver_tests`, which the tests create if it's
+missing and never drop. Each test process gets its own schema in it,
+`adbc_test_<start time>_<pid>_<run>`, where `<run>` is the
+`MOTHERDUCK_TEST_RUN` that `ci/scripts/pre-test.sh` writes (the GitHub run,
+attempt and job in CI, or `local_<pid>`, followed by the platform and arch). The
+start time and process ID keep runs apart even when they source the same
+`.env.override`. Every test connection starts in the schema through
+`adbc.motherduck.db_schema`. Tests that need more schemas or databases name
+them after it, and the tests drop all of them when they finish, so concurrent
+jobs and runs don't share tables. Each run also drops any schema or database
+named `adbc_test_<time>_<pid>_...` (or `adbc_<time>_..._<platform>_<arch>`, as
+an earlier version of the tests named them) with a time a day or more ago,
+which an interrupted run left behind; only names of those shapes are dropped
+(`IsStaleTestName` in `tests/postgresql_test.cc`, mirrored in
+`validation/tests/naming.py`, with tests for both). Databases the old
+database-per-run setup left, `adbc_ci_<run>_...`, carry no time, so they can't
+be told from a live run's and have to be dropped by hand. A database
+per run would scale worse: each interrupted run would leave a database and its
+retained storage behind, and every workspace-mode connection in the account
+attaches every database.
+
+Set `MOTHERDUCK_TEST_DATABASE` to use another database. The tests treat it like
+`adbc_driver_tests`: they create it if it's missing, create and drop their
+schemas in it, and sweep stale test-named schemas from it and test-named
+databases from the account. So the token needs to be able to create databases
+and schemas, and a read-only or shared database won't work.
 `MOTHERDUCK_PG_HOST` overrides the default host
 (`pg.us-east-1-aws.motherduck.com`). Test connections use the driver's default
 `attach_mode=single`, so other databases in the account stay out of catalog
@@ -223,7 +274,7 @@ CI does the same, using the `MOTHERDUCK_TOKEN` secret from the `test` GitHub
 environment.
 
 The validation suite's quirks in `validation/tests/postgresql.py` describe
-MotherDuck: its catalog, `main` schema, no temporary tables, and the vendor
+MotherDuck: its catalog, the run's schema, no temporary tables, and the vendor
 name `MotherDuck`. The driver still reports itself as PostgreSQL (#15), so the
 vendor check fails until that's fixed. Published validation documentation will
 be configured separately.

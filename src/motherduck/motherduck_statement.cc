@@ -124,7 +124,7 @@ Status PrepareCast(PGconn* conn, const std::string& query,
     status = MakeStatus(result,
                         "Failed to prepare query with its parameters cast to their "
                         "bound types: {}\nQuery was: {}",
-                        PQerrorMessage(conn), query.c_str());
+                        PqErrorText(result, conn), RedactQuery(query));
   }
   PQclear(result);
   return status;
@@ -250,7 +250,7 @@ Status MotherduckResultReader::ExecuteAll(int64_t* affected_rows) {
           } else if (result_status != PGRES_PIPELINE_ABORTED && status.ok()) {
             status =
                 MakeStatus(result, "[libpq] Failed to execute prepared statement: {} {}",
-                           PQresStatus(result_status), PQresultErrorMessage(result));
+                           PqStatusName(result_status), PqErrorText(result, conn_));
             PQclear(result);
           } else {
             PQclear(result);
@@ -279,6 +279,10 @@ Status MotherduckResultReader::ExecuteAll(int64_t* affected_rows) {
   }
 
   return Status::Ok();
+}
+
+bool MotherduckResultReader::CommandSucceeded(const PGresult* result) const {
+  return IsResultOk(result);
 }
 
 std::unique_ptr<PqResultArrayReader> MotherduckStatement::MakeResultReader(

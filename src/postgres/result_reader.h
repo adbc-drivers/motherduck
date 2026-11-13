@@ -26,6 +26,7 @@
 #define NOMINMAX
 #endif
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <utility>
@@ -34,24 +35,26 @@
 #include <libpq-fe.h>
 
 #include "bind_stream.h"
+#include "connection.h"
 #include "copy/reader.h"
 #include "result_helper.h"
 
 namespace adbcpq {
 
-class PqResultArrayReader {
+class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayReader> {
  public:
   PqResultArrayReader(PGconn* conn, std::shared_ptr<PostgresTypeResolver> type_resolver,
                       std::string query)
       : conn_(conn),
         helper_(conn, std::move(query)),
         type_resolver_(type_resolver),
-        autocommit_(false) {
+        autocommit_(true) {
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
+    helper_.SetCancelFlag(&cancel_requested_);
   }
 
-  virtual ~PqResultArrayReader() { ResetErrors(); }
+  virtual ~PqResultArrayReader();
 
   // Ensure the reader knows what the autocommit status was on creation. This is used
   // so that the temporary timezone setting required for parameter binding can be wrapped
@@ -66,10 +69,31 @@ class PqResultArrayReader {
   void SetVendorName(std::string_view vendor_name) {
     vendor_name_ = std::string(vendor_name);
   }
+  void SetBatchSizeHint(int64_t batch_size_hint_bytes) {
+    batch_size_hint_bytes_ = batch_size_hint_bytes;
+  }
+  bool streaming_rows() const { return streaming_rows_; }
+  // True while the server still owes this reader a packet.
+  bool server_streaming() const { return helper_.streaming(); }
+  // True until the transaction this reader opened is committed or rolled back.
+  bool owns_transaction() const { return own_txn_; }
+  // Drop a server read so the connection can run another command. A result
+  // that is already fully buffered stays readable. A script that could not be
+  // committed fails the next read of this stream, not the next command.
+  void ReleaseConnection();
+  // Finish an open read on this thread. Safe to call more than once.
+  Status Close();
+  // Thread-safe. Sets the cancel flag. The reading thread sends the cancel.
+  AdbcStatusCode RequestCancel(struct AdbcError* error);
+  void SetConnection(std::shared_ptr<PostgresConnection> connection) {
+    connection_ = std::move(connection);
+  }
 
   int GetSchema(struct ArrowSchema* out);
   int GetNext(struct ArrowArray* out);
   const char* GetLastError();
+  static const struct AdbcError* ErrorFromArrayStream(struct ArrowArrayStream* stream,
+                                                      AdbcStatusCode* status);
 
   Status ToArrayStream(int64_t* affected_rows, struct ArrowArrayStream* out);
 
@@ -82,6 +106,7 @@ class PqResultArrayReader {
                                    const std::vector<Oid>& field_types, int64_t bind_row);
 
  protected:
+  std::shared_ptr<PostgresConnection> connection_;
   PGconn* conn_;
   PqResultHelper helper_;
   std::unique_ptr<BindStream> bind_stream_;
@@ -94,18 +119,42 @@ class PqResultArrayReader {
   nanoarrow::UniqueSchema schema_;
   bool autocommit_;
   std::string vendor_name_;
+  int64_t batch_size_hint_bytes_ = 16777216;
+  int next_row_ = 0;
+  bool streaming_rows_ = false;
+  bool closed_ = false;
+  // Written by the cancel thread, read by the reading thread.
+  std::atomic<bool> cancel_requested_{false};
+  // Set when this reader issued BEGIN so a multi-statement query stays one
+  // transaction. Cleared once that transaction is committed or rolled back.
+  bool own_txn_ = false;
+  // A client-side read error. Close rolls the owned script back.
+  bool script_failed_ = false;
+  AdbcStatusCode status_ = ADBC_STATUS_OK;
   struct AdbcError error_;
   struct ArrowError na_error_;
 
   explicit PqResultArrayReader(PqResultArrayReader* other)
-      : conn_(other->conn_),
+      : connection_(std::move(other->connection_)),
+        conn_(other->conn_),
         helper_(std::move(other->helper_)),
         bind_stream_(std::move(other->bind_stream_)),
         type_resolver_(std::move(other->type_resolver_)),
         field_readers_(std::move(other->field_readers_)),
         field_types_(std::move(other->field_types_)),
         bind_row_(other->bind_row_),
-        schema_(std::move(other->schema_)) {
+        schema_(std::move(other->schema_)),
+        batch_size_hint_bytes_(other->batch_size_hint_bytes_),
+        next_row_(other->next_row_),
+        streaming_rows_(other->streaming_rows_),
+        closed_(other->closed_),
+        cancel_requested_(other->cancel_requested_.load()),
+        own_txn_(other->own_txn_),
+        script_failed_(other->script_failed_),
+        status_(other->status_) {
+    other->cancel_requested_.store(false);
+    other->own_txn_ = false;
+    other->script_failed_ = false;
     ArrowErrorInit(&na_error_);
     error_ = ADBC_ERROR_INIT;
   }
@@ -132,6 +181,18 @@ class PqResultArrayReader {
     return status;
   }
   virtual Status ExecuteAll(int64_t* affected_rows);
+  Status OpenRowStream();
+  // A command tag is success. A subclass may also accept a tuples result.
+  virtual bool CommandSucceeded(const PGresult* result) const;
+  // End the transaction this reader opened. commit is ignored when the server
+  // has already aborted it. Does nothing when this reader did not begin one.
+  Status EndOwnedTransaction(bool commit);
+  int GetNextStream(struct ArrowArray* out);
+  int Fail(const Status& status);
+  int FailArrow(int code);
+  // Record a client-side read failure so Close rolls the script back.
+  int FailRead(int code);
+
   // Prepare the query with the bind stream's parameter types
   virtual Status PrepareWithParamTypes();
   // Resolve the types of any all-null (Arrow NA) parameters from the types the
