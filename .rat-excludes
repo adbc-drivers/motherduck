@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+docs/images/motherduck-logo-dark.svg
+docs/images/motherduck-logo.svg
 license.tpl
 pixi.lock
 tests/testdata/numeric_roundtrip_fixtures.csv
