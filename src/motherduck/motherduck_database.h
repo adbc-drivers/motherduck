@@ -26,6 +26,11 @@
 
 #define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
 #define ADBC_MOTHERDUCK_OPTION_SESSION_NAME "adbc.motherduck.session_name"
+/// The application's name, which the driver puts in front of its own in MotherDuck's
+/// user agent.
+#define ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME "adbc.motherduck.application_name"
+/// The longest time to wait while connecting, in seconds.
+#define ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT "adbc.motherduck.connect_timeout"
 #define ADBC_MOTHERDUCK_OPTION_REGION "adbc.motherduck.region"
 /// The schema new connections start in, set with SET search_path.
 #define ADBC_MOTHERDUCK_OPTION_DB_SCHEMA "adbc.motherduck.db_schema"
@@ -81,6 +86,8 @@ class MotherduckDatabase : public PostgresDatabase {
   // Empty until set, so the URI can override the default.
   std::string attach_mode_;
   std::string session_name_;
+  std::string application_name_;
+  std::string connect_timeout_;
   std::string region_;
   std::string db_schema_;
   std::string username_;

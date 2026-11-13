@@ -155,12 +155,21 @@ which DuckDB would take as an attached database's name when no such schema
 exists, a name that isn't a schema of the current database fails with the
 server's error. Use `USE <database>` to change databases.
 
-MotherDuck builds the user agent in query history and its logs from libpq's
-`application_name`. The driver adds `adbc_driver_motherduck/<version>` to it,
-after the application's own name if the URI's `application_name` or
-`fallback_application_name` gives one (in that order), so
-`application_name=dbt` becomes `dbt adbc_driver_motherduck/<version>`.
-`PGAPPNAME` is never used.
+`adbc.motherduck.application_name` (database option) sets your application's
+name. MotherDuck builds the user agent in query history and its logs from it,
+and the driver adds `adbc_driver_motherduck/<version>` after the name, so
+`dbt` becomes `dbt adbc_driver_motherduck/<version>`. It's unset by default,
+which leaves just the driver's own; an empty value unsets it. The option
+takes precedence over any name in the URI's unsupported `application_name` and
+`fallback_application_name` parameters (in that order). `PGAPPNAME` is never
+used.
+
+`adbc.motherduck.connect_timeout` (database option) is the longest time to wait
+while connecting, as a whole number of seconds. `0` waits indefinitely, and the
+shortest timeout is 2 seconds, so `1` acts as `2`. It's unset by default, which
+waits indefinitely; an empty value unsets it, and a value that isn't a whole
+number fails with `INVALID_ARGUMENT`. The option takes precedence over the URI's
+unsupported `connect_timeout` parameter.
 
 The MotherDuck token is the connection's password. The driver takes it from,
 in order: the standard ADBC `password` database option (or its alias,
@@ -215,8 +224,7 @@ settings of its own. None of them are part of this driver's supported
 interface, and any of them may stop working, or work differently, in a future
 version, including a version that no longer uses that library:
 
-- URI parameters, such as `sslmode`, `sslrootcert`, `options`,
-  `application_name`, `connect_timeout` and `service`.
+- URI parameters, such as `sslmode`, `sslrootcert`, `options` and `service`.
 - PostgreSQL environment variables, such as `PGHOST`, `PGPORT`, `PGSSLMODE`,
   `PGSSLROOTCERT` and `PGOPTIONS`, and files such as `~/.pg_service.conf`. Some
   are read today and some are ignored, as described under

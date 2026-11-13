@@ -127,6 +127,15 @@ bool IsHostLabel(std::string_view value) {
   return !part_empty;
 }
 
+// Whether value is empty or a whole number of seconds, which fits in an int.
+bool IsTimeoutSeconds(std::string_view value) {
+  if (value.size() > 9) return false;
+  for (char c : value) {
+    if (c < '0' || c > '9') return false;
+  }
+  return true;
+}
+
 // Backslash-escapes whitespace and backslashes for libpq options. MotherDuck
 // removes the escapes, so "a b" arrives as is.
 std::string EscapeOptionValue(std::string_view value) {
@@ -202,6 +211,10 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
     output = attach_mode_.empty() ? kDefaultAttachMode : attach_mode_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
     optional = &session_name_;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME) == 0) {
+    optional = &application_name_;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
+    optional = &connect_timeout_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     optional = &region_;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
@@ -267,6 +280,19 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     attach_mode_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
     session_name_ = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME) == 0) {
+    // An empty value unsets it.
+    application_name_ = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
+    // A whole number of seconds. An empty value unsets it; 0 waits indefinitely.
+    if (!IsTimeoutSeconds(value)) {
+      InternalAdbcSetError(error,
+                           "Invalid value for option %s=%s: expected a whole number "
+                           "of seconds, such as 10",
+                           key, value);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    connect_timeout_ = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     // The region becomes part of a hostname. An empty value unsets it.
     std::string region = AsciiLower(value);
@@ -448,10 +474,14 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   params->emplace_back("options", std::move(session_options));
   // MotherDuck's user agent comes from application_name: append the driver to
   // the application's name. Always passing it means PGAPPNAME is never used.
+  if (!application_name_.empty()) application_name = application_name_;
   if (application_name.empty()) application_name = fallback_application_name;
   if (!application_name.empty()) application_name += ' ';
   application_name += "adbc_driver_motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION;
   params->emplace_back("application_name", std::move(application_name));
+  // libpq uses the last value given for a keyword, so this replaces the URI's.
+  if (!connect_timeout_.empty())
+    params->emplace_back("connect_timeout", connect_timeout_);
   return ADBC_STATUS_OK;
 }
 

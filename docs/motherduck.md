@@ -112,8 +112,7 @@ settings of its own. None of them are part of this driver's supported
 interface, and any of them may stop working, or work differently, in a future
 version, including a version that no longer uses that library:
 
-- URI parameters, such as `sslmode`, `sslrootcert`, `options`,
-  `application_name`, `connect_timeout` and `service`.
+- URI parameters, such as `sslmode`, `sslrootcert`, `options` and `service`.
 - PostgreSQL environment variables, such as `PGHOST`, `PGPORT`, `PGSSLMODE`,
   `PGSSLROOTCERT` and `PGOPTIONS`, and files such as `~/.pg_service.conf`.
   Some are read today and some are ignored, as described under
@@ -141,6 +140,8 @@ Without a token, connecting fails with `UNAUTHENTICATED`.
 | `adbc.motherduck.attach_mode` | Database | `single` (default) attaches only the named database; `workspace` attaches every database in the account. |
 | `adbc.motherduck.region` | Database | The MotherDuck region, such as `us-east-1` or `eastus2`, which sets the host. |
 | `adbc.motherduck.session_name` | Database | MotherDuck's [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name), which routes connections with the same name to the same replica under read scaling. |
+| `adbc.motherduck.application_name` | Database | Your application's name. The driver adds `adbc_driver_motherduck/<version>` after it, so it appears in MotherDuck's query history. |
+| `adbc.motherduck.connect_timeout` | Database | The longest time to wait while connecting, in whole seconds. `0` (the default) waits indefinitely; the shortest timeout is 2 seconds, so `1` acts as `2`. |
 | `adbc.motherduck.db_schema` | Database | The schema every new connection starts in. Connecting fails if it doesn't exist. |
 | `adbc.connection.db_schema` | Connection | Changes a single connection's schema, in its current database. |
 | `adbc.motherduck.token` | Database | Alias for the standard `password` option. |

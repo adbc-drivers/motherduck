@@ -822,6 +822,24 @@ TEST_F(PostgresDatabaseTest, SessionNameOption) {
               IsOkStatus(&error));
 }
 
+TEST_F(PostgresDatabaseTest, ApplicationNameAndConnectTimeoutOptions) {
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  adbc_validation::Handle<struct AdbcConnection> connection;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(quirks_.SetupDatabase(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(
+      AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME,
+                            "adbc test app", &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value,
+                                    ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT, "30", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseInit(&database.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
+              IsOkStatus(&error));
+}
+
 // Percent-encodes everything but unreserved characters and '/', for a URI component.
 static std::string PercentEncode(const std::string& text) {
   static const char kHex[] = "0123456789ABCDEF";

@@ -118,6 +118,73 @@ TEST(MotherDuckSessionNameTest, OptionSetGet) {
   if (error.release) error.release(&error);
 }
 
+TEST(MotherDuckApplicationNameTest, OptionSetGet) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  EXPECT_THAT(
+      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME, &error),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+  ASSERT_THAT(
+      AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME,
+                            "dbt", &error),
+      IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME, &error),
+              ::testing::Optional("dbt"s));
+  // An empty value unsets it.
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value,
+                                    ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME, "", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(
+      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME, &error),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckConnectTimeoutTest, OptionSetGet) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  EXPECT_THAT(
+      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT, &error),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+  for (const char* timeout : {"10", "0", "999999999"}) {
+    ASSERT_THAT(
+        AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT,
+                              timeout, &error),
+        IsOkStatus(&error));
+    EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                    &database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT, &error),
+                ::testing::Optional(std::string(timeout)));
+  }
+  // An empty value unsets it.
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value,
+                                    ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT, "", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(
+      GetOptionStatus(&database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT, &error),
+      IsStatus(ADBC_STATUS_NOT_FOUND, &error));
+  if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckConnectTimeoutTest, OptionInvalid) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const char* timeout : {"-1", "1.5", "ten", "10s", " 10", "1000000000"}) {
+    SCOPED_TRACE(timeout);
+    EXPECT_THAT(
+        AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT,
+                              timeout, &error),
+        IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+    error = {};
+  }
+}
+
 TEST(MotherDuckRegionTest, RegionHost) {
   // MotherDuck's AWS regions.
   for (const char* region : {"us-east-1", "us-west-2", "eu-central-1", "eu-west-1",
@@ -481,6 +548,33 @@ TEST_F(MotherDuckConnectParamsTest, ApplicationName) {
   ScopedEnv pgappname("PGAPPNAME", "env");
   SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("application_name"), ::testing::ElementsAre(driver));
+}
+
+TEST_F(MotherDuckConnectParamsTest, ApplicationNameOption) {
+  const std::string driver = "adbc_driver_motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION;
+  SetOption("uri", "motherduck://localhost/db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME, "dbt");
+  EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("dbt " + driver));
+  // The option takes precedence over the URI's names.
+  SetOption(
+      "uri",
+      "motherduck://localhost/db?application_name=uri&fallback_application_name=fb");
+  EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("dbt " + driver));
+  // Unset, the URI's name is used again.
+  SetOption(ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME, "");
+  EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("uri " + driver));
+}
+
+TEST_F(MotherDuckConnectParamsTest, ConnectTimeoutOption) {
+  SetOption("uri", "motherduck://localhost/db");
+  EXPECT_THAT(Values("connect_timeout"), ::testing::IsEmpty());
+  SetOption(ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT, "10");
+  EXPECT_THAT(Values("connect_timeout"), ::testing::ElementsAre("10"));
+  // libpq uses the last value given, so the option replaces the URI's.
+  SetOption("uri", "motherduck://localhost/db?connect_timeout=3");
+  EXPECT_EQ(Values("connect_timeout").back(), "10");
+  SetOption(ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT, "");
+  EXPECT_THAT(Values("connect_timeout"), ::testing::ElementsAre("3"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionRequiresTls) {
