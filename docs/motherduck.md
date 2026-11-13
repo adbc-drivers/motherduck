@@ -66,17 +66,15 @@ The region sets the host, so the URI can leave it out. `us-east-1` connects to
 instead: `postgresql://pg.us-east-1-aws.motherduck.com/my_db`.
 
 The URI can also use the `motherduck://` scheme, such as `motherduck:///my_db`.
-When no `driver` is given, an ADBC driver manager loads the driver named by the
-URI's scheme, so `motherduck://` alone selects this driver:
+Passed in place of the driver name, an ADBC driver manager loads the driver
+named by the URI's scheme, so `motherduck://` alone selects this driver:
 
 ```python
 from adbc_driver_manager import dbapi
 
 with dbapi.connect(
-    db_kwargs={
-        "uri": "motherduck:///my_db",
-        "adbc.motherduck.region": "us-east-1",
-    },
+    "motherduck:///my_db",
+    db_kwargs={"adbc.motherduck.region": "us-east-1"},
 ) as conn:
     ...
 ```
@@ -87,19 +85,20 @@ connect to `md:` and set `adbc.motherduck.attach_mode` to `workspace`.
 
 ### Connection String Format
 
-The URI uses the libpq connection URI syntax:
+The URI uses the libpq connection URI syntax, with either scheme:
 
 ```text
 postgresql://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
+motherduck://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
 ```
 
-The scheme can also be `motherduck://`, which the driver reads as
-`postgresql://` and which the rest of this section applies to equally. Write it
-in lowercase, as libpq's scheme must be. The ADBC driver manager passes the
-whole URI to the driver, and uses the scheme to pick the driver when no `driver`
-option is given. A `motherduck://` URI must name a host or be used with
-`adbc.motherduck.region`; without either, connecting fails instead of falling
-back to `PGHOST` or a local socket, as libpq would.
+The driver reads `motherduck://` as `postgresql://`, so everything below
+applies to both. Write the scheme in lowercase, as libpq's must be. The ADBC
+driver manager passes the whole URI to the driver, and takes the driver's name
+from the scheme when the URI is given in place of a driver name. A
+`motherduck://` URI must name a host or be used with `adbc.motherduck.region`;
+without either, connecting fails instead of falling back to `PGHOST` or a local
+socket, as libpq would.
 
 Components:
 

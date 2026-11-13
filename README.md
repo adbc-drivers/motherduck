@@ -95,10 +95,11 @@ built yourself, pass the path to the library as `driver`, such as
 `build/libadbc_driver_motherduck.dylib`.
 
 The URI is a libpq connection URI (`postgresql://[user[:password]@][host][:port]/database[?parameters]`).
-It can also start with `motherduck://`, as in `motherduck:///my_db`, so that an
-ADBC driver manager given no `driver` loads this driver from the URI's scheme
-and passes it the whole URI. The driver reads `motherduck://` as
-`postgresql://`; the rest of the URI is the same. A `motherduck://` URI must
+It can also start with `motherduck://` instead, as in `motherduck:///my_db`:
+passed in place of a driver name, as in `dbapi.connect("motherduck:///my_db")`,
+an ADBC driver manager loads this driver from the URI's scheme and passes it
+the whole URI. The driver reads `motherduck://` as `postgresql://`; the rest of
+the URI is the same. A `motherduck://` URI must
 name a host or be used with `adbc.motherduck.region`, since libpq would
 otherwise fall back to `PGHOST` or a local socket. The scheme is lowercase, as
 libpq's `postgresql://` is.
