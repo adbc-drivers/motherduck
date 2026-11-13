@@ -52,6 +52,11 @@ Status PqResultArrayReader::Close() {
   // commits unless the caller cancelled or a row failed to convert.
   const bool cancel_if_blocked = user_cancel || (autocommit_ && !own_txn_);
   const bool failed = helper_.Finish(cancel_if_blocked) || script_failed_;
+  // A bind that is still running holds the transaction and time zone that
+  // SetParamTypes() may have set. Cancelling or releasing the stream early
+  // would otherwise leave the connection inside that transaction, so undo it
+  // as on any other error, once the connection is idle.
+  AbortBind();
   Status ended = EndOwnedTransaction(!(failed || user_cancel));
   // Both COMMIT and ROLLBACK failed. The connection rolls this back before
   // the next command, since this reader is about to be destroyed.
@@ -99,6 +104,10 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
     return EINVAL;
   }
 
+  // A failed bind rolled back and dropped the bind stream. Keep failing with
+  // the same error, instead of reporting a clean end of stream.
+  if (bind_failed_errno_ != 0) return bind_failed_errno_;
+
   ResetErrors();
   status_ = ADBC_STATUS_OK;
 
@@ -126,10 +135,7 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
 
     // Keep binding and executing until we have a result to return
     status = BindNextAndExecute(nullptr);
-    if (!status.ok()) {
-      status.ToAdbc(&error_);
-      return EIO;
-    }
+    if (!status.ok()) return FailBind(status);
 
     // It's possible that there is still nothing to do here
     if (!helper_.HasResult()) {
@@ -140,21 +146,18 @@ int PqResultArrayReader::GetNext(struct ArrowArray* out) {
 
   // The schema and field readers were built from the first result. A later
   // result with different columns would index past them or be decoded as the
-  // wrong type. This runs on every call, and the result is kept, so retrying
-  // after the error fails again instead of decoding it or ending the stream
-  // early.
-  status = AbortBindOnError(CheckResultMatches(helper_, field_types_, bind_row_));
-  if (!status.ok()) {
-    status.ToAdbc(&error_);
-    return EIO;
-  }
+  // wrong type. This runs on every call, and the failure is sticky, so a retry
+  // can't decode the result or end the stream early.
+  status = CheckResultMatches(helper_, field_types_, bind_row_);
+  if (!status.ok()) return FailBind(status);
 
   nanoarrow::UniqueArray tmp;
   int code = ReadResult(tmp.get());
   if (code != NANOARROW_OK) {
     // A value the field readers reject ends the bind like any other error.
     AbortBind();
-    return code;
+    bind_failed_errno_ = FailArrow(code);
+    return bind_failed_errno_;
   }
 
   // Signal that the next call to GetNext() will have to populate the result again
@@ -324,10 +327,11 @@ Status PqResultArrayReader::CheckResultMatches(const PqResultHelper& result,
 
   for (int i = 0; i < result.NumColumns(); i++) {
     if (result.FieldType(i) != field_types[i]) {
+      // The column name is left out: on MotherDuck an unaliased expression is
+      // named after its SQL text, which may hold literals.
       return Status::IO("[libpq] Result for bind row ", bind_row, " has type OID ",
-                        result.FieldType(i), " for column ", i, " (\"",
-                        result.FieldName(i), "\"), but the first result had type OID ",
-                        field_types[i]);
+                        result.FieldType(i), " for column ", i,
+                        ", but the first result had type OID ", field_types[i]);
     }
   }
 
@@ -573,6 +577,12 @@ Status PqResultArrayReader::ExecuteAll(int64_t* affected_rows) {
   }
 
   return Status::Ok();
+}
+
+int PqResultArrayReader::FailBind(const Status& status) {
+  AbortBind();
+  bind_failed_errno_ = Fail(status);
+  return bind_failed_errno_;
 }
 
 int PqResultArrayReader::Fail(const Status& status) {

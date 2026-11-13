@@ -116,6 +116,9 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   std::vector<Oid> field_types_;
   // The 0-based index of the bind row last executed, for error messages
   int64_t bind_row_ = -1;
+  // The errno of the failure that aborted the bind, which GetNext keeps
+  // returning. Zero until then.
+  int bind_failed_errno_ = 0;
   nanoarrow::UniqueSchema schema_;
   bool autocommit_;
   std::string vendor_name_;
@@ -143,6 +146,7 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
         field_readers_(std::move(other->field_readers_)),
         field_types_(std::move(other->field_types_)),
         bind_row_(other->bind_row_),
+        bind_failed_errno_(other->bind_failed_errno_),
         schema_(std::move(other->schema_)),
         batch_size_hint_bytes_(other->batch_size_hint_bytes_),
         next_row_(other->next_row_),
@@ -190,6 +194,8 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   Status EndOwnedTransaction(bool commit);
   int GetNextStream(struct ArrowArray* out);
   int Fail(const Status& status);
+  // Abort the bind and fail with status, now and on every later GetNext().
+  int FailBind(const Status& status);
   int FailArrow(int code);
   // Record a client-side read failure so Close rolls the script back.
   int FailRead(int code);

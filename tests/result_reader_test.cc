@@ -74,8 +74,9 @@ TEST(PostgresResultReaderTest, ColumnTypeMismatch) {
       PqResultArrayReader::CheckResultMatches(helper, {kInt4Oid, kTextOid}, 7);
   ASSERT_FALSE(status.ok());
   EXPECT_THAT(status.message(), ::testing::HasSubstr("bind row 7"));
-  EXPECT_THAT(status.message(),
-              ::testing::HasSubstr("type OID 701 for column 1 (\"b\")"));
+  EXPECT_THAT(status.message(), ::testing::HasSubstr("type OID 701 for column 1,"));
+  // The name could be SQL text, so it stays out of the message.
+  EXPECT_THAT(status.message(), ::testing::Not(::testing::HasSubstr("\"b\"")));
   EXPECT_THAT(status.message(), ::testing::HasSubstr("first result had type OID 25"));
 }
 
