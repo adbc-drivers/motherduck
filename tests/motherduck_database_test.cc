@@ -14,7 +14,13 @@
 
 // Tests for the MotherDuck database subclass that don't need a server.
 
+#ifdef _WIN32
+// winsock2.h includes windows.h, which declares SetEnvironmentVariableA.
+#include <winsock2.h>
+#endif
+
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -441,6 +447,51 @@ TEST_F(MotherDuckConnectParamsTest, KeepsServiceSslmode) {
   SetOption("uri", "postgresql://localhost/db");
   EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
 }
+
+TEST_F(MotherDuckConnectParamsTest, ServiceOutranksTlsEnv) {
+  // libpq ranks a service file above PGSSLMODE and PGSSLROOTCERT, so passing
+  // them explicitly would override the service's settings.
+  ScopedEnv pgsslmode("PGSSLMODE", "prefer");
+  ScopedEnv pgsslrootcert("PGSSLROOTCERT", "/tmp/root.crt");
+  SetOption("uri", "service=md dbname=db");
+  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+  EXPECT_THAT(Values("sslrootcert"), ::testing::IsEmpty());
+  ScopedEnv pgservice("PGSERVICE", "md");
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::IsEmpty());
+  EXPECT_THAT(Values("sslrootcert"), ::testing::IsEmpty());
+}
+
+#ifdef _WIN32
+// Sets a variable in the process environment only, as an application does
+// after the DLL loads (Python's os.environ, say), leaving the C runtime's copy,
+// which libpq reads, alone. ScopedEnv's _putenv_s sets both.
+class ScopedProcessEnv {
+ public:
+  ScopedProcessEnv(const char* name, const char* value) : name_(name) {
+    SetEnvironmentVariableA(name, value);
+  }
+  ~ScopedProcessEnv() { SetEnvironmentVariableA(name_.c_str(), nullptr); }
+  void Set(const char* value) { SetEnvironmentVariableA(name_.c_str(), value); }
+
+ private:
+  std::string name_;
+};
+
+TEST_F(MotherDuckConnectParamsTest, ServiceOnlyInProcessEnv) {
+  // libpq reads PGSERVICE from the C runtime, where it's unset (the fixture
+  // clears it), so it loads no service file. The driver must still pass the
+  // process environment's PGSSLMODE, and its own default without one, rather
+  // than leave libpq on prefer.
+  ASSERT_EQ(std::getenv("PGSERVICE"), nullptr);
+  ScopedProcessEnv pgservice("PGSERVICE", "md");
+  ScopedProcessEnv pgsslmode("PGSSLMODE", "verify-full");
+  SetOption("uri", "postgresql://localhost/db");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+  pgsslmode.Set(nullptr);
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+}
+#endif
 
 // Every combination of region, sslmode (URI and PGSSLMODE) and sslrootcert
 // source. The URI's sslmode passes through unchanged. The driver adds
