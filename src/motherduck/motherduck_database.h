@@ -34,7 +34,7 @@
 
 namespace adbcpq {
 
-/// rief The URI in a form libpq parses. The driver accepts only motherduck://
+/// \brief The URI in a form libpq parses. The driver accepts only motherduck://
 /// URIs, [user[:token]@][host][:port]/[database][?params], which ADBC driver
 /// managers pass through unchanged when they pick this driver from the scheme.
 /// This replaces the scheme with postgresql://, which libpq parses and which

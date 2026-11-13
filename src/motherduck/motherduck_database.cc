@@ -292,7 +292,7 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     // that reads uri_ sees motherduck://.
     if (*value != '\0' && !std::string_view(value).starts_with(kMotherduckScheme)) {
       InternalAdbcSetError(error,
-                           "[libpq] Invalid database option 'uri': expected a "
+                           "Invalid database option 'uri': expected a "
                            "motherduck:// URI, such as motherduck:///my_db or "
                            "motherduck://pg.us-east-1-aws.motherduck.com/my_db");
       return ADBC_STATUS_INVALID_ARGUMENT;
@@ -377,16 +377,6 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     }
   }
 
-  bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
-  // Without a host libpq would fall back to PGHOST or a local socket, which
-  // would send the token somewhere other than MotherDuck.
-  if (region_.empty() && uri_host.empty() && uri_hostaddr.empty() && !names_service) {
-    InternalAdbcSetError(error,
-                         "[libpq] The URI needs a host, or set the database "
-                         "option '%s'",
-                         ADBC_MOTHERDUCK_OPTION_REGION);
-    return ADBC_STATUS_INVALID_ARGUMENT;
-  }
   if (!region_.empty()) {
     // A different host, or any hostaddr (which libpq connects to instead of the
     // host), would send the connection elsewhere.
@@ -415,6 +405,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   // Certificate verification still needs sslmode=verify-full (#34). A named
   // service may set sslmode itself, which this would override; with a region,
   // a service is already an error.
+  bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
   if (!names_service && DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
     params->emplace_back("sslmode", "require");
   }

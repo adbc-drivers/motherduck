@@ -386,6 +386,19 @@ TEST(MotherDuckUriTest, RejectsOtherSchemes) {
               IsOkStatus(&error));
 }
 
+TEST_F(MotherDuckConnectParamsTest, RejectedUriKeepsPreviousUri) {
+  SetOption("uri", "motherduck://alice@localhost/db");
+  EXPECT_EQ(database_.SetOption("uri", "postgresql://bob:secret@elsewhere/db", &error_),
+            ADBC_STATUS_INVALID_ARGUMENT);
+  // The message doesn't repeat the rejected URI, which may hold a token.
+  EXPECT_THAT(error_.message, ::testing::Not(::testing::HasSubstr("secret")));
+  EXPECT_THAT(error_.message, ::testing::Not(::testing::HasSubstr("elsewhere")));
+  if (error_.release) error_.release(&error_);
+  error_ = {};
+  EXPECT_THAT(Values("user"), ::testing::ElementsAre("alice"));
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("localhost"));
+}
+
 TEST_F(MotherDuckConnectParamsTest, UriParts) {
   SetOption("uri", "motherduck://alice:secret@localhost:5000/db?application_name=dbt");
   EXPECT_THAT(Values("host"), ::testing::ElementsAre("localhost"));
@@ -397,23 +410,6 @@ TEST_F(MotherDuckConnectParamsTest, UriParts) {
   EXPECT_THAT(Values("application_name"),
               ::testing::ElementsAre(
                   "dbt adbc_driver_motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION));
-}
-
-TEST_F(MotherDuckConnectParamsTest, UriNeedsHost) {
-  // Without a host, libpq would use PGHOST or a local socket.
-  ScopedEnv pghost("PGHOST", "elsewhere.example.com");
-  SetOption("uri", "motherduck:///db");
-  EXPECT_EQ(ADBC_STATUS_INVALID_ARGUMENT, Status());
-  // A host in the URI, a region or a service is enough.
-  SetOption("uri", "motherduck://localhost/db");
-  EXPECT_EQ(ADBC_STATUS_OK, Status());
-  SetOption("uri", "motherduck:///db?hostaddr=127.0.0.1");
-  EXPECT_EQ(ADBC_STATUS_OK, Status());
-  SetOption("uri", "motherduck:///db?service=md");
-  EXPECT_EQ(ADBC_STATUS_OK, Status());
-  SetOption("uri", "motherduck:///db");
-  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
-  EXPECT_EQ(ADBC_STATUS_OK, Status());
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionConflictsWithUriHost) {

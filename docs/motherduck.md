@@ -90,13 +90,7 @@ The URI is a `motherduck://` URI:
 motherduck://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
 ```
 
-The driver accepts no other scheme. A `postgresql://` or `postgres://` URI, or a
-libpq keyword/value string, fails with `INVALID_ARGUMENT`, so the driver doesn't
-commit to libpq's connection syntax. Write the scheme in lowercase. The URI
-must name a host or be used with `adbc.motherduck.region`; without either,
-connecting fails instead of falling back to `PGHOST` or a local socket, as
-libpq would. The parameters after the `?` are libpq's, because the driver hands
-libpq the same URI with `postgresql://` in place of `motherduck://`.
+The driver accepts no other scheme, and the scheme is lowercase.
 
 Components:
 
@@ -153,7 +147,7 @@ PostgreSQL driver:
   endpoint. Plain PostgreSQL servers aren't supported, because every connection
   sets `attach_mode`.
 - **Connection URI.** The URI must use the `motherduck://` scheme, not
-  `postgresql://`, and must name a host or be used with `adbc.motherduck.region`.
+  `postgresql://`.
 - **Connection settings.** The MotherDuck token is the password, and the user
   defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
   and connection service files are never used, and `sslmode` defaults to

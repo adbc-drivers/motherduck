@@ -822,6 +822,22 @@ TEST_F(PostgresDatabaseTest, SessionNameOption) {
               IsOkStatus(&error));
 }
 
+// Percent-encodes everything but unreserved characters and '/', for a URI component.
+static std::string PercentEncode(const std::string& text) {
+  static const char kHex[] = "0123456789ABCDEF";
+  std::string encoded;
+  for (unsigned char c : text) {
+    if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~' || c == '/') {
+      encoded += static_cast<char>(c);
+    } else {
+      encoded += '%';
+      encoded += kHex[c >> 4];
+      encoded += kHex[c & 0xF];
+    }
+  }
+  return encoded;
+}
+
 // Each sslmode against MotherDuck's endpoint, which refuses plaintext: every
 // mode that connects must use TLS. The CA bundle comes from the test URI,
 // since some libpq builds can't read the system trust store.
@@ -873,11 +889,11 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   ScopedEnv pgsslmode("PGSSLMODE", nullptr);
   ScopedEnv pgsslrootcert("PGSSLROOTCERT", nullptr);
   for (const Case& test_case : kCases) {
-    // The database name has no characters that need escaping, such as md:.
-    std::string conn_uri = "motherduck://" + user + "@" + host + ":" + port + "/" +
-                           dbname + "?sslmode=" + test_case.sslmode;
+    std::string conn_uri = "motherduck://" + PercentEncode(user) + "@" + host + ":" +
+                           port + "/" + PercentEncode(dbname) +
+                           "?sslmode=" + test_case.sslmode;
     if (!test_case.sslrootcert.empty()) {
-      conn_uri += "&sslrootcert=" + test_case.sslrootcert;
+      conn_uri += "&sslrootcert=" + PercentEncode(test_case.sslrootcert);
     }
     SCOPED_TRACE(std::string("sslmode=") + test_case.sslmode +
                  " sslrootcert=" + test_case.sslrootcert);
