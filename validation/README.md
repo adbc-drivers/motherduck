@@ -30,7 +30,7 @@ PostgreSQL itself is not a goal of this repository.
 
 ## Testing
 
-You need a MotherDuck token whose account can create and drop databases, and a
+You need a MotherDuck token whose account can create databases and schemas, and a
 build of the driver in `build/`:
 
 ```shell
@@ -39,11 +39,13 @@ $ export MOTHERDUCK_TOKEN=...
 ```
 
 `ci/scripts/pre-test.sh` writes the connection settings to `.env.override`.
-Pass your platform and architecture; they only go into the database name.
-Setting `GITHUB_JOB=validate` keeps the name distinct from the C++ tests'.
+Pass your platform and architecture; they go into the run label,
+`MOTHERDUCK_TEST_RUN`. The suite's schema adds its own start time and process
+ID to that label, so it never shares a schema with the C++ tests or another
+run, even one that sources the same `.env.override`.
 
 ```shell
-$ GITHUB_JOB=validate ./ci/scripts/pre-test.sh macos arm64
+$ ./ci/scripts/pre-test.sh macos arm64
 $ set -a; source .env.override; set +a
 ```
 
@@ -53,8 +55,11 @@ Then run the suite from the repository root:
 $ pixi run validate
 ```
 
-The suite creates a fresh database before it starts and drops it when it
-finishes. To use an existing database instead, which the suite leaves in place,
-set `MOTHERDUCK_TEST_DATABASE` before running `pre-test.sh`.
+The suite works in a schema of its own in the shared `adbc_driver_tests`
+database, which it creates before it starts and drops, with the schemas and
+databases named after it, when it finishes; it also drops what interrupted runs
+left behind a day or more ago (see the main README). To use another database, set
+`MOTHERDUCK_TEST_DATABASE` before running `pre-test.sh`; the suite creates and
+cleans up in it the same way, so it can't be read-only.
 `MOTHERDUCK_PG_HOST` overrides the default endpoint,
 `pg.us-east-1-aws.motherduck.com`.
