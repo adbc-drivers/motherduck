@@ -747,9 +747,8 @@ TEST_F(TokenCacheTest, PausesAfterDeniedLogin) {
   EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)),
             ADBC_STATUS_UNAUTHENTICATED);
 
-  // A new connection attempt within a minute fails without opening the
-  // browser, in this database and in a new one for the same account, as dbt
-  // may create.
+  // Within a minute, this database and a new one of the account fail without
+  // opening the browser.
   now_ += 30s;
   const Status status = cache.Get(/*need_host=*/false, &credentials);
   EXPECT_EQ(Code(status), ADBC_STATUS_UNAUTHENTICATED);

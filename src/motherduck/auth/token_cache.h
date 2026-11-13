@@ -51,29 +51,23 @@ struct Credentials {
 ///
 /// Thread-safe. Logins are serialized across the process, and across processes
 /// sharing the credentials file, so concurrent connections wait for one login
-/// rather than each starting their own. Within the process, a connection waits
-/// for a login in progress however long it takes (the login ends by its own
-/// timeout), and shares its outcome: its token, or its failure, so that a
-/// login that times out or is denied doesn't open another browser. After a
-/// denied login, no database logging in to the same account (credentials file,
-/// Auth0 application and MotherDuck API) opens the browser for a minute.
+/// rather than each starting their own, and share its outcome, including a
+/// failure. After a denied login, the account (credentials file, client ID and
+/// API origin) doesn't open the browser again for a minute.
 class TokenCache {
  public:
   TokenCache(LoginEnvironment env, LoginOptions options)
       : env_(std::move(env)), options_(std::move(options)) {}
 
-  /// \brief The number of logins the process has finished, to pass to Get as
-  ///   since when a connection attempt begins.
+  /// \brief Logins finished in the process; pass it to Get as since.
   static uint64_t LoginsFinished();
 
   /// \brief Credentials to connect with, logging in through the browser unless a
   ///   saved token is usable.
   ///
   /// \param need_host Also look up the organization's Postgres endpoint.
-  /// \param since LoginsFinished() when the connection attempt began. If a login
-  ///   of the same account that finished since then (one in progress then, or
-  ///   started later) failed, Get returns its failure instead of logging in
-  ///   again.
+  /// \param since LoginsFinished() when the connection attempt began. A failed
+  ///   login of the account that finished after that fails this Get too.
   Status Get(bool need_host, Credentials* credentials, uint64_t since);
 
   /// \brief Get, for a connection attempt that begins now.
@@ -94,8 +88,7 @@ class TokenCache {
  private:
   using Deadline = std::optional<std::chrono::steady_clock::time_point>;
 
-  // When to stop waiting for another process's login: after the login timeout,
-  // or never without one.
+  // The login timeout from now, if there is one.
   Deadline LockDeadline() const;
   Status LockCredentials(const std::filesystem::path& path, const Deadline& deadline,
                          std::unique_ptr<CredentialsLock>* lock) const;
@@ -131,9 +124,8 @@ class CredentialsLock {
   intptr_t handle_;
 };
 
-/// \brief A login in progress in some process, announced next to the credentials
-///   file (in credentials.json.login) while that process holds its lock, so that
-///   processes waiting for the lock know how long to wait.
+/// \brief A login in progress, announced in credentials.json.login by the process
+///   holding the credentials lock, so waiters know how long to wait.
 struct LoginAnnouncement {
   int64_t pid = 0;
   /// \brief When the login ends at the latest.
@@ -153,7 +145,6 @@ void RemoveLoginAnnouncement(const std::filesystem::path& path);
 /// \brief Whether a process with this ID is running.
 bool ProcessIsRunning(int64_t pid);
 
-/// \brief This process's ID.
 int64_t CurrentProcessId();
 
 /// \brief $MOTHERDUCK_HOME/credentials.json, or ~/.motherduck/credentials.json.

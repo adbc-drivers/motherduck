@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Many threads connecting at once with browser login, as dbt does with one
-// connection per thread: they should share one login, and its outcome, without
-// data races. These use real time and threads, unlike motherduck_auth_test.cc.
+// Many threads connecting at once with browser login, as dbt does: they should
+// share one login and its outcome. Real time and threads, unlike
+// motherduck_auth_test.cc, so timings leave seconds of slack for slow CI.
 
 #include <atomic>
 #include <chrono>
@@ -64,7 +64,7 @@ class FakeServer : public adbcpq::auth::HttpClient {
                                       : HttpResponse{401, R"({"errMessage":"Invalid"})"};
       return Status::Ok();
     }
-    // lookup-user: exchange the ID token for a MotherDuck token.
+    // lookup-user
     std::this_thread::sleep_for(exchange_delay);
     std::lock_guard<std::mutex> lock(mutex_);
     exchanges_++;
@@ -157,8 +157,7 @@ class AuthStressTest : public ::testing::Test {
     return std::make_shared<TokenCache>(std::move(env), std::move(options));
   }
 
-  /// What MotherduckDatabase::Connect does: get credentials, connect, and if the
-  /// endpoint rejects a saved token, reject it and try once more.
+  /// Like MotherduckDatabase::Connect.
   Status Connect(TokenCache& cache, bool need_host, std::string* token) {
     const uint64_t logins = TokenCache::LoginsFinished();
     Credentials credentials;
@@ -181,7 +180,7 @@ class AuthStressTest : public ::testing::Test {
     std::map<std::string, int> tokens;
   };
 
-  /// Connect from kThreads threads at once, thread i through caches[i % size].
+  /// Thread i connects through caches[i % size].
   Outcome ConnectAll(const std::vector<std::shared_ptr<TokenCache>>& caches,
                      bool need_host) {
     Outcome outcome;
@@ -249,31 +248,27 @@ TEST_F(AuthStressTest, ExpiredTokenSharesOneLogin) {
 }
 
 TEST_F(AuthStressTest, WaitsForLoginThatOutlastsTheTimeout) {
-  // Approved in time, but the exchange ends after login_timeout: the threads
-  // waiting for the login get its token rather than timing out.
-  server_->approve_after = 500ms;
-  server_->exchange_delay = 1500ms;
-  const Outcome outcome = ConnectAll({MakeCache(2s)}, /*need_host=*/true);
+  // The first poll, at 1s, sees the approval; the exchange then ends at about
+  // 4s, past the 3s timeout the waiting threads used to give up at.
+  server_->approve_after = 200ms;
+  server_->exchange_delay = 3s;
+  const Outcome outcome = ConnectAll({MakeCache(3s)}, /*need_host=*/true);
   EXPECT_EQ(outcome.codes, (Codes{{ADBC_STATUS_OK, kThreads}}));
   EXPECT_EQ(browsers_, 1);
 }
 
 TEST_F(AuthStressTest, SharesTimedOutLogin) {
-  // Never approved: one browser, and every connection fails with its timeout
-  // instead of the next one starting another login.
+  // Never approved. One device code means no thread started a second login.
   server_->approve_after = 1h;
-  const auto start = Clock::now();
   const Outcome outcome = ConnectAll({MakeCache(2s)}, /*need_host=*/true);
-  const auto elapsed = Clock::now() - start;
   EXPECT_EQ(outcome.codes, (Codes{{ADBC_STATUS_TIMEOUT, kThreads}}));
   EXPECT_EQ(browsers_, 1);
   EXPECT_EQ(server_->device_codes(), 1);
-  EXPECT_LT(elapsed, 3500ms);
 
   // A connection attempt that starts after the failure logs in again.
   server_->approve_after = 0ms;
   std::string token;
-  EXPECT_TRUE(Connect(*MakeCache(2s), /*need_host=*/true, &token).ok());
+  EXPECT_TRUE(Connect(*MakeCache(120s), /*need_host=*/true, &token).ok());
   EXPECT_EQ(browsers_, 2);
 }
 

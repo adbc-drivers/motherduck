@@ -590,8 +590,7 @@ AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* erro
   RAISE_ADBC(ConnectParams(&params, error));
   LibpqParams connect_params = params;
   auth::Credentials credentials;
-  // A failed login during this attempt, such as one the retry below would wait
-  // for, fails this attempt rather than opening another browser.
+  // A login that fails during this attempt, retry included, fails it.
   const uint64_t logins = auth::TokenCache::LoginsFinished();
   if (token_cache_) {
     RAISE_RESULT(error, connect_params,

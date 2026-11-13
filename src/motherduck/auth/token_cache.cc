@@ -195,15 +195,12 @@ std::string_view Trim(std::string_view text) {
 
 constexpr std::chrono::milliseconds kLockPollInterval{100};
 
-// How long to wait for a process holding the credentials lock without an
-// announced login, without a login timeout: it's saving or deleting a token,
-// which is quick.
+// Without a login timeout, how long to wait for a lock held without an announced
+// login. Its holder is only saving or deleting a token.
 constexpr std::chrono::seconds kUnannouncedHoldWait{30};
-// How long past its announced end to wait for another process's login before
-// deciding it's stuck.
+// How overdue an announced login must be to count as stuck.
 constexpr std::chrono::seconds kAnnouncementGrace{10};
-// After a login is denied, or finds no MotherDuck account, how long to fail
-// instead of opening the browser again.
+// How long to refuse new logins after a denied one.
 constexpr std::chrono::seconds kDeniedLoginBackoff{60};
 
 Status WaitTimedOut() {
@@ -211,26 +208,21 @@ Status WaitTimedOut() {
                 "[motherduck] Timed out waiting for another MotherDuck login to finish");
 }
 
-// How an account's latest login failed, if it did.
+// An account's latest login, if it failed.
 struct FailedLogin {
-  // The login's number in SharedLogin::finished.
-  uint64_t number = 0;
+  uint64_t number = 0;  // In SharedLogin::finished.
   AdbcStatusCode code = ADBC_STATUS_OK;
   std::string message;
-  // After a denied login: until when to fail instead of logging in again.
-  std::optional<std::chrono::steady_clock::time_point> paused_until;
+  std::optional<std::chrono::steady_clock::time_point> paused_until;  // If denied.
 };
 
-// The process's logins: one at a time, and how each account's latest login
-// failed.
 struct SharedLogin {
-  // Held while a TokenCache reads or changes its token, including while it logs
-  // in, so that other connections wait for that login instead of starting one.
+  // Held while a TokenCache uses its token, including while it logs in, so
+  // other connections wait for that login instead of starting their own.
   std::mutex mutex;
   std::atomic<uint64_t> finished{0};
-  // Guarded by mutex. Keyed by account: the credentials file, the Auth0
-  // application and the MotherDuck API, so that databases set up differently
-  // don't fail with each other's errors.
+  // Guarded by mutex. Keyed by credentials file, client ID and API origin, so
+  // databases set up differently don't share failures.
   std::map<std::string, FailedLogin> failures;
 };
 
@@ -264,8 +256,7 @@ fs::path AnnouncementPath(const fs::path& path) {
   return announcement;
 }
 
-// Atomically replace the file at path, readable only by the user: write a
-// sibling and rename it over the file, so readers never see a partial file.
+// Write a sibling and rename it over path, so readers never see a partial file.
 Status ReplacePrivateFile(const fs::path& path, const std::string& contents) {
   std::error_code ec;
   const fs::path directory = path.parent_path();
@@ -458,9 +449,8 @@ void RemoveSavedToken(const fs::path& path, std::string_view token) {
 uint64_t TokenCache::LoginsFinished() { return Shared().finished.load(); }
 
 Status TokenCache::Get(bool need_host, Credentials* credentials, uint64_t since) {
-  // Wait for a login in progress however long it takes: it ends by its own
-  // timeout, and its token is the one this connection needs. Waiting only
-  // login_timeout from now would give up just before a slow login finishes.
+  // No deadline: a login in progress ends by its own timeout, and this
+  // connection needs its token.
   std::lock_guard<std::mutex> lock(Shared().mutex);
   const Deadline deadline = LockDeadline();
   fs::path path;
@@ -525,15 +515,11 @@ TokenCache::Deadline TokenCache::LockDeadline() const {
 
 Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadline,
                                    std::unique_ptr<CredentialsLock>* lock) const {
-  // A process that holds the lock without announcing a login is saving or
-  // deleting a token: wait the login timeout for it, or a while without one.
   auto unannounced_deadline = deadline ? *deadline : env_.now() + kUnannouncedHoldWait;
   while (true) {
     UNWRAP_STATUS(CredentialsLock::Acquire(path, lock, /*block=*/false));
     if (*lock != nullptr) return Status::Ok();
-    // A process that's logging in announces until when. Wait for its login
-    // however long it takes, since its token is the one to use, but no longer
-    // than that: past it, the process is stuck.
+    // Wait for an announced login however long it takes, unless it's overdue.
     if (std::optional<LoginAnnouncement> login = ReadLoginAnnouncement(path);
         login && ProcessIsRunning(login->pid)) {
       if (std::chrono::system_clock::now() > login->until + kAnnouncementGrace) {
@@ -543,9 +529,7 @@ Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadlin
                           "timeout and still holds " +
                           PathString(LockPath(path)) + "; end it to log in here");
       }
-      // Once its login ends, the process only saves the token before it
-      // releases the lock: give it a while for that from now, even if this
-      // waited past the login timeout for its login.
+      // After its login, the holder still saves the token; don't time out then.
       unannounced_deadline =
           std::max(unannounced_deadline, env_.now() + kUnannouncedHoldWait);
     } else if (env_.now() >= unannounced_deadline) {
@@ -575,14 +559,10 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
   const std::string account =
       PathString(path) + '\n' + options_.client_id + '\n' + options_.api_origin;
   FailedLogin& failure = shared.failures[account];
-  // A login of this account that ended during this connection attempt and
-  // failed (it timed out, or the user denied it) answers for this attempt too:
-  // another browser prompt would most likely end the same way.
+  // A login that failed during this connection attempt fails it too.
   if (failure.number > since) return Status(failure.code, failure.message);
-  // After a login was denied, or found no MotherDuck account, another one would
-  // most likely end the same way, so no database of the account opens the
-  // browser again for a while. Timeouts and network errors don't count: the
-  // next login may well work.
+  // A denial would likely recur; a timeout or network error may not, so only
+  // a denial pauses.
   if (failure.paused_until && env_.now() < *failure.paused_until) {
     const auto wait =
         std::chrono::ceil<std::chrono::seconds>(*failure.paused_until - env_.now());
@@ -591,7 +571,6 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
                       std::to_string(wait.count()) + " seconds)");
   }
 
-  // Tell processes waiting for the lock how long this login may take.
   const bool announced =
       lock != nullptr &&
       AnnounceLogin(path, CurrentProcessId(),
@@ -619,8 +598,8 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
   if (!saved.ok()) {
     env_.print(saved.message() + ". You'll be asked to log in again next time.");
   }
-  // Only now, with the token saved, so that processes waiting for the lock
-  // never see it held without either an announced login or a saved token.
+  // Only after saving, so waiters never see the lock held with neither an
+  // announcement nor a saved token.
   if (announced) RemoveLoginAnnouncement(path);
   return Status::Ok();
 }
