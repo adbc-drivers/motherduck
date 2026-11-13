@@ -88,7 +88,8 @@ class PostgresConnection {
   AdbcStatusCode Init(struct AdbcDatabase* database, struct AdbcError* error);
   AdbcStatusCode Release(struct AdbcError* error);
   AdbcStatusCode Rollback(struct AdbcError* error);
-  AdbcStatusCode SetOption(const char* key, const char* value, struct AdbcError* error);
+  virtual AdbcStatusCode SetOption(const char* key, const char* value,
+                                   struct AdbcError* error);
   AdbcStatusCode SetOptionBytes(const char* key, const uint8_t* value, size_t length,
                                 struct AdbcError* error);
   AdbcStatusCode SetOptionDouble(const char* key, double value, struct AdbcError* error);
