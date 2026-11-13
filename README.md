@@ -96,7 +96,9 @@ built yourself, pass the path to the library as `driver`, such as
 
 The URI is a `motherduck://` URI:
 `motherduck://[user[:token]@][host][:port]/database[?parameters]`. The
-driver accepts no other scheme, and the scheme is lowercase. Passed
+driver accepts no other scheme, and the scheme is lowercase. Other URI
+parameters are PostgreSQL settings, which
+[aren't supported](#postgresql-settings-are-not-supported). Passed
 in place of a driver name, as in `dbapi.connect("motherduck:///my_db")`, the
 URI lets an ADBC driver manager load this driver from its scheme.
 See [Options](#options) for everything else you can set, including how the
@@ -205,6 +207,27 @@ libpq connection service files (`~/.pg_service.conf`, `service=`, or
 replaces any `options` a service file sets, doesn't default `sslmode` when
 one is named, and can't combine one with a `region`. Put connection settings
 in the URI instead.
+
+## PostgreSQL settings are not supported
+
+The driver reaches MotherDuck through a PostgreSQL client library, which has
+settings of its own. None of them are part of this driver's supported
+interface, and any of them may stop working, or work differently, in a future
+version, including a version that no longer uses that library:
+
+- URI parameters, such as `sslmode`, `sslrootcert`, `options`,
+  `application_name`, `connect_timeout` and `service`.
+- PostgreSQL environment variables, such as `PGHOST`, `PGPORT`, `PGSSLMODE`,
+  `PGSSLROOTCERT` and `PGOPTIONS`, and files such as `~/.pg_service.conf`. Some
+  are read today and some are ignored, as described under
+  [Options](#options) and
+  [Differences from the PostgreSQL driver](#differences-from-the-postgresql-driver).
+
+Use the `adbc.motherduck.*` options and the standard ADBC options instead. The
+driver has no supported option for certificate verification yet.
+`sslmode=verify-full` with `sslrootcert` works today, but it is one of the
+unsupported settings. Where the sections below describe one of these settings,
+they describe today's behavior, not a commitment.
 
 ## Differences from the PostgreSQL driver
 

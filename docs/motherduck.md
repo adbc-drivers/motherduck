@@ -102,18 +102,27 @@ Components:
 - `USER`: optional. The default is `postgres`, which MotherDuck expects.
 - `TOKEN`: the MotherDuck token. Prefer `MOTHERDUCK_TOKEN` or a database option
   to putting it in the URI.
-- `sslmode`: defaults to `require`, which encrypts the connection without
-  verifying the server's certificate. Use `verify-full` to verify it, with
-  `sslrootcert` naming a CA bundle (or `system`, on libpq 16 and later).
-- `options`: MotherDuck [session options](https://motherduck.com/docs/sql-reference/postgres-endpoint/#session-options),
-  which the driver passes to libpq's `options` along with its own.
-- `application_name`: your application's name. The driver appends
-  `adbc_driver_motherduck/<version>` to it, so it appears in MotherDuck's query
-  history.
 
-The driver never reads `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, or password files
-(`~/.pgpass`), and doesn't support libpq connection service files. Put
-connection settings in the URI or the driver options instead.
+Other URI parameters are PostgreSQL settings, which aren't supported; see below.
+
+### PostgreSQL settings are not supported
+
+The driver reaches MotherDuck through a PostgreSQL client library, which has
+settings of its own. None of them are part of this driver's supported
+interface, and any of them may stop working, or work differently, in a future
+version, including a version that no longer uses that library:
+
+- URI parameters, such as `sslmode`, `sslrootcert`, `options`,
+  `application_name`, `connect_timeout` and `service`.
+- PostgreSQL environment variables, such as `PGHOST`, `PGPORT`, `PGSSLMODE`,
+  `PGSSLROOTCERT` and `PGOPTIONS`, and files such as `~/.pg_service.conf`.
+  Some are read today and some are ignored, as described under
+  [Differences from the PostgreSQL Driver](#differences-from-the-postgresql-driver).
+
+Use the `adbc.motherduck.*` options and the standard ADBC options instead.
+The driver has no supported option for certificate verification yet.
+`sslmode=verify-full` with `sslrootcert` works today, but it is one of the
+unsupported settings.
 
 ### Authentication
 
