@@ -172,11 +172,20 @@ Like the MotherDuck DuckDB extension's login, it doesn't use an HTTP proxy.
   `$MOTHERDUCK_HOME/credentials.json`, which must be absolute), readable only
   by the user, and a saved token is used without opening a browser. Processes
   that use the same file take turns logging in, through `credentials.json.lock`
-  next to it, so they share one login.
+  next to it, so they share one login. The process logging in writes its
+  process ID and when its login ends at the latest to `credentials.json.login`.
+  The others wait for that login as long as it takes, and give up once it's
+  10 seconds overdue, naming the stuck process. They wait at most
+  `login_timeout` (or 30 seconds with `0`) for a process that holds the lock
+  without logging in.
 - Connections opened at the same time in one process, such as one per thread,
   share one login: they wait for it as long as it takes, then use its token. If
   it fails (it times out or is denied), they all fail with its error instead of
   opening the browser again.
+- After a login is denied, or finds no MotherDuck account, new connections of
+  the same database fail with that error for 60 seconds instead of opening the
+  browser again. Initializing the database again retries right away. A login
+  that times out doesn't pause anything.
 - Without a host from the URI, `PGHOST`, `PGHOSTADDR`, `adbc.motherduck.region`
   or a connection service, the driver connects to the Postgres endpoint of the
   user's organization, which it looks up at

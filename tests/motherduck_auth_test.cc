@@ -401,6 +401,17 @@ TEST_F(LoginTest, LookupPgEndpointRejected) {
   EXPECT_THAT(status.message(), HasSubstr("Invalid token"));
 }
 
+TEST_F(LoginTest, MaxLoginDuration) {
+  // The wait for approval, plus three requests and the exchange's 60s of retries.
+  options_.timeout = 120s;
+  EXPECT_EQ(adbcpq::auth::MaxLoginDuration(options_), 270s);
+  // Without a timeout, until the login code expires, at most after an hour.
+  options_.timeout = 0s;
+  EXPECT_EQ(adbcpq::auth::MaxLoginDuration(options_), 3750s);
+  options_.timeout = std::chrono::seconds(std::numeric_limits<int64_t>::max());
+  EXPECT_EQ(adbcpq::auth::MaxLoginDuration(options_), 3750s);
+}
+
 TEST_F(LoginTest, LookupPgEndpointNotFound) {
   http_->Respond(kLookupUserWithTokenUrl, 404,
                  R"({"errMessage":"Route not found: GET /mom/lookup-user-with-token",)"
@@ -502,6 +513,34 @@ TEST_F(CredentialsFileTest, IgnoresInvalidFiles) {
   }
 }
 
+TEST_F(CredentialsFileTest, LoginAnnouncement) {
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
+  const auto until = std::chrono::system_clock::now() + 90s;
+  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, 1234, until).ok());
+  std::optional<adbcpq::auth::LoginAnnouncement> read =
+      adbcpq::auth::ReadLoginAnnouncement(path_);
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->pid, 1234);
+  EXPECT_EQ(std::chrono::floor<std::chrono::milliseconds>(read->until),
+            std::chrono::floor<std::chrono::milliseconds>(until));
+  adbcpq::auth::RemoveLoginAnnouncement(path_);
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
+
+  fs::path announcement = path_;
+  announcement += ".login";
+  for (const char* contents : {"", "1234", "x 5", "0 5", "-3 5", "12 5 extra", "12 x"}) {
+    WriteFile(announcement, contents);
+    EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt) << contents;
+  }
+}
+
+TEST(MotherDuckProcessTest, ProcessIsRunning) {
+  EXPECT_TRUE(adbcpq::auth::ProcessIsRunning(adbcpq::auth::CurrentProcessId()));
+  EXPECT_FALSE(adbcpq::auth::ProcessIsRunning(0));
+  EXPECT_FALSE(adbcpq::auth::ProcessIsRunning(-1));
+  EXPECT_FALSE(adbcpq::auth::ProcessIsRunning(0x7ffffff0));
+}
+
 TEST_F(CredentialsFileTest, RemoveOnlyMatchingToken) {
   ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "token-1").ok());
   adbcpq::auth::RemoveSavedToken(path_, "token-2");
@@ -576,9 +615,13 @@ TEST_F(TokenCacheTest, LogsInWhenApiRejectsSavedToken) {
 }
 
 TEST_F(TokenCacheTest, UsesTokenFromLoginInAnotherProcess) {
-  // Holding the lock stands in for another process that is logging in.
+  // Holding the lock and announcing a login stands in for another process that
+  // is logging in.
   std::unique_ptr<adbcpq::auth::CredentialsLock> other;
   ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, adbcpq::auth::CurrentProcessId(),
+                                          std::chrono::system_clock::now() + 1h)
+                  .ok());
   TokenCache cache = MakeCache();
   Credentials credentials;
   std::future<Status> result = std::async(
@@ -601,6 +644,134 @@ TEST_F(TokenCacheTest, TimesOutWaitingForLoginInAnotherProcess) {
   Credentials credentials;
   EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
   EXPECT_TRUE(http_->requests.empty());
+}
+
+TEST_F(TokenCacheTest, WaitsPastTimeoutForAnnouncedLogin) {
+  // Another process announced a login that may take an hour: wait for it past
+  // this database's own login timeout, then use its token.
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, adbcpq::auth::CurrentProcessId(),
+                                          std::chrono::system_clock::now() + 1h)
+                  .ok());
+  options_.timeout = 5s;
+  const auto start = now_;
+  env_.sleep = [&](std::chrono::milliseconds duration) {
+    now_ += duration;
+    if (other && now_ - start > 20s) {
+      ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "other-token").ok());
+      adbcpq::auth::RemoveLoginAnnouncement(path_);
+      other.reset();
+    }
+  };
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "other-token");
+  EXPECT_FALSE(credentials.fresh);
+  EXPECT_TRUE(http_->requests.empty());
+}
+
+TEST_F(TokenCacheTest, TimesOutWhenAnnouncedLoginIsOverdue) {
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, adbcpq::auth::CurrentProcessId(),
+                                          std::chrono::system_clock::now() - 1h)
+                  .ok());
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  const Status status = cache.Get(/*need_host=*/false, &credentials);
+  EXPECT_EQ(Code(status), ADBC_STATUS_TIMEOUT);
+  EXPECT_THAT(status.message(), HasSubstr("longer than its timeout"));
+  EXPECT_TRUE(sleeps_.empty());
+}
+
+TEST_F(TokenCacheTest, IgnoresAnnouncementOfEndedProcess) {
+  // A crashed process's announcement is left behind; the lock holder is a
+  // process that isn't logging in, so wait the login timeout.
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, /*pid=*/0x7ffffff0,
+                                          std::chrono::system_clock::now() + 1h)
+                  .ok());
+  options_.timeout = 5s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  const Status status = cache.Get(/*need_host=*/false, &credentials);
+  EXPECT_EQ(Code(status), ADBC_STATUS_TIMEOUT);
+  EXPECT_THAT(status.message(), HasSubstr("waiting for another MotherDuck login"));
+}
+
+TEST_F(TokenCacheTest, BoundsUnannouncedWaitWithoutTimeout) {
+  // login_timeout=0 used to wait forever for a lock held without a login.
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  options_.timeout = 0s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  const auto start = now_;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
+  EXPECT_GE(now_ - start, 30s);
+  EXPECT_LT(now_ - start, 31s);
+}
+
+TEST_F(TokenCacheTest, AnnouncesLoginWhileLoggingIn) {
+  RespondWithLogin();
+  std::optional<adbcpq::auth::LoginAnnouncement> during;
+  env_.open_browser = [&](const std::string&) {
+    during = adbcpq::auth::ReadLoginAnnouncement(path_);
+    return true;
+  };
+  options_.timeout = 120s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  const auto before = std::chrono::system_clock::now();
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  ASSERT_TRUE(during.has_value());
+  EXPECT_EQ(during->pid, adbcpq::auth::CurrentProcessId());
+  EXPECT_GE(during->until, std::chrono::floor<std::chrono::milliseconds>(
+                               before + adbcpq::auth::MaxLoginDuration(options_)));
+  EXPECT_LE(during->until,
+            std::chrono::system_clock::now() + adbcpq::auth::MaxLoginDuration(options_));
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
+}
+
+TEST_F(TokenCacheTest, PausesAfterDeniedLogin) {
+  http_->Respond(kDeviceCodeUrl, 200, kDeviceCode);
+  http_->Respond(kTokenUrl, 403,
+                 R"({"error":"access_denied","error_description":"User denied"})");
+  http_->Respond(kTokenUrl, 200, kIdToken);
+  http_->Respond(kLookupUserUrl, 200, kLookupUser);
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)),
+            ADBC_STATUS_UNAUTHENTICATED);
+
+  // A new connection attempt within a minute fails without opening the browser.
+  now_ += 30s;
+  const Status status = cache.Get(/*need_host=*/false, &credentials);
+  EXPECT_EQ(Code(status), ADBC_STATUS_UNAUTHENTICATED);
+  EXPECT_THAT(status.message(), HasSubstr("User denied"));
+  EXPECT_THAT(status.message(), HasSubstr("not opening the browser again"));
+  EXPECT_EQ(http_->Count(kDeviceCodeUrl), 1);
+  EXPECT_EQ(opened_.size(), 1);
+
+  // After it, log in again.
+  now_ += 31s;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "md-token");
+  EXPECT_EQ(http_->Count(kDeviceCodeUrl), 2);
+}
+
+TEST_F(TokenCacheTest, NoPauseAfterTimedOutLogin) {
+  http_->Respond(kDeviceCodeUrl, 200, kDeviceCode);
+  http_->Respond(kTokenUrl, 400, kPending);
+  options_.timeout = 10s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
+  EXPECT_EQ(http_->Count(kDeviceCodeUrl), 2);
 }
 
 TEST_F(TokenCacheTest, LoginFailure) {

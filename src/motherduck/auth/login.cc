@@ -65,6 +65,8 @@ constexpr seconds kMaxLifetime{3600};
 constexpr seconds kSlowDownStep{5};
 constexpr seconds kExchangeDeadline{60};
 constexpr std::chrono::milliseconds kExchangeRetryDelay{500};
+// The longest one HTTPS request can take (kRequestTimeout in http_client.cc).
+constexpr seconds kMaxRequest{30};
 
 /// The reason an Auth0 (error_description) or MotherDuck (errMessage) request failed.
 std::string Reason(const JsonObject& body, long status) {
@@ -300,6 +302,14 @@ Status DeviceLogin(const LoginEnvironment& env, const LoginOptions& options,
   UNWRAP_STATUS(PollForIdToken(env, options, *device_code, interval, env.now() + lifetime,
                                &id_token));
   return ExchangeIdToken(env, options, id_token, result);
+}
+
+seconds MaxLoginDuration(const LoginOptions& options) {
+  seconds wait = kMaxLifetime;
+  if (options.timeout > 0s) wait = std::min(wait, options.timeout);
+  // The device code request, the poll in flight at the deadline, and the
+  // exchange's retries and its last request.
+  return wait + kMaxRequest + kMaxRequest + kExchangeDeadline + kMaxRequest;
 }
 
 Status LookupPgEndpoint(const LoginEnvironment& env, const LoginOptions& options,

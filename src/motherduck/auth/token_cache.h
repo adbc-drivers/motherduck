@@ -104,6 +104,9 @@ class TokenCache {
   const LoginOptions options_;
   std::string token_;
   std::string host_;
+  // After a denied login: when to open the browser again, and the failure.
+  std::optional<std::chrono::steady_clock::time_point> denied_until_;
+  std::string denied_message_;
 };
 
 /// \brief The lock that serializes logins across processes sharing a credentials
@@ -127,6 +130,31 @@ class CredentialsLock {
   // A file descriptor, or a Windows HANDLE.
   intptr_t handle_;
 };
+
+/// \brief A login in progress in some process, announced next to the credentials
+///   file (in credentials.json.login) while that process holds its lock, so that
+///   processes waiting for the lock know how long to wait.
+struct LoginAnnouncement {
+  int64_t pid = 0;
+  /// \brief When the login ends at the latest.
+  std::chrono::system_clock::time_point until;
+};
+
+/// \brief Announce that process pid is logging in through the credentials file
+///   at path until at most until.
+Status AnnounceLogin(const std::filesystem::path& path, int64_t pid,
+                     std::chrono::system_clock::time_point until);
+
+/// \brief The announced login, or nullopt if there's none or it's unreadable.
+std::optional<LoginAnnouncement> ReadLoginAnnouncement(const std::filesystem::path& path);
+
+void RemoveLoginAnnouncement(const std::filesystem::path& path);
+
+/// \brief Whether a process with this ID is running.
+bool ProcessIsRunning(int64_t pid);
+
+/// \brief This process's ID.
+int64_t CurrentProcessId();
 
 /// \brief $MOTHERDUCK_HOME/credentials.json, or ~/.motherduck/credentials.json.
 Status CredentialsPath(std::filesystem::path* path);

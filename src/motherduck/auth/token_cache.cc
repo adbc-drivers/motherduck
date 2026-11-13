@@ -21,12 +21,13 @@
 
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
-#include <functional>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -42,6 +43,7 @@
 #else
 #include <fcntl.h>
 #include <pwd.h>
+#include <signal.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -191,15 +193,16 @@ std::string_view Trim(std::string_view text) {
 
 constexpr std::chrono::milliseconds kLockPollInterval{100};
 
-// Retry try_acquire until it succeeds or the deadline passes.
-bool Poll(const LoginEnvironment& env, std::chrono::steady_clock::time_point deadline,
-          const std::function<bool()>& try_acquire) {
-  while (!try_acquire()) {
-    if (env.now() >= deadline) return false;
-    env.sleep(kLockPollInterval);
-  }
-  return true;
-}
+// How long to wait for a process holding the credentials lock without an
+// announced login, without a login timeout: it's saving or deleting a token,
+// which is quick.
+constexpr std::chrono::seconds kUnannouncedHoldWait{30};
+// How long past its announced end to wait for another process's login before
+// deciding it's stuck.
+constexpr std::chrono::seconds kAnnouncementGrace{10};
+// After a login is denied, or finds no MotherDuck account, how long to fail
+// instead of opening the browser again.
+constexpr std::chrono::seconds kDeniedLoginBackoff{60};
 
 Status WaitTimedOut() {
   return Status(ADBC_STATUS_TIMEOUT,
@@ -241,6 +244,32 @@ fs::path LockPath(const fs::path& path) {
   fs::path lock_path = path;
   lock_path += ".lock";
   return lock_path;
+}
+
+fs::path AnnouncementPath(const fs::path& path) {
+  fs::path announcement = path;
+  announcement += ".login";
+  return announcement;
+}
+
+// Atomically replace the file at path, readable only by the user: write a
+// sibling and rename it over the file, so readers never see a partial file.
+Status ReplacePrivateFile(const fs::path& path, const std::string& contents) {
+  std::error_code ec;
+  const fs::path directory = path.parent_path();
+  UNWRAP_STATUS(EnsureDirectory(directory));
+  const fs::path temporary = directory / ("." + PathString(path.filename()) + "." +
+                                          std::to_string(ProcessId()) + ".tmp");
+  Status status = WritePrivateFile(temporary, contents);
+  if (status.ok()) {
+    fs::rename(temporary, path, ec);
+    if (ec) {
+      status = Status(ADBC_STATUS_IO, "[motherduck] Could not replace " +
+                                          PathString(path) + ": " + ec.message());
+    }
+  }
+  if (!status.ok()) fs::remove(temporary, ec);
+  return status;
 }
 
 }  // namespace
@@ -335,28 +364,78 @@ std::optional<std::string> LoadSavedToken(const fs::path& path) {
 }
 
 Status SaveToken(const fs::path& path, std::string_view token) {
-  std::error_code ec;
-  const fs::path directory = path.parent_path();
-  UNWRAP_STATUS(EnsureDirectory(directory));
-  // Write a sibling and rename it over the file, so readers never see a partial file.
-  const fs::path temporary = directory / ("." + PathString(path.filename()) + "." +
-                                          std::to_string(ProcessId()) + ".tmp");
   const std::optional<std::string> contents = CredentialsJson(token);
   if (!contents) {
     return Status(ADBC_STATUS_INVALID_ARGUMENT,
                   "[motherduck] Could not encode the MotherDuck token");
   }
-  Status status = WritePrivateFile(temporary, *contents);
-  if (status.ok()) {
-    fs::rename(temporary, path, ec);
-    if (ec) {
-      status = Status(ADBC_STATUS_IO, "[motherduck] Could not replace " +
-                                          PathString(path) + ": " + ec.message());
-    }
-  }
-  if (!status.ok()) fs::remove(temporary, ec);
-  return status;
+  return ReplacePrivateFile(path, *contents);
 }
+
+Status AnnounceLogin(const fs::path& path, int64_t pid,
+                     std::chrono::system_clock::time_point until) {
+  const int64_t until_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(until.time_since_epoch())
+          .count();
+  return ReplacePrivateFile(AnnouncementPath(path),
+                            std::to_string(pid) + " " + std::to_string(until_ms) + "\n");
+}
+
+std::optional<LoginAnnouncement> ReadLoginAnnouncement(const fs::path& path) {
+  std::ifstream file(AnnouncementPath(path), std::ios::binary);
+  if (!file) return std::nullopt;
+  char buffer[64];
+  file.read(buffer, sizeof(buffer));
+  const std::string_view text = Trim(std::string_view(buffer, file.gcount()));
+  const size_t space = text.find(' ');
+  if (space == std::string_view::npos) return std::nullopt;
+  int64_t pid = 0;
+  int64_t until_ms = 0;
+  const std::string_view pid_text = text.substr(0, space);
+  const std::string_view until_text = text.substr(space + 1);
+  const auto [pid_end, pid_ec] =
+      std::from_chars(pid_text.data(), pid_text.data() + pid_text.size(), pid);
+  const auto [until_end, until_ec] =
+      std::from_chars(until_text.data(), until_text.data() + until_text.size(), until_ms);
+  if (pid_ec != std::errc() || pid_end != pid_text.data() + pid_text.size() ||
+      until_ec != std::errc() || until_end != until_text.data() + until_text.size() ||
+      pid <= 0) {
+    return std::nullopt;
+  }
+  LoginAnnouncement announcement;
+  announcement.pid = pid;
+  announcement.until =
+      std::chrono::system_clock::time_point(std::chrono::milliseconds(until_ms));
+  return announcement;
+}
+
+void RemoveLoginAnnouncement(const fs::path& path) {
+  std::error_code ec;
+  fs::remove(AnnouncementPath(path), ec);
+}
+
+int64_t CurrentProcessId() { return ProcessId(); }
+
+#ifdef _WIN32
+bool ProcessIsRunning(int64_t pid) {
+  if (pid <= 0 || pid > MAXDWORD) return false;
+  HANDLE process =
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+  // Access denied means it exists.
+  if (process == nullptr) return GetLastError() == ERROR_ACCESS_DENIED;
+  DWORD code = 0;
+  const bool running = GetExitCodeProcess(process, &code) && code == STILL_ACTIVE;
+  CloseHandle(process);
+  return running;
+}
+#else
+bool ProcessIsRunning(int64_t pid) {
+  // kill(0) and negative IDs signal process groups, so only check real IDs.
+  if (pid <= 0 || pid > std::numeric_limits<pid_t>::max()) return false;
+  // EPERM means it exists but belongs to another user.
+  return kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+}
+#endif
 
 void RemoveSavedToken(const fs::path& path, std::string_view token) {
   if (LoadSavedToken(path) != token) return;
@@ -434,15 +513,30 @@ TokenCache::Deadline TokenCache::LockDeadline() const {
 
 Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadline,
                                    std::unique_ptr<CredentialsLock>* lock) const {
-  if (!deadline) return CredentialsLock::Acquire(path, lock);
-  Status status;
-  const bool acquired = Poll(env_, *deadline, [&] {
-    status = CredentialsLock::Acquire(path, lock, /*block=*/false);
-    return !status.ok() || *lock != nullptr;
-  });
-  if (!status.ok()) return status;
-  if (!acquired) return WaitTimedOut();
-  return Status::Ok();
+  // A process that holds the lock without announcing a login is saving or
+  // deleting a token: wait the login timeout for it, or a while without one.
+  const auto unannounced_deadline =
+      deadline ? *deadline : env_.now() + kUnannouncedHoldWait;
+  while (true) {
+    UNWRAP_STATUS(CredentialsLock::Acquire(path, lock, /*block=*/false));
+    if (*lock != nullptr) return Status::Ok();
+    // A process that's logging in announces until when. Wait for its login
+    // however long it takes, since its token is the one to use, but no longer
+    // than that: past it, the process is stuck.
+    if (std::optional<LoginAnnouncement> login = ReadLoginAnnouncement(path);
+        login && ProcessIsRunning(login->pid)) {
+      if (std::chrono::system_clock::now() > login->until + kAnnouncementGrace) {
+        return Status(ADBC_STATUS_TIMEOUT,
+                      "[motherduck] Process " + std::to_string(login->pid) +
+                          " has been logging in to MotherDuck for longer than its "
+                          "timeout and still holds " +
+                          PathString(LockPath(path)) + "; end it to log in here");
+      }
+    } else if (env_.now() >= unannounced_deadline) {
+      return WaitTimedOut();
+    }
+    env_.sleep(kLockPollInterval);
+  }
 }
 
 Status TokenCache::Login(const fs::path& path, const std::string& rejected,
@@ -468,15 +562,37 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
   if (shared.failed > since) {
     return Status(shared.failure_code, shared.failure_message);
   }
+  // After a login was denied, or found no MotherDuck account, another one would
+  // most likely end the same way, so don't open the browser again for a while.
+  // Timeouts and network errors don't count: the next login may well work.
+  if (denied_until_ && env_.now() < *denied_until_) {
+    return Status(ADBC_STATUS_UNAUTHENTICATED,
+                  denied_message_ + " (not opening the browser again within " +
+                      std::to_string(kDeniedLoginBackoff.count()) +
+                      " seconds of that; initialize the database again to retry now)");
+  }
+
+  // Tell processes waiting for the lock how long this login may take.
+  const bool announced =
+      lock != nullptr &&
+      AnnounceLogin(path, CurrentProcessId(),
+                    std::chrono::system_clock::now() + MaxLoginDuration(options_))
+          .ok();
   LoginResult result;
   Status status = DeviceLogin(env_, options_, &result);
+  if (announced) RemoveLoginAnnouncement(path);
   const uint64_t number = ++shared.finished;
   if (!status.ok()) {
     shared.failed = number;
     shared.failure_code = status.ToAdbc(nullptr);
     shared.failure_message = status.message();
+    if (shared.failure_code == ADBC_STATUS_UNAUTHENTICATED) {
+      denied_until_ = env_.now() + kDeniedLoginBackoff;
+      denied_message_ = status.message();
+    }
     return status;
   }
+  denied_until_.reset();
   token_ = std::move(result.token);
   host_ = std::move(result.pg_endpoint);
   *fresh = true;
