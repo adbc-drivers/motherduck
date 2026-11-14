@@ -317,6 +317,8 @@ class MotherDuckConnectParamsTest : public ::testing::Test {
   ScopedEnv pghostaddr_{"PGHOSTADDR", nullptr};
   ScopedEnv pgport_{"PGPORT", "5433"};
   ScopedEnv pguser_{"PGUSER", "someone"};
+  // A bad SSL_CERT_FILE in the developer's environment would fail every test.
+  ScopedEnv ssl_cert_file_{"SSL_CERT_FILE", nullptr};
   // Where libpq looks for its default root certificate, ~/.postgresql/root.crt
   ScopedEnv home_{"HOME", "/nonexistent"};
   ScopedEnv appdata_{"APPDATA", "C:\\nonexistent"};
@@ -424,26 +426,57 @@ TEST_F(MotherDuckConnectParamsTest, VerifiesServer) {
   EXPECT_EQ(stderr_, "");
 }
 
-TEST_F(MotherDuckConnectParamsTest, NoCaBundleRequiresTls) {
+TEST_F(MotherDuckConnectParamsTest, NoCaBundleFailsClosed) {
+  // Without root certificates, connecting fails rather than falling back to an
+  // unverified connection, and the error says how to fix it.
   SetCaBundle("");
-  SetOption("uri", "postgresql://localhost/db");
-  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
-  EXPECT_THAT(Values("sslrootcert"), ::testing::IsEmpty());
-  // The warning comes once per process, so an earlier test may have had it.
+  for (const char* uri :
+       {"postgresql://localhost/db", "postgresql://localhost/db?sslmode=verify-full"}) {
+    SCOPED_TRACE(uri);
+    SetOption("uri", uri);
+    std::vector<std::pair<std::string, std::string>> params;
+    EXPECT_THAT(database_.ConnectParams(&params, &error_),
+                IsStatus(ADBC_STATUS_INVALID_STATE, &error_));
+    ASSERT_NE(error_.message, nullptr);
+    EXPECT_THAT(
+        error_.message,
+        ::testing::AllOf(::testing::HasSubstr("No trusted CA certificates"),
+                         ::testing::HasSubstr(ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH),
+                         ::testing::HasSubstr("SSL_CERT_FILE"),
+                         ::testing::HasSubstr(ADBC_MOTHERDUCK_OPTION_TLS_VERIFY)));
+    if (error_.release) error_.release(&error_);
+  }
+  // With a region too.
   SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
   SetOption("uri", "postgresql:///db");
-  std::string printed = stderr_;
+  EXPECT_EQ(Status(), ADBC_STATUS_INVALID_STATE);
+  // Modes that don't verify, root certificates the connection names, and
+  // tls_verify=false don't need a found bundle.
+  SetOption("uri", "postgresql:///db?sslmode=require");
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
-  printed += stderr_;
-  EXPECT_THAT(printed,
-              ::testing::AnyOf("",
-                               "[motherduck] warning: no trusted CA certificates found, "
-                               "so the driver can't verify the server's certificate; "
-                               "using sslmode=require. Set database option "
-                               "'adbc.motherduck.tls_root_cert_path' (or "
-                               "SSL_CERT_FILE) to a PEM CA bundle, or "
-                               "adbc.motherduck.tls_verify=false to skip "
-                               "verification\n"));
+  SetOption("uri", "postgresql:///db?sslrootcert=/tmp/root.crt");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+  SetOption("uri", "postgresql:///db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, "false");
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("require"));
+  EXPECT_EQ(stderr_, "");
+}
+
+TEST_F(MotherDuckConnectParamsTest, UnreadableSslCertFileFails) {
+  // A bundle SSL_CERT_FILE names but that can't be read is reported, even when
+  // the driver could find another.
+  ScopedEnv ssl_cert_file("SSL_CERT_FILE", "/nonexistent/motherduck-test-ca.pem");
+  SetOption("uri", "postgresql://localhost/db");
+  std::vector<std::pair<std::string, std::string>> params;
+  EXPECT_THAT(database_.ConnectParams(&params, &error_),
+              IsStatus(ADBC_STATUS_INVALID_STATE, &error_));
+  ASSERT_NE(error_.message, nullptr);
+  EXPECT_THAT(error_.message,
+              ::testing::HasSubstr("/nonexistent/motherduck-test-ca.pem"));
+  if (error_.release) error_.release(&error_);
+  // It isn't consulted when the connection names root certificates.
+  SetOption("uri", "postgresql://localhost/db?sslrootcert=/tmp/root.crt");
+  EXPECT_THAT(Values("sslrootcert"), ::testing::ElementsAre("/tmp/root.crt"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, EmptySslmodeVerifiesServer) {
@@ -702,9 +735,9 @@ TEST_F(MotherDuckConnectParamsTest, KeepsServiceSslmode) {
 // source, and whether the driver finds a CA bundle. The URI's sslmode and
 // sslrootcert pass through unchanged. When nothing else sets sslmode and
 // sslrootcert isn't system (which already makes libpq default to verify-full),
-// the driver adds verify-full if it has root certificates, and otherwise
-// require. It adds the bundle it found when nothing names root certificates
-// and sslmode is unset or verifies.
+// the driver adds verify-full. It adds the bundle it found when nothing names
+// root certificates and sslmode is unset or verify-full, and fails when it
+// needs one and has none.
 TEST_F(MotherDuckConnectParamsTest, SslmodeMatrix) {
   struct RootCert {
     const char* uri;
@@ -746,6 +779,11 @@ TEST_F(MotherDuckConnectParamsTest, SslmodeMatrix) {
 
             std::string mode = *uri_mode != '\0' ? uri_mode : env_mode ? env_mode : "";
             bool named_roots = *rootcert.uri != '\0' || rootcert.env != nullptr;
+            if (!named_roots && *bundle == '\0' &&
+                (mode.empty() || mode == "verify-full")) {
+              EXPECT_EQ(Status(), ADBC_STATUS_INVALID_STATE);
+              continue;
+            }
             // Only modes that check the host name get the found bundle.
             bool add_bundle = !named_roots && *bundle != '\0' &&
                               (mode.empty() || mode == "verify-full");
@@ -765,8 +803,7 @@ TEST_F(MotherDuckConnectParamsTest, SslmodeMatrix) {
             } else if (env_mode != nullptr) {
               expected_mode.push_back(env_mode);
             } else if (!rootcert.system) {
-              expected_mode.push_back(named_roots || add_bundle ? "verify-full"
-                                                                : "require");
+              expected_mode.push_back("verify-full");
             }
             EXPECT_EQ(Values("sslmode"), expected_mode);
             EXPECT_EQ(Values("sslrootcert"), expected_rootcert);

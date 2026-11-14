@@ -195,7 +195,8 @@ the OS's trusted certificates itself (`sslrootcert=system` may not find them),
 so unless the connection names root certificates, the driver passes the first
 it finds of these as `sslrootcert`:
 
-1. The file `SSL_CERT_FILE` names.
+1. The file `SSL_CERT_FILE` names. If it can't be read, connecting fails
+   instead of trying the others.
 2. On Linux, the distribution's CA bundle: `/etc/ssl/certs/ca-certificates.crt`,
    `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, or
    `/etc/ssl/cert.pem`.
@@ -212,9 +213,11 @@ the driver leaves `sslmode` alone. An explicit `sslmode=verify-full`
 without root certificates also gets the found bundle. Other explicit modes
 don't: `verify-ca` doesn't check the host name, so a bundle of public CAs would
 accept any public certificate, and root certificates would make the weaker
-modes verify the server's CA. If the driver finds no root certificates, it uses
-`sslmode=require`, which encrypts but doesn't verify, and prints a warning
-once per process. Naming a connection service turns these defaults off, since
+modes verify the server's CA. If the driver finds no root certificates,
+connecting fails rather than falling back to a connection that doesn't verify
+the server, which would send the token to whoever answers. This happens in
+minimal container images without the `ca-certificates` package; install it,
+or set one of the options below. Naming a connection service turns these defaults off, since
 the service file may set `sslmode` and `sslrootcert` itself.
 
 Two database options set this up without libpq's settings:
@@ -225,8 +228,8 @@ Two database options set this up without libpq's settings:
   read. It outranks `PGSSLMODE`, `PGSSLROOTCERT` and a connection service
   file.
 - `adbc.motherduck.tls_verify`: `false` encrypts the connection without
-  verifying the server's certificate (`sslmode=require`), and drops the
-  warning. Defaults to `true`. It outranks `PGSSLMODE` and a connection
+  verifying the server's certificate (`sslmode=require`), and doesn't need
+  root certificates. Defaults to `true`. It outranks `PGSSLMODE` and a connection
   service file, but libpq still checks the server's CA when `PGSSLROOTCERT`
   or its default file (`~/.postgresql/root.crt`) names root certificates.
 
@@ -253,7 +256,7 @@ PostgreSQL driver:
 - **Connection settings.** The MotherDuck token is the password, and the user
   defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
   and connection service files are never used, and `sslmode` defaults to
-  `require`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
+  `verify-full`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
 - **Options that differ.** `adbc.postgresql.use_copy` defaults to `false`, and
   setting it to `true` fails. `adbc.postgresql.type_resolver_mode` is accepted
   and ignored. `adbc.connection.db_schema` names a schema, not an arbitrary

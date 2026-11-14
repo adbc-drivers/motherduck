@@ -149,7 +149,7 @@ std::string RegionHost(std::string_view region) {
   return host;
 }
 
-bool DefaultsToRequireSsl(std::string_view uri_sslmode,
+bool DriverChoosesSslmode(std::string_view uri_sslmode,
                           std::string_view uri_sslrootcert) {
   if (!uri_sslmode.empty() || !GetEnv("PGSSLMODE").empty()) return false;
   // With sslrootcert=system, libpq already defaults to verify-full and rejects
@@ -457,27 +457,38 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     // check the host name: verify-ca with every public CA would accept any
     // public certificate for any host, and a root file would make require
     // verify the CA.
+    //
+    // Without root certificates the connection fails rather than falling back
+    // to an unverified one, which would send the token to whoever answers.
+    // tls_verify=false is the explicit way to skip verification.
     if (sslrootcert.empty() && (sslmode.empty() || sslmode == "verify-full")) {
-      sslrootcert = find_ca_bundle_ ? find_ca_bundle_() : FindCaBundle(GetEnv);
-      if (!sslrootcert.empty()) params->emplace_back("sslrootcert", sslrootcert);
-    }
-    if (DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert) && !sslrootcert.empty()) {
-      params->emplace_back("sslmode", "verify-full");
-    } else if (DefaultsToRequireSsl(uri_sslmode, uri_sslrootcert)) {
-      params->emplace_back("sslmode", "require");
-      // Warn once per process so connection pools don't repeat it.
-      // TODO(https://github.com/adbc-drivers/motherduck/issues/29): use a logger
-      static std::atomic<bool> warned{false};
-      if (!warned.exchange(true)) {
-        std::fprintf(stderr,
-                     "[motherduck] warning: no trusted CA certificates found, so the "
-                     "driver can't verify the server's certificate; using "
-                     "sslmode=require. Set database option '%s' (or "
-                     "SSL_CERT_FILE) to a PEM CA bundle, or %s=false to skip "
-                     "verification\n",
-                     ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH,
-                     ADBC_MOTHERDUCK_OPTION_TLS_VERIFY);
+      // A bundle the user named but that can't be read is a mistake to report,
+      // not a reason to look elsewhere.
+      if (std::string cert_file = GetEnv("SSL_CERT_FILE");
+          !cert_file.empty() && !IsReadableFile(cert_file)) {
+        InternalAdbcSetError(error,
+                             "[libpq] Can't read the CA bundle SSL_CERT_FILE names: %s. "
+                             "Fix or unset it, or set database option '%s' to a PEM "
+                             "CA bundle",
+                             cert_file.c_str(),
+                             ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH);
+        return ADBC_STATUS_INVALID_STATE;
       }
+      sslrootcert = find_ca_bundle_ ? find_ca_bundle_() : FindCaBundle(GetEnv);
+      if (sslrootcert.empty()) {
+        InternalAdbcSetError(
+            error,
+            "[libpq] No trusted CA certificates found to verify the server's "
+            "certificate. Install the OS's CA certificates (such as the "
+            "ca-certificates package), set database option '%s' (or SSL_CERT_FILE) "
+            "to a PEM CA bundle, or set %s=false to connect without verifying",
+            ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY);
+        return ADBC_STATUS_INVALID_STATE;
+      }
+      params->emplace_back("sslrootcert", sslrootcert);
+    }
+    if (DriverChoosesSslmode(uri_sslmode, uri_sslrootcert)) {
+      params->emplace_back("sslmode", "verify-full");
     }
   }
   if (!password_.empty()) password = password_;
