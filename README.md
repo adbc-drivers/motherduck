@@ -217,17 +217,21 @@ modes verify the server's CA. If the driver finds no root certificates,
 connecting fails rather than falling back to a connection that doesn't verify
 the server, which would send the token to whoever answers. This happens in
 minimal container images without the `ca-certificates` package; install it,
-or set one of the options below. Naming a connection service turns these defaults off, since
-the service file may set `sslmode` and `sslrootcert` itself.
+or set one of the options below. Naming a connection service turns these
+defaults off, since the service file may set `sslmode` and `sslrootcert`
+itself.
 
-Two database options set this up without libpq's settings:
+Most connections need no TLS settings: on macOS, Windows, and Linux with the
+OS's CA certificates installed, the driver verifies the server on its own. Two
+optional database options cover the other cases, without libpq's settings:
 
-- `adbc.motherduck.tls_root_cert_path`: a PEM file of root certificates to
-  verify the server with, instead of the ones the driver finds. The driver
+- `adbc.motherduck.tls_root_cert_path` (optional): a PEM file of root
+  certificates to verify the server with, instead of the ones the driver
+  finds, such as a corporate CA bundle. The driver
   uses `sslmode=verify-full`, and the connection fails if the file can't be
   read. It outranks `PGSSLMODE`, `PGSSLROOTCERT` and a connection service
   file.
-- `adbc.motherduck.tls_verify`: `false` encrypts the connection without
+- `adbc.motherduck.tls_verify` (optional): `false` encrypts the connection without
   verifying the server's certificate (`sslmode=require`), and doesn't need
   root certificates. Defaults to `true`. It outranks `PGSSLMODE` and a connection
   service file, but libpq still checks the server's CA when `PGSSLROOTCERT`
