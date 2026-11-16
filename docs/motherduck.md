@@ -87,9 +87,13 @@ Components:
 - `USER`: optional. The default is `postgres`, which MotherDuck expects.
 - `TOKEN`: the MotherDuck token. Prefer `MOTHERDUCK_TOKEN` or a database option
   to putting it in the URI.
-- `sslmode`: defaults to `require`, which encrypts the connection without
-  verifying the server's certificate. Use `verify-full` to verify it, with
-  `sslrootcert` naming a CA bundle (or `system`, on libpq 16 and later).
+- `sslmode`: usually leave it out. The driver defaults to `verify-full`,
+  verifying the server's certificate with the OS's trusted CA certificates (or
+  `SSL_CERT_FILE`), so most connections need no TLS settings. If the driver
+  finds no CA certificates, connecting fails; install the OS's CA certificates
+  (such as the `ca-certificates` package), or use the optional
+  `adbc.motherduck.tls_root_cert_path` or `adbc.motherduck.tls_verify` options
+  below rather than `sslmode` and `sslrootcert`.
 - `options`: MotherDuck [session options](https://motherduck.com/docs/sql-reference/postgres-endpoint/#session-options),
   which the driver passes to libpq's `options` along with its own.
 - `application_name`: your application's name. The driver appends
@@ -120,6 +124,8 @@ Without a token, connecting fails with `UNAUTHENTICATED`.
 | `adbc.motherduck.db_schema` | Database | The schema every new connection starts in. Connecting fails if it doesn't exist. |
 | `adbc.connection.db_schema` | Connection | Changes a single connection's schema, in its current database. |
 | `adbc.motherduck.token` | Database | Alias for the standard `password` option. |
+| `adbc.motherduck.tls_root_cert_path` | Database | Optional; unset by default, which uses the OS's trusted CA certificates. A PEM file of root certificates to verify the server with instead, such as a corporate CA bundle. Uses `sslmode=verify-full`; connecting fails if the file can't be read. |
+| `adbc.motherduck.tls_verify` | Database | Optional. `true` (default) verifies the server's certificate; `false` encrypts without verifying (`sslmode=require`). |
 
 ## Differences from the PostgreSQL Driver
 
@@ -134,7 +140,7 @@ PostgreSQL driver:
 - **Connection settings.** The MotherDuck token is the password, and the user
   defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
   and connection service files are never used, and `sslmode` defaults to
-  `require`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
+  `verify-full`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
 - **Options that differ.** `adbc.postgresql.use_copy` defaults to `false`, and
   setting it to `true` fails. `adbc.postgresql.type_resolver_mode` is accepted
   and ignored. `adbc.connection.db_schema` names a schema, not an arbitrary

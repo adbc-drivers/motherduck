@@ -185,22 +185,66 @@ ignored, and the port is 5432 unless the URI sets one. For example, with
 `region` set to `us-east-1`:
 
 ```text
-postgresql:///my_db?sslmode=verify-full&sslrootcert=system
+postgresql:///my_db
 ```
 
-Unless the URI or `PGSSLMODE` sets `sslmode`, the driver uses
-`sslmode=require` instead of libpq's default, `prefer`, so the token is never
-sent unencrypted. `require` doesn't verify the server's certificate; set
-`sslmode=verify-full` to verify it. With `sslrootcert=system` (in the URI or
-`PGSSLROOTCERT`), libpq 16 and later already default to `verify-full`, so the
-driver leaves `sslmode` alone. Naming a connection service also turns this
-default off, since the service file may set `sslmode` itself.
+The driver verifies the server's certificate: unless the URI or `PGSSLMODE`
+sets `sslmode`, it uses `sslmode=verify-full` instead of libpq's default,
+`prefer`, which can send the token unencrypted. The driver's libpq can't read
+the OS's trusted certificates itself (`sslrootcert=system` may not find them),
+so unless the connection names root certificates, the driver passes the first
+it finds of these as `sslrootcert`:
+
+1. The file `SSL_CERT_FILE` names. If it can't be read, connecting fails
+   instead of trying the others.
+2. On Linux, the distribution's CA bundle: `/etc/ssl/certs/ca-certificates.crt`,
+   `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, or
+   `/etc/ssl/cert.pem`.
+3. On macOS and Windows, the OS trust store (the keychains' trust settings, or
+   the Windows `ROOT` store), which the driver exports once per process to
+   `adbc_driver_motherduck_roots.pem` in the user's cache directory (macOS) or
+   temporary directory (Windows).
+
+Root certificates named by `sslrootcert` in the URI, `PGSSLROOTCERT`, or
+libpq's default file (`~/.postgresql/root.crt`, or
+`%APPDATA%\postgresql\root.crt` on Windows) are used instead. With
+`sslrootcert=system`, libpq 16 and later already default to `verify-full`, so
+the driver leaves `sslmode` alone. An explicit `sslmode=verify-full`
+without root certificates also gets the found bundle. Other explicit modes
+don't: `verify-ca` doesn't check the host name, so a bundle of public CAs would
+accept any public certificate, and root certificates would make the weaker
+modes verify the server's CA. If the driver finds no root certificates,
+connecting fails rather than falling back to a connection that doesn't verify
+the server, which would send the token to whoever answers. This happens in
+minimal container images without the `ca-certificates` package; install it,
+or set one of the options below. Naming a connection service turns these
+defaults off, since the service file may set `sslmode` and `sslrootcert`
+itself.
+
+Most connections need no TLS settings: on macOS, Windows, and Linux with the
+OS's CA certificates installed, the driver verifies the server on its own. Two
+optional database options cover the other cases, without libpq's settings:
+
+- `adbc.motherduck.tls_root_cert_path` (optional): a PEM file of root
+  certificates to verify the server with, instead of the ones the driver
+  finds, such as a corporate CA bundle. The driver
+  uses `sslmode=verify-full`, and the connection fails if the file can't be
+  read. It outranks `PGSSLMODE`, `PGSSLROOTCERT` and a connection service
+  file.
+- `adbc.motherduck.tls_verify` (optional): `false` encrypts the connection without
+  verifying the server's certificate (`sslmode=require`), and doesn't need
+  root certificates. Defaults to `true`. It outranks `PGSSLMODE` and a connection
+  service file, but libpq still checks the server's CA when `PGSSLROOTCERT`
+  or its default file (`~/.postgresql/root.crt`) names root certificates.
+
+Setting both is an error, and so is a URI that sets `sslrootcert`, or an
+`sslmode` other than the one the option implies.
 
 libpq connection service files (`~/.pg_service.conf`, `service=`, or
 `PGSERVICE`) aren't supported: the driver always passes `options`, which
-replaces any `options` a service file sets, doesn't default `sslmode` when
-one is named, and can't combine one with a `region`. Put connection settings
-in the URI instead.
+replaces any `options` a service file sets, doesn't default `sslmode` or
+`sslrootcert` when one is named, and can't combine one with a `region`. Put
+connection settings in the URI instead.
 
 ## Differences from the PostgreSQL driver
 
@@ -216,7 +260,7 @@ PostgreSQL driver:
 - **Connection settings.** The MotherDuck token is the password, and the user
   defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
   and connection service files are never used, and `sslmode` defaults to
-  `require`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
+  `verify-full`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
 - **Options that differ.** `adbc.postgresql.use_copy` defaults to `false`, and
   setting it to `true` fails. `adbc.postgresql.type_resolver_mode` is accepted
   and ignored. `adbc.connection.db_schema` names a schema, not an arbitrary

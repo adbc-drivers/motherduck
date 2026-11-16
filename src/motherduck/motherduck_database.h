@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -23,6 +24,7 @@
 #include <libpq-fe.h>
 
 #include "database.h"
+#include "motherduck_trust_store.h"
 
 #define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
 #define ADBC_MOTHERDUCK_OPTION_SESSION_NAME "adbc.motherduck.session_name"
@@ -31,6 +33,12 @@
 #define ADBC_MOTHERDUCK_OPTION_DB_SCHEMA "adbc.motherduck.db_schema"
 /// An alias for the standard ADBC password option, which holds the token.
 #define ADBC_MOTHERDUCK_OPTION_TOKEN "adbc.motherduck.token"
+/// A PEM file of root certificates to verify the server with, instead of the
+/// ones the driver finds. Implies sslmode=verify-full.
+#define ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH "adbc.motherduck.tls_root_cert_path"
+/// "false" encrypts the connection without verifying the server's
+/// certificate (sslmode=require). Defaults to "true".
+#define ADBC_MOTHERDUCK_OPTION_TLS_VERIFY "adbc.motherduck.tls_verify"
 
 namespace adbcpq {
 
@@ -40,10 +48,10 @@ namespace adbcpq {
 /// part of a hostname.
 std::string RegionHost(std::string_view region);
 
-/// \brief Whether a connection should default to sslmode=require: neither the
-/// URI nor PGSSLMODE sets sslmode, and sslrootcert (from the URI, or
+/// \brief Whether the driver chooses sslmode (verify-full): neither the URI
+/// nor PGSSLMODE sets sslmode, and sslrootcert (from the URI, or
 /// PGSSLROOTCERT) isn't system, which makes libpq default to verify-full.
-bool DefaultsToRequireSsl(std::string_view uri_sslmode, std::string_view uri_sslrootcert);
+bool DriverChoosesSslmode(std::string_view uri_sslmode, std::string_view uri_sslrootcert);
 
 /// \brief A libpq session option, --<name>=<value>, with whitespace and
 /// backslashes in value escaped.
@@ -66,6 +74,12 @@ class MotherduckDatabase : public PostgresDatabase {
   AdbcStatusCode ConnectParams(std::vector<std::pair<std::string, std::string>>* params,
                                struct AdbcError* error) const;
 
+  /// \brief Replace how Connect finds a CA bundle when the connection names
+  /// none, for tests. Returns the bundle's path, or empty if there's none.
+  void SetCaBundleFinder(std::function<std::string()> finder) {
+    find_ca_bundle_ = std::move(finder);
+  }
+
   std::string_view InfoVendorName() override { return "MotherDuck"; }
   std::string_view DriverName() override { return "ADBC MotherDuck Driver"; }
   std::string_view DriverVersion() override;
@@ -78,6 +92,10 @@ class MotherduckDatabase : public PostgresDatabase {
   std::string db_schema_;
   std::string username_;
   std::string password_;
+  std::string tls_root_cert_path_;
+  bool tls_verify_ = true;
+  // Empty for FindCaBundle.
+  std::function<std::string()> find_ca_bundle_;
 };
 
 }  // namespace adbcpq
