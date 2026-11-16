@@ -160,6 +160,161 @@ bool IsTimeoutSeconds(std::string_view value) {
   return true;
 }
 
+// The settings a URI query parameter can set, named like the database options.
+// motherduck.token is left out so a token doesn't end up in a URI's query, which
+// is more likely to be logged than its password.
+constexpr std::string_view kUriSettingKeys[] = {
+    ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+    ADBC_MOTHERDUCK_OPTION_SESSION_NAME,
+    ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME,
+    ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT,
+    ADBC_MOTHERDUCK_OPTION_REGION,
+    ADBC_MOTHERDUCK_OPTION_DB_SCHEMA,
+    ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH,
+    ADBC_MOTHERDUCK_OPTION_TLS_VERIFY,
+};
+
+bool IsUriSettingKey(std::string_view key) {
+  for (std::string_view name : kUriSettingKeys) {
+    if (key == name) return true;
+  }
+  return false;
+}
+
+// Sets the setting named key, after validating value. *known is false, and
+// nothing is set, if key names none of them. An empty value unsets all but
+// attach_mode and tls_verify.
+AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
+                          const char* value, bool* known, struct AdbcError* error) {
+  *known = true;
+  if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
+    if (std::strcmp(value, "single") != 0 && std::strcmp(value, "workspace") != 0) {
+      InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    settings->attach_mode = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
+    settings->session_name = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME) == 0) {
+    settings->application_name = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
+    // A whole number of seconds; 0 waits indefinitely.
+    if (!IsTimeoutSeconds(value)) {
+      InternalAdbcSetError(error,
+                           "Invalid value for option %s=%s: expected a whole number "
+                           "of seconds, such as 10",
+                           key, value);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    settings->connect_timeout = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
+    // The region becomes part of a hostname.
+    std::string region = AsciiLower(value);
+    if (!region.empty() && RegionHost(region).empty()) {
+      InternalAdbcSetError(error,
+                           "[libpq] Invalid value for option %s=%s: expected a region "
+                           "such as us-east-1 or eastus2, of letters, digits and "
+                           "dashes",
+                           key, value);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    settings->region = std::move(region);
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
+    settings->db_schema = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH) == 0) {
+    // The file is checked when connecting.
+    settings->tls_root_cert_path = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY) == 0) {
+    if (std::strcmp(value, ADBC_OPTION_VALUE_ENABLED) == 0) {
+      settings->tls_verify = true;
+    } else if (std::strcmp(value, ADBC_OPTION_VALUE_DISABLED) == 0) {
+      settings->tls_verify = false;
+    } else {
+      InternalAdbcSetError(
+          error, "[libpq] Invalid value for option %s=%s: expected %s or %s", key, value,
+          ADBC_OPTION_VALUE_ENABLED, ADBC_OPTION_VALUE_DISABLED);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+  } else {
+    *known = false;
+  }
+  return ADBC_STATUS_OK;
+}
+
+bool PercentDecode(std::string_view in, std::string* out) {
+  auto hex = [](char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  out->clear();
+  for (size_t i = 0; i < in.size(); i++) {
+    if (in[i] != '%') {
+      *out += in[i];
+      continue;
+    }
+    if (i + 2 >= in.size()) return false;
+    int high = hex(in[i + 1]);
+    int low = hex(in[i + 2]);
+    if (high < 0 || low < 0) return false;
+    *out += static_cast<char>(high * 16 + low);
+    i += 2;
+  }
+  return true;
+}
+
+// Splits uri, already accepted by IsAcceptedUri, into the URI libpq parses, which
+// has no query, and the settings its query parameters set. The query takes only
+// the settings named like database options; anything else, including libpq's own
+// parameters, is an error, and the driver never passes the query on to libpq.
+AdbcStatusCode ParseUri(std::string_view uri, std::string* libpq_uri,
+                        MotherduckSettings* settings, struct AdbcError* error) {
+  std::string normalized = NormalizeUri(uri);
+  size_t query_start = normalized.find('?');
+  *libpq_uri = normalized.substr(0, query_start);
+  if (query_start == std::string::npos) return ADBC_STATUS_OK;
+  std::string_view query = std::string_view(normalized).substr(query_start + 1);
+  while (!query.empty()) {
+    size_t end = query.find('&');
+    std::string_view parameter = query.substr(0, end);
+    query = end == std::string_view::npos ? std::string_view() : query.substr(end + 1);
+    if (parameter.empty()) continue;
+    size_t equals = parameter.find('=');
+    std::string key, value;
+    if (!PercentDecode(parameter.substr(0, equals), &key) ||
+        (equals != std::string_view::npos &&
+         !PercentDecode(parameter.substr(equals + 1), &value))) {
+      InternalAdbcSetError(error,
+                           "Invalid database option 'uri': a query parameter isn't "
+                           "valid percent-encoding");
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    if (!IsUriSettingKey(key)) {
+      std::string supported;
+      for (std::string_view name : kUriSettingKeys) {
+        if (!supported.empty()) supported += ", ";
+        supported += name;
+      }
+      InternalAdbcSetError(error,
+                           "Invalid database option 'uri': unsupported query parameter "
+                           "'%s'. The URI's query takes only the options %s",
+                           key.c_str(), supported.c_str());
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    if (equals == std::string_view::npos) {
+      InternalAdbcSetError(error,
+                           "Invalid database option 'uri': query parameter '%s' has no "
+                           "value",
+                           key.c_str());
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    bool known = false;
+    RAISE_ADBC(SetSetting(settings, key.c_str(), value.c_str(), &known, error));
+  }
+  return ADBC_STATUS_OK;
+}
+
 // Backslash-escapes whitespace and backslashes for libpq options. MotherDuck
 // removes the escapes, so "a b" arrives as is.
 std::string EscapeOptionValue(std::string_view value) {
@@ -203,14 +358,11 @@ std::string RegionHost(std::string_view region) {
   return host;
 }
 
-bool DriverChoosesSslmode(std::string_view uri_sslmode,
-                          std::string_view uri_sslrootcert) {
-  if (!uri_sslmode.empty() || !GetEnv("PGSSLMODE").empty()) return false;
+bool DriverChoosesSslmode() {
+  if (!GetEnv("PGSSLMODE").empty()) return false;
   // With sslrootcert=system, libpq already defaults to verify-full and rejects
   // anything weaker.
-  std::string sslrootcert =
-      uri_sslrootcert.empty() ? GetEnv("PGSSLROOTCERT") : std::string(uri_sslrootcert);
-  return sslrootcert != "system";
+  return GetEnv("PGSSLROOTCERT") != "system";
 }
 
 std::string SessionOption(std::string_view name, std::string_view value) {
@@ -237,27 +389,48 @@ AdbcStatusCode MotherduckDatabase::Init(struct AdbcError* error) {
   return status.ToAdbc(error);
 }
 
+MotherduckSettings MotherduckDatabase::Settings() const {
+  MotherduckSettings settings = option_settings_;
+  auto fill = [](std::string* value, const std::string& fallback) {
+    if (value->empty()) *value = fallback;
+  };
+  fill(&settings.attach_mode, uri_settings_.attach_mode);
+  fill(&settings.session_name, uri_settings_.session_name);
+  fill(&settings.application_name, uri_settings_.application_name);
+  fill(&settings.connect_timeout, uri_settings_.connect_timeout);
+  fill(&settings.region, uri_settings_.region);
+  fill(&settings.db_schema, uri_settings_.db_schema);
+  fill(&settings.tls_root_cert_path, uri_settings_.tls_root_cert_path);
+  if (!settings.tls_verify) settings.tls_verify = uri_settings_.tls_verify;
+  return settings;
+}
+
 AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
                                              size_t* length, struct AdbcError* error) {
   std::string output;
+  const MotherduckSettings settings = Settings();
   // Options that are unset when empty.
   const std::string* optional = nullptr;
   if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
-    output = attach_mode_.empty() ? kDefaultAttachMode : attach_mode_;
+    output = settings.attach_mode.empty() ? kDefaultAttachMode : settings.attach_mode;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
-    optional = &session_name_;
+    optional = &settings.session_name;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME) == 0) {
-    optional = &application_name_;
+    optional = &settings.application_name;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
-    optional = &connect_timeout_;
+    optional = &settings.connect_timeout;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
-    optional = &region_;
+    optional = &settings.region;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
-    optional = &db_schema_;
+    optional = &settings.db_schema;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH) == 0) {
-    optional = &tls_root_cert_path_;
+    optional = &settings.tls_root_cert_path;
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY) == 0) {
-    output = tls_verify_ ? ADBC_OPTION_VALUE_ENABLED : ADBC_OPTION_VALUE_DISABLED;
+    output = settings.tls_verify.value_or(true) ? ADBC_OPTION_VALUE_ENABLED
+                                                : ADBC_OPTION_VALUE_DISABLED;
+  } else if (std::strcmp(option, "uri") == 0 && !original_uri_.empty()) {
+    // What the user set, not the form libpq parses.
+    output = original_uri_;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     // The user the driver connects as.
     output = username_;
@@ -294,6 +467,29 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
   return ADBC_STATUS_OK;
 }
 
+AdbcStatusCode MotherduckDatabase::GetOptionInt(const char* option, int64_t* value,
+                                                struct AdbcError* error) {
+  if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
+    const std::string timeout = Settings().connect_timeout;
+    if (timeout.empty()) {
+      InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
+      return ADBC_STATUS_NOT_FOUND;
+    }
+    *value = std::stoll(timeout);
+    return ADBC_STATUS_OK;
+  }
+  return PostgresDatabase::GetOptionInt(option, value, error);
+}
+
+AdbcStatusCode MotherduckDatabase::SetOptionInt(const char* key, int64_t value,
+                                                struct AdbcError* error) {
+  if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
+    // Languages like Python send a number through the integer setter.
+    return SetOption(key, std::to_string(value).c_str(), error);
+  }
+  return PostgresDatabase::SetOptionInt(key, value, error);
+}
+
 AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
                                              struct AdbcError* error) {
   if (value == nullptr) {
@@ -311,65 +507,26 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
                    "always uses its built-in type table\n",
                    key, value);
     }
-  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
-    if (std::strcmp(value, "single") != 0 && std::strcmp(value, "workspace") != 0) {
-      InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
-    attach_mode_ = value;
-  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
-    session_name_ = value;
-  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME) == 0) {
-    // An empty value unsets it.
-    application_name_ = value;
-  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
-    // A whole number of seconds. An empty value unsets it; 0 waits indefinitely.
-    if (!IsTimeoutSeconds(value)) {
-      InternalAdbcSetError(error,
-                           "Invalid value for option %s=%s: expected a whole number "
-                           "of seconds, such as 10",
-                           key, value);
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
-    connect_timeout_ = value;
-  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
-    // The region becomes part of a hostname. An empty value unsets it.
-    std::string region = AsciiLower(value);
-    if (!region.empty() && RegionHost(region).empty()) {
-      InternalAdbcSetError(error,
-                           "[libpq] Invalid value for option %s=%s: expected a region "
-                           "such as us-east-1 or eastus2, of letters, digits and "
-                           "dashes",
-                           key, value);
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
-    region_ = std::move(region);
-  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
-    // An empty value unsets it.
-    db_schema_ = value;
-  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH) == 0) {
-    // An empty value unsets it. The file is checked when connecting.
-    tls_root_cert_path_ = value;
-  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY) == 0) {
-    if (std::strcmp(value, ADBC_OPTION_VALUE_ENABLED) == 0) {
-      tls_verify_ = true;
-    } else if (std::strcmp(value, ADBC_OPTION_VALUE_DISABLED) == 0) {
-      tls_verify_ = false;
-    } else {
-      InternalAdbcSetError(
-          error, "[libpq] Invalid value for option %s=%s: expected %s or %s", key, value,
-          ADBC_OPTION_VALUE_ENABLED, ADBC_OPTION_VALUE_DISABLED);
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
-  } else if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
+    return ADBC_STATUS_OK;
+  }
+  // Database options set the settings that a URI's query parameters also can. An
+  // empty value unsets them, which lets the URI's value apply again.
+  bool known = false;
+  AdbcStatusCode status = SetSetting(&option_settings_, key, value, &known, error);
+  if (known) return status;
+  if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
     username_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0 ||
              std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
     password_ = value;
   } else if (std::strcmp(key, "uri") == 0) {
-    // An empty value unsets it. Keep the URI in the form libpq parses, so nothing
-    // that reads uri_ sees motherduck://, md:// or md:.
-    if (*value != '\0' && !IsAcceptedUri(value)) {
+    // An empty value unsets it.
+    if (*value == '\0') {
+      uri_settings_ = {};
+      original_uri_.clear();
+      return PostgresDatabase::SetOption(key, value, error);
+    }
+    if (!IsAcceptedUri(value)) {
       InternalAdbcSetError(error,
                            "Invalid database option 'uri': expected a "
                            "motherduck://, md:// or md: URI, such as "
@@ -377,7 +534,14 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
                            "md://pg.us-east-1-aws.motherduck.com/my_db or md:my_db");
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    return PostgresDatabase::SetOption(key, NormalizeUri(value).c_str(), error);
+    // Nothing changes unless the whole URI is valid. What libpq gets has no query,
+    // so nothing that reads uri_ sees motherduck://, md://, md: or the settings.
+    std::string libpq_uri;
+    MotherduckSettings uri_settings;
+    RAISE_ADBC(ParseUri(value, &libpq_uri, &uri_settings, error));
+    RAISE_ADBC(PostgresDatabase::SetOption(key, libpq_uri.c_str(), error));
+    uri_settings_ = std::move(uri_settings);
+    original_uri_ = value;
   } else {
     return PostgresDatabase::SetOption(key, value, error);
   }
@@ -403,120 +567,82 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     return ADBC_STATUS_IO;
   }
 
-  // Always pass the user, token and application name, so libpq never falls
-  // back to PGUSER, PGPASSWORD, a password file, or PGAPPNAME.
+  // The URI's query isn't passed on, so it carries only the user, token, host,
+  // port and database. Always pass the user, token and application name, so libpq
+  // never falls back to PGUSER, PGPASSWORD, a password file, or PGAPPNAME.
   params->clear();
+  const MotherduckSettings settings = Settings();
   std::string options = GetEnv("PGOPTIONS");
   std::string password;
   std::string user;
-  std::string application_name;
-  std::string fallback_application_name;
-  // Connection settings from the URI that the region and sslmode interact with.
+  // Connection settings from the URI that the region interacts with.
   std::string uri_host;
-  std::string uri_hostaddr;
   std::string uri_port;
-  std::string uri_sslmode;
-  std::string uri_sslrootcert;
-  std::string uri_service;
   for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
     if (option->val == nullptr) continue;
     std::string_view keyword = option->keyword;
     if (keyword == "host") uri_host = option->val;
-    if (keyword == "hostaddr") uri_hostaddr = option->val;
     if (keyword == "port") uri_port = option->val;
-    if (keyword == "sslmode") uri_sslmode = option->val;
-    if (keyword == "sslrootcert") uri_sslrootcert = option->val;
-    if (keyword == "service") uri_service = option->val;
-    // The option replaces the URI's value, so libpq gets one.
-    if (keyword == "connect_timeout" && !connect_timeout_.empty()) continue;
-    if (keyword == "options") {
-      options = option->val;
-    } else if (keyword == "password") {
+    if (keyword == "password") {
       password = option->val;
     } else if (keyword == "user") {
       user = option->val;
-    } else if (keyword == "application_name") {
-      application_name = option->val;
-    } else if (keyword == "fallback_application_name") {
-      fallback_application_name = option->val;
     } else {
       params->emplace_back(option->keyword, option->val);
     }
   }
   PQconninfoFree(conninfo);
 
-  // The TLS options settle sslmode and sslrootcert themselves, so the URI may
-  // only repeat them. Passed explicitly, they outrank PGSSLMODE, PGSSLROOTCERT
-  // and a connection service file.
-  const bool pinned_roots = !tls_root_cert_path_.empty();
-  const bool tls_options = pinned_roots || !tls_verify_;
+  // The TLS options settle sslmode and sslrootcert themselves. Passed
+  // explicitly, they outrank PGSSLMODE, PGSSLROOTCERT and a connection service
+  // file.
+  const bool tls_verify = settings.tls_verify.value_or(true);
+  const bool pinned_roots = !settings.tls_root_cert_path.empty();
+  const bool tls_options = pinned_roots || !tls_verify;
   if (tls_options) {
-    const char* tls_option = pinned_roots ? ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH
-                                          : ADBC_MOTHERDUCK_OPTION_TLS_VERIFY;
-    if (pinned_roots && !tls_verify_) {
-      InternalAdbcSetError(error,
-                           "[libpq] Set either database option '%s' or %s=%s, not both",
+    if (pinned_roots && !tls_verify) {
+      InternalAdbcSetError(error, "[libpq] Set either option '%s' or %s=%s, not both",
                            ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH,
                            ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, ADBC_OPTION_VALUE_DISABLED);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    // With sslmode=require, a root file would make libpq verify the CA after all.
-    if (!uri_sslrootcert.empty()) {
-      InternalAdbcSetError(error,
-                           "[libpq] Set either database option '%s' or sslrootcert in "
-                           "the URI, not both",
-                           tls_option);
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
-    const char* tls_sslmode = pinned_roots ? "verify-full" : "require";
-    if (!uri_sslmode.empty() && uri_sslmode != tls_sslmode) {
-      InternalAdbcSetError(error,
-                           "[libpq] Database option '%s' uses sslmode=%s, but the URI "
-                           "sets sslmode=%s",
-                           tls_option, tls_sslmode, uri_sslmode.c_str());
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
-    if (pinned_roots && !IsReadableFile(tls_root_cert_path_)) {
-      InternalAdbcSetError(error, "[libpq] Can't read database option '%s': %s",
+    if (pinned_roots && !IsReadableFile(settings.tls_root_cert_path)) {
+      InternalAdbcSetError(error, "[libpq] Can't read option '%s': %s",
                            ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH,
-                           tls_root_cert_path_.c_str());
+                           settings.tls_root_cert_path.c_str());
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    if (pinned_roots) params->emplace_back("sslrootcert", tls_root_cert_path_);
-    if (uri_sslmode.empty()) params->emplace_back("sslmode", tls_sslmode);
+    if (pinned_roots) params->emplace_back("sslrootcert", settings.tls_root_cert_path);
+    params->emplace_back("sslmode", pinned_roots ? "verify-full" : "require");
   } else {
     // On Windows the driver reads the process environment, but libpq reads
     // its own C runtime copy, which can be stale. Pass the TLS settings the
     // driver acts on, so libpq uses the same ones.
-    if (uri_sslmode.empty()) {
-      if (std::string env = GetEnv("PGSSLMODE"); !env.empty()) {
-        params->emplace_back("sslmode", std::move(env));
-      }
+    if (std::string env = GetEnv("PGSSLMODE"); !env.empty()) {
+      params->emplace_back("sslmode", std::move(env));
     }
-    if (uri_sslrootcert.empty()) {
-      if (std::string env = GetEnv("PGSSLROOTCERT"); !env.empty()) {
-        params->emplace_back("sslrootcert", std::move(env));
-      }
+    if (std::string env = GetEnv("PGSSLROOTCERT"); !env.empty()) {
+      params->emplace_back("sslrootcert", std::move(env));
     }
   }
 
-  if (!region_.empty()) {
+  if (!settings.region.empty()) {
     // A different host, or any hostaddr (which libpq connects to instead of the
     // host), would send the connection elsewhere.
-    std::string region_host = RegionHost(region_);
+    std::string region_host = RegionHost(settings.region);
     if ((!uri_host.empty() && NormalizeHost(uri_host) != region_host) ||
-        !uri_hostaddr.empty() || !GetEnv("PGHOSTADDR").empty()) {
+        !GetEnv("PGHOSTADDR").empty()) {
       InternalAdbcSetError(error,
-                           "[libpq] Set either database option '%s' or a different "
-                           "host (host or hostaddr in the URI, or PGHOSTADDR), not both",
+                           "[libpq] Set either option '%s' or a different host (in the "
+                           "URI, or PGHOSTADDR), not both",
                            ADBC_MOTHERDUCK_OPTION_REGION);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
     // libpq fills unset settings, including hostaddr, from a connection service.
-    if (!uri_service.empty() || !GetEnv("PGSERVICE").empty()) {
+    if (!GetEnv("PGSERVICE").empty()) {
       InternalAdbcSetError(error,
-                           "[libpq] Database option '%s' can't be used with a "
-                           "connection service (service in the URI, or PGSERVICE)",
+                           "[libpq] Option '%s' can't be used with a connection "
+                           "service (PGSERVICE)",
                            ADBC_MOTHERDUCK_OPTION_REGION);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
@@ -528,11 +654,10 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   // verify the server's certificate. A named service may set sslmode and
   // sslrootcert itself, which defaults here would override; with a region, a
   // service is already an error.
-  bool names_service = !uri_service.empty() || !GetEnv("PGSERVICE").empty();
+  bool names_service = !GetEnv("PGSERVICE").empty();
   if (!tls_options && !names_service) {
-    std::string sslmode = uri_sslmode.empty() ? GetEnv("PGSSLMODE") : uri_sslmode;
-    std::string sslrootcert =
-        uri_sslrootcert.empty() ? GetEnv("PGSSLROOTCERT") : uri_sslrootcert;
+    std::string sslmode = GetEnv("PGSSLMODE");
+    std::string sslrootcert = GetEnv("PGSSLROOTCERT");
     // libpq's own default root certificate file is the user's choice too.
     if (sslrootcert.empty() && IsReadableFile(DefaultRootCertPath(GetEnv))) {
       sslrootcert = DefaultRootCertPath(GetEnv);
@@ -572,7 +697,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
       }
       params->emplace_back("sslrootcert", sslrootcert);
     }
-    if (DriverChoosesSslmode(uri_sslmode, uri_sslrootcert)) {
+    if (DriverChoosesSslmode()) {
       params->emplace_back("sslmode", "verify-full");
     }
   }
@@ -590,15 +715,15 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   if (user.empty()) user = kDefaultUser;
   params->emplace_back("user", std::move(user));
   // Only an option appended after them can be affected.
-  if ((!attach_mode_.empty() || !session_name_.empty()) &&
+  if ((!settings.attach_mode.empty() || !settings.session_name.empty()) &&
       EndsWithLoneBackslash(options)) {
     InternalAdbcSetError(error, "%s",
-                         "[libpq] Session options (options in the URI, or "
-                         "PGOPTIONS) end in a backslash that escapes nothing");
+                         "[libpq] Session options (PGOPTIONS) end in a backslash that "
+                         "escapes nothing");
     return ADBC_STATUS_INVALID_ARGUMENT;
   }
   // MotherDuck keeps the last value of a repeated setting, so defaults go
-  // before the URI's options (or PGOPTIONS) and explicit options after them.
+  // before PGOPTIONS and explicit options after them.
   std::string session_options;
   auto add = [&session_options](std::string_view session_option) {
     if (session_option.empty()) return;
@@ -608,15 +733,20 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   // Have the endpoint send PostgreSQL command tags with affected-row counts
   // instead of DuckDB's Count and Success result sets.
   add(SessionOption("return_pg_command_tags", "on"));
-  if (attach_mode_.empty()) add(SessionOption("attach_mode", kDefaultAttachMode));
+  if (settings.attach_mode.empty()) {
+    add(SessionOption("attach_mode", kDefaultAttachMode));
+  }
   add(options);
-  if (!attach_mode_.empty()) add(SessionOption("attach_mode", attach_mode_));
-  if (!session_name_.empty()) add(SessionOption("session_name", session_name_));
+  if (!settings.attach_mode.empty()) {
+    add(SessionOption("attach_mode", settings.attach_mode));
+  }
+  if (!settings.session_name.empty()) {
+    add(SessionOption("session_name", settings.session_name));
+  }
   params->emplace_back("options", std::move(session_options));
   // MotherDuck's user agent comes from application_name: append the driver to
   // the application's name. Always passing it means PGAPPNAME is never used.
-  if (!application_name_.empty()) application_name = application_name_;
-  if (application_name.empty()) application_name = fallback_application_name;
+  std::string application_name = settings.application_name;
   // PostgreSQL cuts names at 63 bytes, which would cut the driver's identifier
   // off, so shorten the application's name to leave room for it.
   constexpr std::string_view kDriverName =
@@ -640,8 +770,9 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   if (!application_name.empty()) application_name += ' ';
   application_name += kDriverName;
   params->emplace_back("application_name", std::move(application_name));
-  if (!connect_timeout_.empty())
-    params->emplace_back("connect_timeout", connect_timeout_);
+  if (!settings.connect_timeout.empty()) {
+    params->emplace_back("connect_timeout", settings.connect_timeout);
+  }
   return ADBC_STATUS_OK;
 }
 
@@ -670,7 +801,8 @@ AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* erro
   // connected. A database the URI names is the connection's current database,
   // which saves looking it up. Otherwise (md:, or no database, where libpq
   // falls back to the user name) the server says which it is.
-  if (!db_schema_.empty()) {
+  const std::string db_schema = Settings().db_schema;
+  if (!db_schema.empty()) {
     std::string_view database;
     for (const auto& [keyword, value] : params) {
       if (keyword == "dbname" && !value.empty() && value.find(':') == std::string::npos) {
@@ -678,7 +810,7 @@ AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* erro
       }
     }
     AdbcStatusCode status = SetMotherduckSearchPath(
-        *conn, db_schema_, database, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, error);
+        *conn, db_schema, database, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA, error);
     if (status != ADBC_STATUS_OK) {
       PQfinish(*conn);
       *conn = nullptr;

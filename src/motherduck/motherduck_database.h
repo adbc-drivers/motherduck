@@ -15,6 +15,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -53,8 +54,22 @@ namespace adbcpq {
 /// workspace. ADBC driver managers pass motherduck:// through unchanged when they
 /// pick this driver from the scheme. This rewrites the URI as a postgresql://
 /// URI, which libpq parses and which stays an implementation detail of the driver.
-/// Anything else is returned as is.
+/// Anything else is returned as is. The query is left in place; the driver strips
+/// and interprets it itself.
 std::string NormalizeUri(std::string_view uri);
+
+/// \brief The driver's settings that a database option or a URI query parameter
+/// of the same name can set. A string is empty when unset.
+struct MotherduckSettings {
+  std::string attach_mode;
+  std::string session_name;
+  std::string application_name;
+  std::string connect_timeout;
+  std::string region;
+  std::string db_schema;
+  std::string tls_root_cert_path;
+  std::optional<bool> tls_verify;
+};
 
 /// \brief The Postgres endpoint host for a MotherDuck region, e.g.
 /// pg.us-east-1-aws.motherduck.com for us-east-1 or
@@ -62,10 +77,10 @@ std::string NormalizeUri(std::string_view uri);
 /// part of a hostname.
 std::string RegionHost(std::string_view region);
 
-/// \brief Whether the driver chooses sslmode (verify-full): neither the URI
-/// nor PGSSLMODE sets sslmode, and sslrootcert (from the URI, or
-/// PGSSLROOTCERT) isn't system, which makes libpq default to verify-full.
-bool DriverChoosesSslmode(std::string_view uri_sslmode, std::string_view uri_sslrootcert);
+/// \brief Whether the driver chooses sslmode (verify-full): PGSSLMODE doesn't set
+/// sslmode, and sslrootcert (from PGSSLROOTCERT) isn't system, which makes libpq
+/// default to verify-full.
+bool DriverChoosesSslmode();
 
 /// \brief A libpq session option, --<name>=<value>, with whitespace and
 /// backslashes in value escaped.
@@ -80,8 +95,12 @@ class MotherduckDatabase : public PostgresDatabase {
   AdbcStatusCode Init(struct AdbcError* error) override;
   AdbcStatusCode GetOption(const char* option, char* value, size_t* length,
                            struct AdbcError* error) override;
+  AdbcStatusCode GetOptionInt(const char* option, int64_t* value,
+                              struct AdbcError* error) override;
   AdbcStatusCode SetOption(const char* key, const char* value,
                            struct AdbcError* error) override;
+  AdbcStatusCode SetOptionInt(const char* key, int64_t value,
+                              struct AdbcError* error) override;
   AdbcStatusCode Connect(PGconn** conn, struct AdbcError* error) override;
 
   /// \brief The libpq keywords and values Connect passes, in order.
@@ -99,17 +118,16 @@ class MotherduckDatabase : public PostgresDatabase {
   std::string_view DriverVersion() override;
 
  private:
-  // Empty until set, so the URI can override the default.
-  std::string attach_mode_;
-  std::string session_name_;
-  std::string application_name_;
-  std::string connect_timeout_;
-  std::string region_;
-  std::string db_schema_;
+  // The settings the URI's query parameters set, and the ones database options
+  // set, which take precedence.
+  MotherduckSettings uri_settings_;
+  MotherduckSettings option_settings_;
+  // The settings in effect: an option's value if it has one, else the URI's.
+  MotherduckSettings Settings() const;
+  // What the user passed as the URI, which uri_ replaces with a form libpq parses.
+  std::string original_uri_;
   std::string username_;
   std::string password_;
-  std::string tls_root_cert_path_;
-  bool tls_verify_ = true;
   // Empty for FindCaBundle.
   std::function<std::string()> find_ca_bundle_;
 };

@@ -79,9 +79,7 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
     database = quote(catalog)
     # The setup connection is to md:, where the run's schema doesn't resolve.
     setup_kwargs = {
-        key: value
-        for key, value in db_kwargs.items()
-        if key != "motherduck.db_schema"
+        key: value for key, value in db_kwargs.items() if key != "motherduck.db_schema"
     }
 
     def connect():

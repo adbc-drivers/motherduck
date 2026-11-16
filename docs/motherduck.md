@@ -112,7 +112,13 @@ Components:
 - `TOKEN`: the MotherDuck token. Prefer `MOTHERDUCK_TOKEN` or a database option
   to putting it in the URI.
 
-Other URI parameters are PostgreSQL settings, which aren't supported; see below.
+The query takes the [driver options](#driver-options) by name, such as
+`motherduck:///my_db?motherduck.region=us-east-1&motherduck.connect_timeout=10`.
+Percent-encode values; an empty value is unset. Every option except
+`motherduck.token` can be set this way (a token doesn't belong in a query, which
+is more likely to be logged than the URI's password), and an option set on the
+database takes precedence over the URI's. Any other query parameter, including
+the PostgreSQL settings below, is rejected with `INVALID_ARGUMENT`.
 
 ### PostgreSQL settings are not supported
 
@@ -121,7 +127,9 @@ settings of its own. None of them are part of this driver's supported
 interface, and any of them may stop working, or work differently, in a future
 version, including a version that no longer uses that library:
 
-- URI parameters, such as `sslmode`, `sslrootcert`, `options` and `service`.
+- URI query parameters, such as `sslmode`, `sslrootcert`, `options` and
+  `service`. These are rejected: the URI's query takes only the `motherduck.*`
+  options.
 - PostgreSQL environment variables, such as `PGHOST`, `PGPORT`, `PGSSLMODE`,
   `PGSSLROOTCERT` and `PGOPTIONS`, and files such as `~/.pg_service.conf`.
   Some are read today and some are ignored, as described under
@@ -153,10 +161,10 @@ Without a token, connecting fails with `UNAUTHENTICATED`.
 | `motherduck.region` | Database | The MotherDuck region, such as `us-east-1` or `eastus2`, which sets the host. |
 | `motherduck.session_name` | Database | MotherDuck's [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name), which routes connections with the same name to the same replica under read scaling. |
 | `motherduck.application_name` | Database | Your application's name. The driver adds `adbc_driver_motherduck/<version>` after it, so it appears in MotherDuck's query history. A name too long to fit in PostgreSQL's 63 bytes is shortened. |
-| `motherduck.connect_timeout` | Database | The longest time to wait while connecting, in whole seconds. Unset by default, which sets no timeout of its own. `0` waits indefinitely; the shortest timeout is 2 seconds, so `1` acts as `2`. |
+| `motherduck.connect_timeout` | Database | The longest time to wait while connecting, in whole seconds, as a string or an integer. Unset by default, which sets no timeout of its own. `0` waits indefinitely; the shortest timeout is 2 seconds, so `1` acts as `2`. |
 | `motherduck.db_schema` | Database | The schema every new connection starts in. Connecting fails if it doesn't exist. |
 | `adbc.connection.db_schema` | Connection | Changes a single connection's schema, in its current database. |
-| `motherduck.token` | Database | Alias for the standard `password` option. |
+| `motherduck.token` | Database | Alias for the standard `password` option. Not accepted in the URI's query. |
 | `motherduck.tls_root_cert_path` | Database | Optional; unset by default, which uses the OS's trusted CA certificates. A PEM file of root certificates to verify the server with instead, such as a corporate CA bundle. Uses `sslmode=verify-full`; connecting fails if the file can't be read. |
 | `motherduck.tls_verify` | Database | Optional. `true` (default) verifies the server's certificate; `false` encrypts without verifying (`sslmode=require`). |
 
