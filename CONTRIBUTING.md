@@ -221,7 +221,7 @@ When writing the pull request description:
   be a directory path relative to the repo root, e.g. `fix(src): ...` or
   `test(tests): ...`; most titles here leave it out.  Example titles:
 
-  - `feat: add adbc.motherduck.db_schema and qualify the current schema`
+  - `feat: add motherduck.db_schema and qualify the current schema`
   - `fix: strip DuckDB's statement echo from error text`
   - `fix!: return us instead of ms`
 
