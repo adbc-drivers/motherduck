@@ -858,7 +858,8 @@ static std::string PercentEncode(const std::string& text) {
 
 // Each sslmode against MotherDuck's endpoint, which refuses plaintext: every
 // mode that connects must use TLS. The CA bundle comes from the test URI,
-// since some libpq builds can't read the system trust store.
+// since some libpq builds can't read the system trust store, or, without
+// sslrootcert, from the driver's search of the OS trust store.
 TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
@@ -887,11 +888,15 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   ASSERT_FALSE(rootcert.empty()) << "Test URI must set sslrootcert";
 
   struct Case {
+    // Empty to leave it unset.
     const char* sslmode;
     std::string sslrootcert;
     bool connects;
   };
   const Case kCases[] = {
+      // The driver finds the OS's roots and verifies the server.
+      {"", "", true},
+      {"verify-full", "", true},
       // The endpoint refuses plaintext.
       {"disable", "", false},
       // allow and prefer retry with TLS after that refusal.
@@ -908,10 +913,15 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   ScopedEnv pgsslrootcert("PGSSLROOTCERT", nullptr);
   for (const Case& test_case : kCases) {
     std::string conn_uri = "motherduck://" + PercentEncode(user) + "@" + host + ":" +
-                           port + "/" + PercentEncode(dbname) +
-                           "?sslmode=" + test_case.sslmode;
+                           port + "/" + PercentEncode(dbname);
+    const char* separator = "?";
+    if (*test_case.sslmode != '\0') {
+      conn_uri += separator + std::string("sslmode=") + test_case.sslmode;
+      separator = "&";
+    }
     if (!test_case.sslrootcert.empty()) {
-      conn_uri += "&sslrootcert=" + PercentEncode(test_case.sslrootcert);
+      conn_uri +=
+          separator + std::string("sslrootcert=") + PercentEncode(test_case.sslrootcert);
     }
     SCOPED_TRACE(std::string("sslmode=") + test_case.sslmode +
                  " sslrootcert=" + test_case.sslrootcert);
@@ -926,8 +936,106 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
     }
     ASSERT_THAT(status, IsOkStatus(&error));
     EXPECT_EQ(PQsslInUse(conn), 1);
+    if (*test_case.sslmode == '\0') {
+      std::string sslmode;
+      PQconninfoOption* used = PQconninfo(conn);
+      for (PQconninfoOption* option = used; option->keyword != nullptr; option++) {
+        if (std::string_view(option->keyword) == "sslmode" && option->val) {
+          sslmode = option->val;
+        }
+      }
+      PQconninfoFree(used);
+      EXPECT_EQ(sslmode, "verify-full");
+    }
     ASSERT_THAT(database.Disconnect(&conn, &error), IsOkStatus(&error));
   }
+}
+
+// adbc.motherduck.tls_root_cert_path verifies the server with the given
+// file, and adbc.motherduck.tls_verify=false encrypts without verifying,
+// against the real endpoint.
+TEST_F(PostgresDatabaseTest, TlsOptions) {
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  char* parse_error = nullptr;
+  PQconninfoOption* conninfo =
+      PQconninfoParse(adbcpq::NormalizeUri(uri).c_str(), &parse_error);
+  ASSERT_NE(conninfo, nullptr) << (parse_error ? parse_error : "out of memory");
+  std::string user, host, port, dbname;
+  std::string rootcert;
+  for (PQconninfoOption* option = conninfo; option->keyword != nullptr; option++) {
+    if (option->val == nullptr || *option->val == '\0') continue;
+    std::string_view keyword = option->keyword;
+    if (keyword == "sslrootcert") {
+      rootcert = option->val;
+    } else if (keyword == "user") {
+      user = option->val;
+    } else if (keyword == "host") {
+      host = option->val;
+    } else if (keyword == "port") {
+      port = option->val;
+    } else if (keyword == "dbname") {
+      dbname = option->val;
+    }
+  }
+  PQconninfoFree(conninfo);
+  const std::string base = "motherduck://" + PercentEncode(user) + "@" + host + ":" +
+                           port + "/" + PercentEncode(dbname);
+  ASSERT_FALSE(rootcert.empty()) << "Test URI must set sslrootcert";
+
+  // A file libpq can read but that holds no certificates.
+  std::filesystem::path not_roots =
+      std::filesystem::temp_directory_path() /
+      ("motherduck_test_not_roots_" +
+       std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + ".pem");
+  std::ofstream(not_roots) << "not a certificate\n";
+
+  struct Case {
+    const char* option;
+    std::string value;
+    // The sslmode the connection used, or empty if it fails.
+    const char* sslmode;
+    // PGSSLROOTCERT, which tls_root_cert_path outranks. With tls_verify=false
+    // libpq would still check the CA with it.
+    const char* env_rootcert;
+  };
+  const std::string not_roots_path = not_roots.string();
+  const Case kCases[] = {
+      {ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, rootcert, "verify-full",
+       not_roots_path.c_str()},
+      {ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, not_roots_path, "", nullptr},
+      {ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, "false", "require", nullptr},
+  };
+  // The options outrank it.
+  ScopedEnv pgsslmode("PGSSLMODE", "disable");
+  for (const Case& test_case : kCases) {
+    SCOPED_TRACE(std::string(test_case.option) + "=" + test_case.value);
+    ScopedEnv pgsslrootcert("PGSSLROOTCERT", test_case.env_rootcert);
+    adbcpq::MotherduckDatabase database;
+    ASSERT_THAT(database.SetOption("uri", base.c_str(), &error), IsOkStatus(&error));
+    ASSERT_THAT(database.SetOption(test_case.option, test_case.value.c_str(), &error),
+                IsOkStatus(&error));
+    PGconn* conn = nullptr;
+    AdbcStatusCode status = database.Connect(&conn, &error);
+    if (*test_case.sslmode == '\0') {
+      EXPECT_THAT(status, IsStatus(ADBC_STATUS_IO, &error));
+      if (error.release) error.release(&error);
+      continue;
+    }
+    ASSERT_THAT(status, IsOkStatus(&error));
+    EXPECT_EQ(PQsslInUse(conn), 1);
+    std::string sslmode;
+    PQconninfoOption* used = PQconninfo(conn);
+    for (PQconninfoOption* option = used; option->keyword != nullptr; option++) {
+      if (std::string_view(option->keyword) == "sslmode" && option->val) {
+        sslmode = option->val;
+      }
+    }
+    PQconninfoFree(used);
+    EXPECT_EQ(sslmode, test_case.sslmode);
+    ASSERT_THAT(database.Disconnect(&conn, &error), IsOkStatus(&error));
+  }
+  std::filesystem::remove(not_roots);
 }
 
 TEST_F(PostgresDatabaseTest, TypeResolverModeOptionIgnored) {

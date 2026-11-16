@@ -80,8 +80,8 @@ with dbapi.connect(
 ```
 
 A driver manager matches the scheme against the driver's name, so it doesn't
-find the driver from an `md://` URI. When you use `md://`, name the driver as
-well, with `driver="motherduck"`.
+find the driver from an `md://` or `md:` URI. When you use those, name the
+driver as well, with `driver="motherduck"`.
 
 By default the driver connects in `single` attach mode, which attaches only the
 database named in the connection. To work across every database in the account,
@@ -95,8 +95,11 @@ The URI is a `motherduck://` URI:
 motherduck://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
 ```
 
-`md://` is accepted as a short form of the scheme, with the same syntax. The
-driver accepts no other scheme, and the scheme is lowercase.
+Two short forms are accepted: `md://`, with the same syntax, and DuckDB's
+`md:[DATABASE][?PARAMETER=VALUE&...]`, which has no host, so set
+`adbc.motherduck.region` too. `md:` alone is the workspace, the same as
+`md%3A` as the database. The driver accepts no other scheme, and the scheme is
+lowercase.
 
 Components:
 
@@ -124,10 +127,13 @@ version, including a version that no longer uses that library:
   Some are read today and some are ignored, as described under
   [Differences from the PostgreSQL Driver](#differences-from-the-postgresql-driver).
 
-Use the `adbc.motherduck.*` options and the standard ADBC options instead.
-The driver has no supported option for certificate verification yet.
-`sslmode=verify-full` with `sslrootcert` works today, but it is one of the
-unsupported settings.
+Use the `adbc.motherduck.*` options and the standard ADBC options instead,
+such as `adbc.motherduck.tls_root_cert_path` and `adbc.motherduck.tls_verify`
+for certificate verification. By default the driver verifies the server's
+certificate with the OS's trusted CA certificates (or `SSL_CERT_FILE`), so most
+connections need no TLS settings. If the driver finds no CA certificates,
+connecting fails; install the OS's CA certificates (such as the
+`ca-certificates` package) or use one of those options.
 
 ### Authentication
 
@@ -146,11 +152,13 @@ Without a token, connecting fails with `UNAUTHENTICATED`.
 | `adbc.motherduck.attach_mode` | Database | `single` (default) attaches only the named database; `workspace` attaches every database in the account. |
 | `adbc.motherduck.region` | Database | The MotherDuck region, such as `us-east-1` or `eastus2`, which sets the host. |
 | `adbc.motherduck.session_name` | Database | MotherDuck's [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name), which routes connections with the same name to the same replica under read scaling. |
-| `adbc.motherduck.application_name` | Database | Your application's name. The driver adds `adbc_driver_motherduck/<version>` after it, so it appears in MotherDuck's query history. |
-| `adbc.motherduck.connect_timeout` | Database | The longest time to wait while connecting, in whole seconds. `0` (the default) waits indefinitely; the shortest timeout is 2 seconds, so `1` acts as `2`. |
+| `adbc.motherduck.application_name` | Database | Your application's name. The driver adds `adbc_driver_motherduck/<version>` after it, so it appears in MotherDuck's query history. A name too long to fit in PostgreSQL's 63 bytes is shortened. |
+| `adbc.motherduck.connect_timeout` | Database | The longest time to wait while connecting, in whole seconds. Unset by default, which sets no timeout of its own. `0` waits indefinitely; the shortest timeout is 2 seconds, so `1` acts as `2`. |
 | `adbc.motherduck.db_schema` | Database | The schema every new connection starts in. Connecting fails if it doesn't exist. |
 | `adbc.connection.db_schema` | Connection | Changes a single connection's schema, in its current database. |
 | `adbc.motherduck.token` | Database | Alias for the standard `password` option. |
+| `adbc.motherduck.tls_root_cert_path` | Database | Optional; unset by default, which uses the OS's trusted CA certificates. A PEM file of root certificates to verify the server with instead, such as a corporate CA bundle. Uses `sslmode=verify-full`; connecting fails if the file can't be read. |
+| `adbc.motherduck.tls_verify` | Database | Optional. `true` (default) verifies the server's certificate; `false` encrypts without verifying (`sslmode=require`). |
 
 ## Differences from the PostgreSQL Driver
 
@@ -162,12 +170,12 @@ PostgreSQL driver:
 - **MotherDuck only.** The driver connects only to MotherDuck's PostgreSQL
   endpoint. Plain PostgreSQL servers aren't supported, because every connection
   sets `attach_mode`.
-- **Connection URI.** The URI must use the `motherduck://` (or `md://`) scheme,
+- **Connection URI.** The URI must use the `motherduck://` scheme (or `md://`, or `md:`),
   not `postgresql://`.
 - **Connection settings.** The MotherDuck token is the password, and the user
   defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
   and connection service files are never used, and `sslmode` defaults to
-  `require`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
+  `verify-full`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
 - **Options that differ.** `adbc.postgresql.use_copy` defaults to `false`, and
   setting it to `true` fails. `adbc.postgresql.type_resolver_mode` is accepted
   and ignored. `adbc.connection.db_schema` names a schema, not an arbitrary

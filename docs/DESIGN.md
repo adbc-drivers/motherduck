@@ -46,6 +46,8 @@ lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
 - `motherduck_pipeline`: pipelined execution, splitting multi-statement
   queries, and casting a query's parameters.
 - `motherduck_type_resolver`: DuckDB-only type OIDs.
+- `motherduck_trust_store`: finding the OS's trusted CA certificates for
+  libpq, which can't read them itself.
 - `motherduck_factory`: the subclasses `postgresql.cc` creates.
 - `motherduck.cc`: the `AdbcDriverMotherduckInit` entry point.
 
