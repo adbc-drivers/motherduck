@@ -64,13 +64,23 @@ TEST(MotherDuckAttachModeTest, OptionSetGet) {
                     &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
                 ::testing::Optional(value));
   }
+  // An empty value unsets it, which reads back as the default.
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                    "workspace", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
+                                    "", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE, &error),
+              ::testing::Optional("single"s));
 }
 
 TEST(MotherDuckAttachModeTest, OptionInvalid) {
   struct AdbcError error = {};
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* value : {"", "SINGLE", "multi"}) {
+  for (const char* value : {"SINGLE", "multi"}) {
     EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE,
                                       value, &error),
                 IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
@@ -237,6 +247,12 @@ TEST(MotherDuckConnectTimeoutTest, IntegerOption) {
                                &timeout, &error),
       IsOkStatus(&error));
   EXPECT_EQ(timeout, 999999999);
+  // A null output pointer is an error, not a crash.
+  EXPECT_THAT(
+      AdbcDatabaseGetOptionInt(&database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT,
+                               nullptr, &error),
+      IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+  if (error.release) error.release(&error);
   // Other options aren't integers.
   EXPECT_THAT(
       AdbcDatabaseSetOptionInt(&database.value, ADBC_MOTHERDUCK_OPTION_REGION, 1, &error),
@@ -347,24 +363,6 @@ TEST(MotherDuckUsernameTest, OptionSetGet) {
   EXPECT_THAT(
       adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
       ::testing::Optional("bob"s));
-}
-
-TEST(MotherDuckUsernameTest, MotherduckScheme) {
-  struct AdbcError error = {};
-  adbc_validation::Handle<struct AdbcDatabase> database;
-  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri",
-                                    "motherduck://alice@localhost/db", &error),
-              IsOkStatus(&error));
-  EXPECT_THAT(
-      adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
-      ::testing::Optional("alice"s));
-  // A URI that doesn't parse is reported as such.
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", "motherduck://[bad", &error),
-              IsOkStatus(&error));
-  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_USERNAME, &error),
-              IsStatus(ADBC_STATUS_INVALID_STATE, &error));
-  if (error.release) error.release(&error);
 }
 
 TEST(MotherDuckUsernameTest, UnparseableUri) {
@@ -507,11 +505,12 @@ TEST(MotherDuckUriTest, NormalizeUri) {
   EXPECT_EQ("postgresql:///md%3A", adbcpq::NormalizeUri("md:"));
   EXPECT_EQ("postgresql:///md%3A?x=y", adbcpq::NormalizeUri("md:?x=y"));
   // Anything else is returned as is.
-  for (const char* uri : {"postgresql://localhost/db", "postgres://localhost/db",
-                          "host=localhost dbname=db", "motherduck:db", "motherduck:/", "",
-                          "motherduck:/x", "md:/x",
-                          // The scheme is case-sensitive, like libpq's.
-                          "MotherDuck://localhost/db", "MD://localhost/db"}) {
+  for (const char* uri :
+       {"postgresql://localhost/db", "postgres://localhost/db",
+        "host=localhost dbname=db", "motherduck:db", "motherduck:/", "", "motherduck:/x",
+        "md:/x", "md:token@db", "md:pg.us-east-1-aws.motherduck.com/my_db", "md:db/x?a=b",
+        // The scheme is case-sensitive, like libpq's.
+        "MotherDuck://localhost/db", "MD://localhost/db"}) {
     EXPECT_EQ(uri, adbcpq::NormalizeUri(uri));
   }
 }
@@ -520,9 +519,11 @@ TEST(MotherDuckUriTest, RejectsOtherSchemes) {
   struct AdbcError error = {};
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* uri : {"postgresql://localhost/db", "postgres://localhost/db",
-                          "host=localhost dbname=db", "motherduck:db", "md:/db", "MD:db",
-                          "MotherDuck://localhost/db", "motherduck:/db"}) {
+  for (const char* uri :
+       {"postgresql://localhost/db", "postgres://localhost/db",
+        "host=localhost dbname=db", "motherduck:db", "md:/db", "md:eyJ_SECRET@my_db",
+        "md:pg.us-east-1-aws.motherduck.com/my_db", "md:my_db/schema", "MD:db",
+        "MotherDuck://localhost/db", "motherduck:/db"}) {
     SCOPED_TRACE(uri);
     EXPECT_THAT(AdbcDatabaseSetOption(&database.value, "uri", uri, &error),
                 IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
@@ -610,17 +611,12 @@ TEST_F(MotherDuckConnectParamsTest, UriQuerySetsOptions) {
   ASSERT_THAT(database_.GetOption(ADBC_MOTHERDUCK_OPTION_REGION, value, &length, &error_),
               IsOkStatus(&error_));
   EXPECT_STREQ(value, "eu-central-1");
-  // The URI reads back as given, not in libpq's form.
+  // The URI itself can't be read back: it may hold a token.
   length = sizeof(value);
-  const std::string uri =
-      "motherduck:///db?motherduck.region=eu-central-1&motherduck.attach_mode=workspace&"
-      "motherduck.session_name=my%20session&motherduck.application_name=dbt&"
-      "motherduck.connect_timeout=7&motherduck.tls_verify=false";
-  std::vector<char> uri_value(uri.size() + 1);
-  length = uri_value.size();
-  ASSERT_THAT(database_.GetOption("uri", uri_value.data(), &length, &error_),
-              IsOkStatus(&error_));
-  EXPECT_STREQ(uri_value.data(), uri.c_str());
+  EXPECT_THAT(database_.GetOption("uri", value, &length, &error_),
+              IsStatus(ADBC_STATUS_NOT_FOUND, &error_));
+  if (error_.release) error_.release(&error_);
+  error_ = {};
 }
 
 TEST_F(MotherDuckConnectParamsTest, OptionsOutrankUriQuery) {
@@ -647,6 +643,43 @@ TEST_F(MotherDuckConnectParamsTest, OptionsOutrankUriQuery) {
   EXPECT_THAT(Values("application_name"), ::testing::ElementsAre(driver));
 }
 
+// A token must not come back in an error, nor must the scheme the driver hides.
+TEST_F(MotherDuckConnectParamsTest, ErrorsOmitTokens) {
+  // Rejected when the URI is set: a '?' in a password ends the authority early.
+  for (const char* uri : {"motherduck:///db?my_secret_token",
+                          "motherduck://alice:sec?ret_token@elsewhere/db",
+                          "motherduck://alice:sec?ret_token=x@elsewhere/db",
+                          "motherduck:///db?motherduck.region=us-east-1&SECRET%40TOKEN",
+                          "motherduck:///db?motherduck.connect_timeout=SECRET_TOKEN",
+                          "md:SECRET_TOKEN@my_db"}) {
+    SCOPED_TRACE(uri);
+    EXPECT_EQ(database_.SetOption("uri", uri, &error_), ADBC_STATUS_INVALID_ARGUMENT);
+    ASSERT_NE(error_.message, nullptr);
+    EXPECT_THAT(error_.message,
+                ::testing::Not(::testing::AnyOf(::testing::HasSubstr("ret_token"),
+                                                ::testing::HasSubstr("SECRET"),
+                                                ::testing::HasSubstr("elsewhere"))));
+    if (error_.release) error_.release(&error_);
+    error_ = {};
+  }
+  // Accepted when set, but libpq can't parse them when connecting. Its message
+  // quotes the URI.
+  for (const char* uri : {"motherduck://alice:MY_SECRET_TOKEN@[bad",
+                          "motherduck://alice:MY_SECRET_TOKEN%2@localhost/db"}) {
+    SCOPED_TRACE(uri);
+    SetOption("uri", uri);
+    std::vector<std::pair<std::string, std::string>> params;
+    EXPECT_THAT(database_.ConnectParams(&params, &error_),
+                IsStatus(ADBC_STATUS_IO, &error_));
+    ASSERT_NE(error_.message, nullptr);
+    EXPECT_THAT(error_.message,
+                ::testing::Not(::testing::AnyOf(::testing::HasSubstr("SECRET"),
+                                                ::testing::HasSubstr("postgresql"))));
+    if (error_.release) error_.release(&error_);
+    error_ = {};
+  }
+}
+
 TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {
   SetOption("uri", "motherduck://alice@localhost/db?motherduck.connect_timeout=4");
   // libpq's own parameters, PostgreSQL's names for supported settings, and
@@ -657,7 +690,10 @@ TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {
         "dbname=other", "application_name=dbt", "fallback_application_name=dbt",
         "connect_timeout=3", "requiressl=1", "motherduck.token=secret",
         "motherduck.unknown=1", "unknown", "adbc.motherduck.region=us-east-1",
-        "motherduck.region", "motherduck.connect_timeout=1&sslmode=require"}) {
+        "motherduck.region", "motherduck.connect_timeout=1&sslmode=require",
+        // %00 would end the C string a value is checked as.
+        "motherduck.tls_verify=%00invalid", "motherduck.connect_timeout=10%00garbage",
+        "motherduck.tls_verify%00extra=false", "motherduck.tls_verify=%00"}) {
     SCOPED_TRACE(query);
     const std::string uri = std::string("motherduck://bob@elsewhere/db?") + query;
     EXPECT_EQ(database_.SetOption("uri", uri.c_str(), &error_),
@@ -788,15 +824,22 @@ TEST_F(MotherDuckConnectParamsTest, LongApplicationNameKeepsDriverName) {
   ASSERT_EQ(names.size(), 1u);
   EXPECT_EQ(names[0].size(), 63u);
   EXPECT_THAT(names[0], ::testing::EndsWith(" " + driver));
-  // A multi-byte character isn't cut in the middle.
+  // A multi-byte character isn't cut in the middle, and a whole one that ends at
+  // the limit stays: the name keeps every character that fits.
+  const size_t budget = 63 - driver.size() - 1;
   std::string wide;
   for (int i = 0; i < 100; i++) wide += "\xC3\xA9";
   SetOption(ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME, wide.c_str());
   names = Values("application_name");
   ASSERT_EQ(names.size(), 1u);
-  EXPECT_LE(names[0].size(), 63u);
-  std::string name = names[0].substr(0, names[0].size() - driver.size() - 1);
-  EXPECT_EQ(name.size() % 2, 0u);
+  EXPECT_EQ(names[0], wide.substr(0, budget / 2 * 2) + " " + driver);
+  // Three-byte characters too.
+  std::string wider;
+  for (int i = 0; i < 100; i++) wider += "\xE2\x82\xAC";
+  SetOption(ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME, wider.c_str());
+  names = Values("application_name");
+  ASSERT_EQ(names.size(), 1u);
+  EXPECT_EQ(names[0], wider.substr(0, budget / 3 * 3) + " " + driver);
   // A name that fits is unchanged.
   SetOption(ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME, "dbt");
   EXPECT_THAT(Values("application_name"), ::testing::ElementsAre("dbt " + driver));
@@ -811,9 +854,6 @@ TEST_F(MotherDuckConnectParamsTest, RegionVerifiesServer) {
 }
 
 TEST_F(MotherDuckConnectParamsTest, VerifiesServer) {
-  SetOption("uri", "motherduck://localhost/db");
-  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
-  EXPECT_THAT(Values("sslrootcert"), ::testing::ElementsAre(kBundle));
   SetOption("uri", "motherduck://localhost/db");
   EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
   EXPECT_THAT(Values("sslrootcert"), ::testing::ElementsAre(kBundle));

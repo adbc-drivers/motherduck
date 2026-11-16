@@ -98,7 +98,9 @@ motherduck://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
 Two short forms are accepted: `md://`, with the same syntax, and DuckDB's
 `md:[DATABASE][?PARAMETER=VALUE&...]`, which has no host, so set
 `motherduck.region` too. `md:` alone is the workspace, the same as
-`md%3A` as the database. The driver accepts no other scheme, and the scheme is
+`md%3A` as the database. The `md:` form's database name can't contain `/` or
+`@`, so DuckDB's `md:<TOKEN>@<DATABASE>` is rejected; use `MOTHERDUCK_TOKEN` or
+the `password` option. The driver accepts no other scheme, and the scheme is
 lowercase.
 
 Components:

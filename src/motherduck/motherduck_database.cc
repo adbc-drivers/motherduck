@@ -66,9 +66,14 @@ size_t MotherduckSchemeLength(std::string_view uri) {
 constexpr std::string_view kShortFormPrefix = "md:";
 constexpr std::string_view kWorkspaceDatabase = "md%3A";
 
+// A database name has no '/' or '@': md:host/db is a mistyped md://host/db, and
+// md:token@db is DuckDB's token form, which would send the token to the server
+// as a database name.
 bool IsShortForm(std::string_view uri) {
-  return uri.starts_with(kShortFormPrefix) &&
-         !uri.substr(kShortFormPrefix.size()).starts_with('/');
+  if (!uri.starts_with(kShortFormPrefix)) return false;
+  std::string_view database = uri.substr(kShortFormPrefix.size());
+  database = database.substr(0, database.find('?'));
+  return database.find_first_of("/@") == std::string_view::npos;
 }
 
 bool IsAcceptedUri(std::string_view uri) {
@@ -182,13 +187,14 @@ bool IsUriSettingKey(std::string_view key) {
 }
 
 // Sets the setting named key, after validating value. *known is false, and
-// nothing is set, if key names none of them. An empty value unsets all but
-// attach_mode and tls_verify.
+// nothing is set, if key names none of them. An empty value unsets it.
 AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
                           const char* value, bool* known, struct AdbcError* error) {
   *known = true;
   if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
-    if (std::strcmp(value, "single") != 0 && std::strcmp(value, "workspace") != 0) {
+    // Unset, it's the URI's, or single.
+    if (*value != '\0' && std::strcmp(value, "single") != 0 &&
+        std::strcmp(value, "workspace") != 0) {
       InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
@@ -261,6 +267,8 @@ bool PercentDecode(std::string_view in, std::string* out) {
     int high = hex(in[i + 1]);
     int low = hex(in[i + 2]);
     if (high < 0 || low < 0) return false;
+    // A NUL would end the C string the value is validated and used as.
+    if (high == 0 && low == 0) return false;
     *out += static_cast<char>(high * 16 + low);
     i += 2;
   }
@@ -293,27 +301,47 @@ AdbcStatusCode ParseUri(std::string_view uri, std::string* libpq_uri,
                            "valid percent-encoding");
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
+    // Without an '=', this may be part of a token with an unencoded '?' in it.
+    if (equals == std::string_view::npos) {
+      InternalAdbcSetError(error,
+                           "Invalid database option 'uri': a query parameter has no "
+                           "value, or the URI has an unencoded '?'");
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
     if (!IsUriSettingKey(key)) {
       std::string supported;
       for (std::string_view name : kUriSettingKeys) {
         if (!supported.empty()) supported += ", ";
         supported += name;
       }
+      // Name the parameter only if it's one of libpq's, or one of ours with a
+      // prefix, so a password with an unencoded '?' in it isn't repeated.
+      bool name_it = key.starts_with("motherduck.") || key.starts_with("adbc.");
+      if (PQconninfoOption* defaults = PQconndefaults()) {
+        for (PQconninfoOption* option = defaults; option->keyword != nullptr; option++) {
+          name_it = name_it || key == option->keyword;
+        }
+        PQconninfoFree(defaults);
+      }
       InternalAdbcSetError(error,
                            "Invalid database option 'uri': unsupported query parameter "
-                           "'%s'. The URI's query takes only the options %s",
-                           key.c_str(), supported.c_str());
+                           "%s%s%s. The URI's query takes only the options %s",
+                           name_it ? "'" : "", name_it ? key.c_str() : "",
+                           name_it ? "'" : "", supported.c_str());
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    if (equals == std::string_view::npos) {
+    // The value isn't repeated in the error, in case it's part of a token.
+    bool known = false;
+    struct AdbcError setting_error = ADBC_ERROR_INIT;
+    if (SetSetting(settings, key.c_str(), value.c_str(), &known, &setting_error) !=
+        ADBC_STATUS_OK) {
+      if (setting_error.release) setting_error.release(&setting_error);
       InternalAdbcSetError(error,
-                           "Invalid database option 'uri': query parameter '%s' has no "
-                           "value",
+                           "Invalid database option 'uri': invalid value for query "
+                           "parameter '%s'",
                            key.c_str());
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    bool known = false;
-    RAISE_ADBC(SetSetting(settings, key.c_str(), value.c_str(), &known, error));
   }
   return ADBC_STATUS_OK;
 }
@@ -431,9 +459,6 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY) == 0) {
     output = settings.tls_verify.value_or(true) ? ADBC_OPTION_VALUE_ENABLED
                                                 : ADBC_OPTION_VALUE_DISABLED;
-  } else if (std::strcmp(option, "uri") == 0 && !original_uri_.empty()) {
-    // What the user set, not the form libpq parses.
-    output = original_uri_;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     // The user the driver connects as.
     output = username_;
@@ -473,6 +498,10 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
 AdbcStatusCode MotherduckDatabase::GetOptionInt(const char* option, int64_t* value,
                                                 struct AdbcError* error) {
   if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
+    if (value == nullptr) {
+      InternalAdbcSetError(error, "[libpq] Option %s requires an output pointer", option);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
     const std::string timeout = Settings().connect_timeout;
     if (timeout.empty()) {
       InternalAdbcSetError(error, "[libpq] database option '%s' is not set", option);
@@ -526,7 +555,6 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     // An empty value unsets it.
     if (*value == '\0') {
       uri_settings_ = {};
-      original_uri_.clear();
       return PostgresDatabase::SetOption(key, value, error);
     }
     if (!IsAcceptedUri(value)) {
@@ -544,7 +572,6 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     RAISE_ADBC(ParseUri(value, &libpq_uri, &uri_settings, error));
     RAISE_ADBC(PostgresDatabase::SetOption(key, libpq_uri.c_str(), error));
     uri_settings_ = std::move(uri_settings);
-    original_uri_ = value;
   } else {
     return PostgresDatabase::SetOption(key, value, error);
   }
@@ -564,9 +591,12 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   char* parse_error = nullptr;
   PQconninfoOption* conninfo = PQconninfoParse(uri_.c_str(), &parse_error);
   if (conninfo == nullptr) {
-    InternalAdbcSetError(error, "%s%s", "[libpq] Failed to connect: ",
-                         parse_error ? parse_error : "out of memory");
+    // libpq's message quotes the URI, which can hold a token, and has the
+    // postgresql:// scheme the driver hides.
     PQfreemem(parse_error);
+    InternalAdbcSetError(error, "%s",
+                         "[libpq] Failed to connect: the URI doesn't parse; check its "
+                         "host, port and percent-encoding");
     return ADBC_STATUS_IO;
   }
 
@@ -759,16 +789,14 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
                            ? kMaxApplicationNameBytes - kDriverName.size() - 1
                            : 0;
   if (application_name.size() > name_budget) {
-    application_name.resize(name_budget);
-    // Don't end in the middle of a UTF-8 character.
-    while (!application_name.empty() &&
-           (static_cast<unsigned char>(application_name.back()) & 0xC0) == 0x80) {
-      application_name.pop_back();
+    // Cut before a character, not in the middle of one: back up while the first
+    // byte dropped is a continuation byte.
+    size_t cut = name_budget;
+    while (cut > 0 &&
+           (static_cast<unsigned char>(application_name[cut]) & 0xC0) == 0x80) {
+      cut--;
     }
-    if (!application_name.empty() &&
-        static_cast<unsigned char>(application_name.back()) >= 0xC0) {
-      application_name.pop_back();
-    }
+    application_name.resize(cut);
   }
   if (!application_name.empty()) application_name += ' ';
   application_name += kDriverName;

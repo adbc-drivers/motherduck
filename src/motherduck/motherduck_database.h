@@ -124,8 +124,6 @@ class MotherduckDatabase : public PostgresDatabase {
   MotherduckSettings option_settings_;
   // The settings in effect: an option's value if it has one, else the URI's.
   MotherduckSettings Settings() const;
-  // What the user passed as the URI, which uri_ replaces with a form libpq parses.
-  std::string original_uri_;
   std::string username_;
   std::string password_;
   // Empty for FindCaBundle.

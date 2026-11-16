@@ -98,7 +98,9 @@ The URI is a `motherduck://` URI:
 `motherduck://[user[:token]@][host][:port]/database[?parameters]`. Two short
 forms are accepted: `md://` with the same syntax, and DuckDB's
 `md:[database][?parameters]`, which has no host and so needs
-`motherduck.region`; `md:` alone is the workspace. The
+`motherduck.region`; `md:` alone is the workspace. The `md:` form's database
+name can't contain `/` or `@`, so DuckDB's `md:<token>@<database>` is rejected;
+put the token in `MOTHERDUCK_TOKEN` or the `password` option. The
 driver accepts no other scheme, and the scheme is lowercase.
 
 The query takes the `motherduck.*` database options by name, such as

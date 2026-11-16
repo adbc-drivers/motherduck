@@ -656,12 +656,26 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
               IsOkStatus(&error));
 }
 
+// The test URI with a bad password in its authority, which takes precedence over
+// MOTHERDUCK_TOKEN. The URI may have no user.
+static std::string UriWithBadPassword(const char* uri) {
+  std::string bad_uri = uri;
+  size_t authority = bad_uri.find("://") + 3;
+  size_t end = bad_uri.find_first_of("/?", authority);
+  size_t at = bad_uri.find('@', authority);
+  if (at != std::string::npos && at < end) {
+    bad_uri.insert(at, ":invalid");
+  } else {
+    bad_uri.insert(authority, "postgres:invalid@");
+  }
+  return bad_uri;
+}
+
 TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
   // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
-  std::string bad_uri = uri;
-  bad_uri.insert(bad_uri.find('@'), ":invalid");
+  const std::string bad_uri = UriWithBadPassword(uri);
 
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
@@ -722,8 +736,7 @@ TEST_F(PostgresDatabaseTest, PasswordOption) {
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
   const char* token = std::getenv("MOTHERDUCK_TOKEN");
   ASSERT_NE(token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
-  std::string bad_uri = uri;
-  bad_uri.insert(bad_uri.find('@'), ":invalid");
+  const std::string bad_uri = UriWithBadPassword(uri);
 
   // The option takes precedence over a password in the URI.
   {
@@ -838,22 +851,6 @@ TEST_F(PostgresDatabaseTest, ApplicationNameAndConnectTimeoutOptions) {
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
               IsOkStatus(&error));
-}
-
-// Percent-encodes everything but unreserved characters and '/', for a URI component.
-static std::string PercentEncode(const std::string& text) {
-  static const char kHex[] = "0123456789ABCDEF";
-  std::string encoded;
-  for (unsigned char c : text) {
-    if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~' || c == '/') {
-      encoded += static_cast<char>(c);
-    } else {
-      encoded += '%';
-      encoded += kHex[c >> 4];
-      encoded += kHex[c & 0xF];
-    }
-  }
-  return encoded;
 }
 
 // The test URI without its query, and the root certificates its
