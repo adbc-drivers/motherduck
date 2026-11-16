@@ -95,12 +95,14 @@ built yourself, pass the path to the library as `driver`, such as
 `build/libadbc_driver_motherduck.dylib`.
 
 The URI is a `motherduck://` URI:
-`motherduck://[user[:token]@][host][:port]/database[?parameters]`. The
-driver accepts no other scheme, and the scheme is lowercase. Other URI
-parameters are PostgreSQL settings, which
+`motherduck://[user[:token]@][host][:port]/database[?parameters]`. `md://` is
+accepted as a short form of the scheme. The driver accepts no other scheme, and
+the scheme is lowercase. Other URI parameters are PostgreSQL settings, which
 [aren't supported](#postgresql-settings-are-not-supported). Passed
-in place of a driver name, as in `dbapi.connect("motherduck:///my_db")`, the
-URI lets an ADBC driver manager load this driver from its scheme.
+in place of a driver name, as in `dbapi.connect("motherduck:///my_db")`, a
+`motherduck://` URI lets an ADBC driver manager load this driver from its
+scheme. An `md://` URI doesn't, because the scheme has to match the driver's
+name, so name the driver as well: `driver="motherduck"`.
 See [Options](#options) for everything else you can set, including how the
 driver finds the token.
 
@@ -248,8 +250,8 @@ PostgreSQL driver:
 - **MotherDuck only.** The driver connects only to MotherDuck's PostgreSQL
   endpoint. Plain PostgreSQL servers aren't supported, because every connection
   sets `attach_mode`.
-- **Connection URI.** The URI must use the `motherduck://` scheme, not
-  `postgresql://`.
+- **Connection URI.** The URI must use the `motherduck://` (or `md://`) scheme,
+  not `postgresql://`.
 - **Connection settings.** The MotherDuck token is the password, and the user
   defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
   and connection service files are never used, and `sslmode` defaults to

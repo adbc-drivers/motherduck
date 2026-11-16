@@ -422,12 +422,16 @@ TEST(MotherDuckUriTest, NormalizeUri) {
   EXPECT_EQ("postgresql://a:b@h:1/db?x=y",
             adbcpq::NormalizeUri("motherduck://a:b@h:1/db?x=y"));
   EXPECT_EQ("postgresql:///", adbcpq::NormalizeUri("motherduck:///"));
+  // md:// is the short form.
+  EXPECT_EQ("postgresql://localhost/db", adbcpq::NormalizeUri("md://localhost/db"));
+  EXPECT_EQ("postgresql://a:b@h:1/db?x=y", adbcpq::NormalizeUri("md://a:b@h:1/db?x=y"));
+  EXPECT_EQ("postgresql:///db", adbcpq::NormalizeUri("md:///db"));
   // Anything else is returned as is.
   for (const char* uri : {"postgresql://localhost/db", "postgres://localhost/db",
                           "host=localhost dbname=db", "md:db", "motherduck:db",
-                          "motherduck:/", "", "motherduck:/x",
+                          "motherduck:/", "", "motherduck:/x", "md:/x",
                           // The scheme is case-sensitive, like libpq's.
-                          "MotherDuck://localhost/db"}) {
+                          "MotherDuck://localhost/db", "MD://localhost/db"}) {
     EXPECT_EQ(uri, adbcpq::NormalizeUri(uri));
   }
 }
@@ -442,7 +446,8 @@ TEST(MotherDuckUriTest, RejectsOtherSchemes) {
     SCOPED_TRACE(uri);
     EXPECT_THAT(AdbcDatabaseSetOption(&database.value, "uri", uri, &error),
                 IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
-    EXPECT_THAT(error.message, ::testing::HasSubstr("expected a motherduck:// URI"));
+    EXPECT_THAT(error.message,
+                ::testing::HasSubstr("expected a motherduck:// or md:// URI"));
     if (error.release) error.release(&error);
     error = {};
   }
@@ -477,6 +482,18 @@ TEST_F(MotherDuckConnectParamsTest, UriParts) {
   EXPECT_THAT(Values("application_name"),
               ::testing::ElementsAre(
                   "dbt adbc_driver_motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION));
+}
+
+TEST_F(MotherDuckConnectParamsTest, ShortScheme) {
+  SetOption("uri", "md://alice@localhost:5000/db?sslmode=verify-full");
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("localhost"));
+  EXPECT_THAT(Values("port"), ::testing::ElementsAre("5000"));
+  EXPECT_THAT(Values("dbname"), ::testing::ElementsAre("db"));
+  EXPECT_THAT(Values("user"), ::testing::ElementsAre("alice"));
+  EXPECT_THAT(Values("sslmode"), ::testing::ElementsAre("verify-full"));
+  SetOption("uri", "md:///db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionConflictsWithUriHost) {

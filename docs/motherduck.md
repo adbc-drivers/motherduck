@@ -66,7 +66,8 @@ The region sets the host, so the URI can leave it out. `us-east-1` connects to
 instead: `motherduck://pg.us-east-1-aws.motherduck.com/my_db`.
 
 The URI's scheme names the driver, so an ADBC driver manager can pick this
-driver from the URI alone. Pass the URI in place of the driver name:
+driver from a `motherduck://` URI alone. Pass the URI in place of the driver
+name:
 
 ```python
 from adbc_driver_manager import dbapi
@@ -77,6 +78,10 @@ with dbapi.connect(
 ) as conn:
     ...
 ```
+
+A driver manager matches the scheme against the driver's name, so it doesn't
+find the driver from an `md://` URI. When you use `md://`, name the driver as
+well, with `driver="motherduck"`.
 
 By default the driver connects in `single` attach mode, which attaches only the
 database named in the connection. To work across every database in the account,
@@ -90,7 +95,8 @@ The URI is a `motherduck://` URI:
 motherduck://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
 ```
 
-The driver accepts no other scheme, and the scheme is lowercase.
+`md://` is accepted as a short form of the scheme, with the same syntax. The
+driver accepts no other scheme, and the scheme is lowercase.
 
 Components:
 
@@ -156,8 +162,8 @@ PostgreSQL driver:
 - **MotherDuck only.** The driver connects only to MotherDuck's PostgreSQL
   endpoint. Plain PostgreSQL servers aren't supported, because every connection
   sets `attach_mode`.
-- **Connection URI.** The URI must use the `motherduck://` scheme, not
-  `postgresql://`.
+- **Connection URI.** The URI must use the `motherduck://` (or `md://`) scheme,
+  not `postgresql://`.
 - **Connection settings.** The MotherDuck token is the password, and the user
   defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
   and connection service files are never used, and `sslmode` defaults to

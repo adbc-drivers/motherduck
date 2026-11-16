@@ -39,11 +39,12 @@
 
 namespace adbcpq {
 
-/// \brief The URI in a form libpq parses. The driver accepts only motherduck://
-/// URIs, [user[:token]@][host][:port]/[database][?params], which ADBC driver
-/// managers pass through unchanged when they pick this driver from the scheme.
-/// This replaces the scheme with postgresql://, which libpq parses and which
-/// stays an implementation detail of the driver. Anything else is returned as is.
+/// \brief The URI in a form libpq parses. The driver accepts only motherduck:// and
+/// md:// URIs, [user[:token]@][host][:port]/[database][?params]; ADBC driver
+/// managers pass the former through unchanged when they pick this driver from the
+/// scheme. This replaces the scheme with postgresql://, which libpq parses and
+/// which stays an implementation detail of the driver. Anything else is returned
+/// as is.
 std::string NormalizeUri(std::string_view uri);
 
 /// \brief The Postgres endpoint host for a MotherDuck region, e.g.

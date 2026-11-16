@@ -46,10 +46,19 @@ namespace {
 constexpr char kDefaultAttachMode[] = "single";
 // MotherDuck's endpoint expects the user postgres.
 constexpr char kDefaultUser[] = "postgres";
-// The URI scheme an ADBC driver manager selects this driver by, and the only one the
-// driver accepts, so it doesn't commit to libpq's connection syntax. Matched
-// case-sensitively, like libpq matches postgresql://.
-constexpr std::string_view kMotherduckScheme = "motherduck://";
+// The URI schemes the driver accepts, and the only ones, so it doesn't commit to
+// libpq's connection syntax. An ADBC driver manager selects this driver by
+// motherduck://; md:// is the short form. Matched case-sensitively, like libpq
+// matches postgresql://.
+constexpr std::string_view kMotherduckSchemes[] = {"motherduck://", "md://"};
+
+// The length of the accepted scheme uri starts with, or 0 if it starts with none.
+size_t MotherduckSchemeLength(std::string_view uri) {
+  for (std::string_view scheme : kMotherduckSchemes) {
+    if (uri.starts_with(scheme)) return scheme.size();
+  }
+  return 0;
+}
 
 // An environment variable, or empty if it's unset. On Windows this reads the
 // process environment rather than this DLL's own (static) C runtime copy, which
@@ -149,8 +158,8 @@ std::string EscapeOptionValue(std::string_view value) {
 }  // namespace
 
 std::string NormalizeUri(std::string_view uri) {
-  if (uri.starts_with(kMotherduckScheme)) {
-    return "postgresql://" + std::string(uri.substr(kMotherduckScheme.size()));
+  if (size_t length = MotherduckSchemeLength(uri); length > 0) {
+    return "postgresql://" + std::string(uri.substr(length));
   }
   return std::string(uri);
 }
@@ -315,12 +324,12 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
     password_ = value;
   } else if (std::strcmp(key, "uri") == 0) {
     // An empty value unsets it. Keep the URI in the form libpq parses, so nothing
-    // that reads uri_ sees motherduck://.
-    if (*value != '\0' && !std::string_view(value).starts_with(kMotherduckScheme)) {
+    // that reads uri_ sees motherduck:// or md://.
+    if (*value != '\0' && MotherduckSchemeLength(value) == 0) {
       InternalAdbcSetError(error,
                            "Invalid database option 'uri': expected a "
-                           "motherduck:// URI, such as motherduck:///my_db or "
-                           "motherduck://pg.us-east-1-aws.motherduck.com/my_db");
+                           "motherduck:// or md:// URI, such as motherduck:///my_db "
+                           "or md://pg.us-east-1-aws.motherduck.com/my_db");
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
     return PostgresDatabase::SetOption(key, NormalizeUri(value).c_str(), error);
