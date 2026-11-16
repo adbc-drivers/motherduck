@@ -828,7 +828,7 @@ TEST(MotherDuckTlsOptionsTest, OptionSetGet) {
   }
 }
 
-// A PEM file for adbc.motherduck.tls_root_cert_path, removed afterwards.
+// A PEM file for motherduck.tls_root_cert_path, removed afterwards.
 class MotherDuckTlsRootCertPathTest : public MotherDuckConnectParamsTest {
  protected:
   void SetUp() override {

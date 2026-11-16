@@ -26,24 +26,24 @@
 #include "database.h"
 #include "motherduck_trust_store.h"
 
-#define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "adbc.motherduck.attach_mode"
-#define ADBC_MOTHERDUCK_OPTION_SESSION_NAME "adbc.motherduck.session_name"
+#define ADBC_MOTHERDUCK_OPTION_ATTACH_MODE "motherduck.attach_mode"
+#define ADBC_MOTHERDUCK_OPTION_SESSION_NAME "motherduck.session_name"
 /// The application's name, which the driver puts in front of its own in MotherDuck's
 /// user agent.
-#define ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME "adbc.motherduck.application_name"
+#define ADBC_MOTHERDUCK_OPTION_APPLICATION_NAME "motherduck.application_name"
 /// The longest time to wait while connecting, in seconds.
-#define ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT "adbc.motherduck.connect_timeout"
-#define ADBC_MOTHERDUCK_OPTION_REGION "adbc.motherduck.region"
+#define ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT "motherduck.connect_timeout"
+#define ADBC_MOTHERDUCK_OPTION_REGION "motherduck.region"
 /// The schema new connections start in, set with SET search_path.
-#define ADBC_MOTHERDUCK_OPTION_DB_SCHEMA "adbc.motherduck.db_schema"
+#define ADBC_MOTHERDUCK_OPTION_DB_SCHEMA "motherduck.db_schema"
 /// An alias for the standard ADBC password option, which holds the token.
-#define ADBC_MOTHERDUCK_OPTION_TOKEN "adbc.motherduck.token"
+#define ADBC_MOTHERDUCK_OPTION_TOKEN "motherduck.token"
 /// A PEM file of root certificates to verify the server with, instead of the
 /// ones the driver finds. Implies sslmode=verify-full.
-#define ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH "adbc.motherduck.tls_root_cert_path"
+#define ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH "motherduck.tls_root_cert_path"
 /// "false" encrypts the connection without verifying the server's
 /// certificate (sslmode=require). Defaults to "true".
-#define ADBC_MOTHERDUCK_OPTION_TLS_VERIFY "adbc.motherduck.tls_verify"
+#define ADBC_MOTHERDUCK_OPTION_TLS_VERIFY "motherduck.tls_verify"
 
 namespace adbcpq {
 

@@ -581,7 +581,7 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   if (password.empty()) {
     InternalAdbcSetError(error, "%s",
                          "[libpq] No MotherDuck token: set the 'password' (or "
-                         "'adbc.motherduck.token') database option, a password in "
+                         "'motherduck.token') database option, a password in "
                          "the URI, or MOTHERDUCK_TOKEN");
     return ADBC_STATUS_UNAUTHENTICATED;
   }

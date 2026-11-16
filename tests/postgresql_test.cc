@@ -136,7 +136,7 @@ class PostgresQuirks : public adbc_validation::DriverQuirks {
     RAISE_ADBC(SetupDatabase(database, uri, error));
     // Every connection starts in this run's schema.
     if (!RunSchema().empty()) {
-      RAISE_ADBC(AdbcDatabaseSetOption(database, "adbc.motherduck.db_schema",
+      RAISE_ADBC(AdbcDatabaseSetOption(database, "motherduck.db_schema",
                                        TestSchema().c_str(), error));
     }
     return ADBC_STATUS_OK;
@@ -951,8 +951,8 @@ TEST_F(PostgresDatabaseTest, SslmodeMatrix) {
   }
 }
 
-// adbc.motherduck.tls_root_cert_path verifies the server with the given
-// file, and adbc.motherduck.tls_verify=false encrypts without verifying,
+// motherduck.tls_root_cert_path verifies the server with the given
+// file, and motherduck.tls_verify=false encrypts without verifying,
 // against the real endpoint.
 TEST_F(PostgresDatabaseTest, TlsOptions) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
@@ -5405,7 +5405,7 @@ void QueryScalar(struct AdbcStatement* statement, const char* query, std::string
   out->assign(value.data, static_cast<size_t>(value.size_bytes));
 }
 
-// adbc.motherduck.db_schema starts every connection in that schema of the
+// motherduck.db_schema starts every connection in that schema of the
 // connection's database, and connecting fails when the schema doesn't exist,
 // even when an attached database has its name (a bare search_path entry would
 // switch to that database instead).

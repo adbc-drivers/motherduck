@@ -81,7 +81,7 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
     setup_kwargs = {
         key: value
         for key, value in db_kwargs.items()
-        if key != "adbc.motherduck.db_schema"
+        if key != "motherduck.db_schema"
     }
 
     def connect():
@@ -91,7 +91,7 @@ def _motherduck_database(driver, driver_path, db_kwargs):  # noqa: F811
             db_kwargs={
                 **setup_kwargs,
                 "uri": setup_uri,
-                "adbc.motherduck.attach_mode": "workspace",
+                "motherduck.attach_mode": "workspace",
             },
             autocommit=True,
         )

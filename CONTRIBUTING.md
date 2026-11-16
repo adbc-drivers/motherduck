@@ -157,7 +157,7 @@ missing and never drop. Each test process gets its own schema in it,
 attempt and job in CI, or `local_<pid>`, followed by the platform and arch). The
 start time and process ID keep runs apart even when they source the same
 `.env.override`. Every test connection starts in the schema through
-`adbc.motherduck.db_schema`. Tests that need more schemas or databases name
+`motherduck.db_schema`. Tests that need more schemas or databases name
 them after it, and the tests drop all of them when they finish, so concurrent
 jobs and runs don't share tables. Each run also drops any schema or database
 named `adbc_test_<time>_<pid>_...` (or `adbc_<time>_..._<platform>_<arch>`, as
