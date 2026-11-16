@@ -235,6 +235,55 @@ When writing the pull request description:
 Pull requests are squash-merged, so the title becomes the commit message on
 `main`.
 
+## Releasing
+
+A release is a `v*` git tag pushed to `main`. The tag starts the Custom
+Release workflow ([`script_release.yaml`](.github/workflows/script_release.yaml)),
+which tests, validates against MotherDuck, builds for linux (amd64, arm64),
+macOS (arm64) and Windows (amd64), packages, tests the packages with `dbc`, and
+creates a **draft** GitHub release with the packages attached. Nothing is public
+until you publish the draft.
+
+1. Make sure `main` is green, then run the validation suite against MotherDuck
+   locally (`pixi run validate`, with `MOTHERDUCK_TOKEN` set).
+2. Optionally rehearse the workflow: run **Custom Release** manually from the
+   Actions tab on `main`
+   (`gh workflow run "Custom Release" --ref main`). A manual run does everything
+   except create the release.
+3. Write the release notes in `docs/release-notes/<tag>.md` and merge them. The
+   release tooling generates notes from the commits since the previous stable
+   tag, and it ignores pre-release tags. Until the first stable release that is
+   the whole history, including the upstream PostgreSQL driver's, so replace the
+   generated notes with the hand-written ones.
+4. Tag and push. Use SemVer, with a pre-release suffix for alphas and betas
+   (`v0.1.0-alpha.1`, not `v0.1.0a1`):
+
+   ```sh
+   git checkout main && git pull
+   git tag v0.1.0-alpha.1
+   git push origin v0.1.0-alpha.1
+   ```
+
+5. Wait for the workflow to finish, then open the draft release and check that
+   it has the four platform packages, `manifest.yaml`, and the docs page.
+6. Replace the generated notes, mark pre-releases, and publish:
+
+   ```sh
+   gh release edit v0.1.0-alpha.1 \
+     --title "ADBC Driver for MotherDuck v0.1.0-alpha.1" \
+     --notes-file docs/release-notes/v0.1.0-alpha.1.md \
+     --prerelease
+   gh release edit v0.1.0-alpha.1 --draft=false
+   ```
+
+   Drop `--prerelease` for a stable release. The release tooling doesn't set it
+   for you, and without it GitHub shows the release as the latest one.
+
+If the workflow fails, nothing is published. Fix the problem, delete the tag
+(`git tag -d <tag> && git push origin :refs/tags/<tag>`), and tag again, or move
+to the next pre-release number. Once a stable tag such as `v0.1.0` exists, the
+generated notes for later releases cover only the new commits.
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the
