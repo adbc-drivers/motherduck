@@ -79,8 +79,8 @@ from adbc_driver_manager import dbapi
 with dbapi.connect(
     driver="motherduck",
     db_kwargs={
-        "uri": "postgresql:///my_db",
-        "adbc.motherduck.region": "us-east-1",
+        "uri": "motherduck:///my_db",
+        "motherduck.region": "us-east-1",
     },
 ) as conn:
     with conn.cursor() as cursor:
@@ -90,11 +90,30 @@ with dbapi.connect(
 
 The region sets the host, so the URI can leave it out: `us-east-1` connects to
 `pg.us-east-1-aws.motherduck.com`. Without the option, put the host in the URI,
-as in `postgresql://pg.us-east-1-aws.motherduck.com/my_db`. To use a driver you
+as in `motherduck://pg.us-east-1-aws.motherduck.com/my_db`. To use a driver you
 built yourself, pass the path to the library as `driver`, such as
 `build/libadbc_driver_motherduck.dylib`.
 
-The URI is a libpq connection URI (`postgresql://[user[:password]@][host][:port]/database[?parameters]`).
+The URI is a `motherduck://` URI:
+`motherduck://[user[:token]@][host][:port]/database[?parameters]`. Two short
+forms are accepted: `md://` with the same syntax, and DuckDB's
+`md:[database][?parameters]`, which has no host and so needs
+`motherduck.region`; `md:` alone is the workspace. The
+driver accepts no other scheme, and the scheme is lowercase.
+
+The query takes the `motherduck.*` database options by name, such as
+`motherduck:///my_db?motherduck.region=us-east-1&motherduck.connect_timeout=10`
+(percent-encode values; an empty value is unset). Every option below can be set
+this way except `motherduck.token`, so a token doesn't end up in a query, which
+is more likely to be logged than the URI's password. An option set on the
+database takes precedence over the URI's. Any other query parameter, including
+the [PostgreSQL settings](#postgresql-settings-are-not-supported) such as
+`sslmode`, is rejected with `INVALID_ARGUMENT`, and the driver never passes the
+query to libpq. Passed
+in place of a driver name, as in `dbapi.connect("motherduck:///my_db")`, a
+`motherduck://` URI lets an ADBC driver manager load this driver from its
+scheme. The `md` forms don't, because the scheme has to match the driver's
+name, so name the driver as well: `driver="motherduck"`.
 See [Options](#options) for everything else you can set, including how the
 driver finds the token.
 
@@ -105,13 +124,13 @@ MotherDuck error-message redaction.
 
 ## Options
 
-`adbc.motherduck.attach_mode` (database option) sets the MotherDuck
+`motherduck.attach_mode` (database option) sets the MotherDuck
 [attach mode](https://motherduck.com/docs/sql-reference/postgres-endpoint/#session-options):
 `single` (the default) attaches only the database named in the connection,
 and `workspace` attaches every database in the account. The driver adds
 `--attach_mode=<mode>` to libpq's `options`. MotherDuck keeps the last value
-of a repeated setting, so the default goes before any session options from the
-URI or `PGOPTIONS`, which can override it, and an explicitly set option goes
+of a repeated setting, so the default goes before any session options from
+`PGOPTIONS`, which can override it, and an explicitly set option goes
 after them, overriding them. Session options that end in a backslash escaping
 nothing are rejected, since it would escape the space before the driver's
 options. Single mode needs a named database; to connect to `md:`, set
@@ -127,15 +146,15 @@ number of rows changed rather than 1. For a statement that returns rows (a
 tag. The PostgreSQL driver reports -1 for these when it reads results with
 COPY, which MotherDuck doesn't support.
 
-`adbc.motherduck.session_name` (database option) sets MotherDuck's
+`motherduck.session_name` (database option) sets MotherDuck's
 [session name](https://motherduck.com/docs/sql-reference/connection-string-parameters/#session_name),
 which routes connections with the same name to the same replica under read
 scaling and appears in query history. The driver adds `--session_name=<name>`
-after the URI's session options, escaping whitespace and backslashes with a
+after any `PGOPTIONS`, escaping whitespace and backslashes with a
 backslash; MotherDuck removes the escapes, so `my session` arrives as is. It's
 unset by default; an empty value unsets it.
 
-`adbc.motherduck.db_schema` (database option) sets the schema every new
+`motherduck.db_schema` (database option) sets the schema every new
 connection starts in. MotherDuck's endpoint doesn't accept `search_path` as a
 startup option, so the driver runs `SET search_path TO <database>.<schema>`
 once each connection is up, with the connection's current database. (DuckDB
@@ -149,16 +168,25 @@ which DuckDB would take as an attached database's name when no such schema
 exists, a name that isn't a schema of the current database fails with the
 server's error. Use `USE <database>` to change databases.
 
-MotherDuck builds the user agent in query history and its logs from libpq's
-`application_name`. The driver adds `adbc_driver_motherduck/<version>` to it,
-after the application's own name if the URI's `application_name` or
-`fallback_application_name` gives one (in that order), so
-`application_name=dbt` becomes `dbt adbc_driver_motherduck/<version>`.
-`PGAPPNAME` is never used.
+`motherduck.application_name` (database option) sets your application's
+name. MotherDuck builds the user agent in query history and its logs from it,
+and the driver adds `adbc_driver_motherduck/<version>` after the name, so
+`dbt` becomes `dbt adbc_driver_motherduck/<version>`. PostgreSQL cuts names at
+63 bytes, so the driver shortens a long name to keep its own identifier whole.
+It's unset by default, which leaves just the driver's own; an empty value unsets
+it. `PGAPPNAME` is never used.
+
+`motherduck.connect_timeout` (database option) is the longest time to wait
+while connecting, as a whole number of seconds. `0` waits indefinitely, and the
+shortest timeout is 2 seconds, so `1` acts as `2`. It's unset by default, which
+sets no timeout of its own; an empty value unsets it, and a value that isn't a
+whole number fails with `INVALID_ARGUMENT`. Languages whose driver manager sends
+an integer, such as Python's `10`, can pass one: the option also works through
+the integer setter and getter.
 
 The MotherDuck token is the connection's password. The driver takes it from,
 in order: the standard ADBC `password` database option (or its alias,
-`adbc.motherduck.token`), a password in the URI, and the `MOTHERDUCK_TOKEN`
+`motherduck.token`), a password in the URI, and the `MOTHERDUCK_TOKEN`
 environment variable. It always passes the token to libpq, so `PGPASSWORD` and
 password files (`~/.pgpass`, `PGPASSFILE`) are never used. Without a token,
 connecting fails with `UNAUTHENTICATED`.
@@ -168,7 +196,7 @@ leave it out. The standard ADBC `username` database option, then a user in the
 URI, replace it. `PGUSER` is never used. Reading the `username` option returns
 the user the driver connects as.
 
-`adbc.motherduck.region` (database option) sets the host from a MotherDuck
+`motherduck.region` (database option) sets the host from a MotherDuck
 region, so the URI can leave it out: `us-east-1` connects to
 `pg.us-east-1-aws.motherduck.com`, and `eastus2` connects to
 `pg.eastus2-azure.motherduck.com`. Find your region with `md_user_info()`. A
@@ -177,23 +205,21 @@ lowercases. One with
 dashes is taken to be on AWS and one without on Azure, unless it ends in
 `-aws` or `-azure`. The driver doesn't check the region against a list, so a
 mistyped one fails at connect with a DNS error naming the host. Setting it
-together with a different host or any `hostaddr` in the URI, with
-`PGHOSTADDR`, or with a connection service (`service=` or `PGSERVICE`, which
-can set `hostaddr`) is an error; a host that matches the region, ignoring case
+together with a different host in the URI, with `PGHOSTADDR`, or with a
+connection service (`PGSERVICE`, which can set `hostaddr`) is an error; a host that matches the region, ignoring case
 and a trailing dot, is allowed. When it's set, `PGHOST` and `PGPORT` are
 ignored, and the port is 5432 unless the URI sets one. For example, with
 `region` set to `us-east-1`:
 
 ```text
-postgresql:///my_db
+motherduck:///my_db
 ```
 
-The driver verifies the server's certificate: unless the URI or `PGSSLMODE`
-sets `sslmode`, it uses `sslmode=verify-full` instead of libpq's default,
+The driver verifies the server's certificate: unless `PGSSLMODE` sets
+`sslmode`, it uses `sslmode=verify-full` instead of libpq's default,
 `prefer`, which can send the token unencrypted. The driver's libpq can't read
-the OS's trusted certificates itself (`sslrootcert=system` may not find them),
-so unless the connection names root certificates, the driver passes the first
-it finds of these as `sslrootcert`:
+the OS's trusted certificates itself, so unless the connection names root
+certificates, the driver passes the first it finds of these as `sslrootcert`:
 
 1. The file `SSL_CERT_FILE` names. If it can't be read, connecting fails
    instead of trying the others.
@@ -205,46 +231,54 @@ it finds of these as `sslrootcert`:
    `adbc_driver_motherduck_roots.pem` in the user's cache directory (macOS) or
    temporary directory (Windows).
 
-Root certificates named by `sslrootcert` in the URI, `PGSSLROOTCERT`, or
-libpq's default file (`~/.postgresql/root.crt`, or
-`%APPDATA%\postgresql\root.crt` on Windows) are used instead. With
-`sslrootcert=system`, libpq 16 and later already default to `verify-full`, so
-the driver leaves `sslmode` alone. An explicit `sslmode=verify-full`
-without root certificates also gets the found bundle. Other explicit modes
-don't: `verify-ca` doesn't check the host name, so a bundle of public CAs would
-accept any public certificate, and root certificates would make the weaker
-modes verify the server's CA. If the driver finds no root certificates,
-connecting fails rather than falling back to a connection that doesn't verify
-the server, which would send the token to whoever answers. This happens in
-minimal container images without the `ca-certificates` package; install it,
-or set one of the options below. Naming a connection service turns these
-defaults off, since the service file may set `sslmode` and `sslrootcert`
-itself.
+If the driver finds no root certificates, connecting fails rather than falling
+back to a connection that doesn't verify the server, which would send the token
+to whoever answers. This happens in minimal container images without the
+`ca-certificates` package; install it, or set one of the options below.
 
 Most connections need no TLS settings: on macOS, Windows, and Linux with the
 OS's CA certificates installed, the driver verifies the server on its own. Two
-optional database options cover the other cases, without libpq's settings:
+optional database options (which a URI's query can also set) cover the other
+cases:
 
-- `adbc.motherduck.tls_root_cert_path` (optional): a PEM file of root
+- `motherduck.tls_root_cert_path` (optional): a PEM file of root
   certificates to verify the server with, instead of the ones the driver
   finds, such as a corporate CA bundle. The driver
   uses `sslmode=verify-full`, and the connection fails if the file can't be
   read. It outranks `PGSSLMODE`, `PGSSLROOTCERT` and a connection service
   file.
-- `adbc.motherduck.tls_verify` (optional): `false` encrypts the connection without
+- `motherduck.tls_verify` (optional): `false` encrypts the connection without
   verifying the server's certificate (`sslmode=require`), and doesn't need
   root certificates. Defaults to `true`. It outranks `PGSSLMODE` and a connection
   service file, but libpq still checks the server's CA when `PGSSLROOTCERT`
   or its default file (`~/.postgresql/root.crt`) names root certificates.
 
-Setting both is an error, and so is a URI that sets `sslrootcert`, or an
-`sslmode` other than the one the option implies.
+Setting both is an error. An empty `tls_verify` unsets it, like the other
+options.
 
-libpq connection service files (`~/.pg_service.conf`, `service=`, or
-`PGSERVICE`) aren't supported: the driver always passes `options`, which
-replaces any `options` a service file sets, doesn't default `sslmode` or
-`sslrootcert` when one is named, and can't combine one with a `region`. Put
-connection settings in the URI instead.
+## PostgreSQL settings are not supported
+
+The driver reaches MotherDuck through a PostgreSQL client library, which has
+settings of its own. None of them are part of this driver's supported
+interface, and any of them may stop working, or work differently, in a future
+version, including a version that no longer uses that library:
+
+- URI query parameters, such as `sslmode`, `sslrootcert`, `options` and
+  `service`. These are rejected: the URI's query takes only the
+  `motherduck.*` options.
+- PostgreSQL environment variables, such as `PGHOST`, `PGPORT`, `PGSSLMODE`,
+  `PGSSLROOTCERT`, `PGOPTIONS` and `PGSERVICE`, and files such as
+  `~/.pg_service.conf`. Some are read today and some are ignored, as described
+  under [Options](#options) and
+  [Differences from the PostgreSQL driver](#differences-from-the-postgresql-driver).
+  Connection service files aren't supported: the driver always passes
+  `options`, which replaces any `options` a service file sets, doesn't default
+  `sslmode` or `sslrootcert` when one is named, and can't combine one with a
+  `region`.
+
+Use the `motherduck.*` options and the standard ADBC options instead. Where the
+sections above and below describe one of these settings, they describe today's
+behavior, not a commitment.
 
 ## Differences from the PostgreSQL driver
 
@@ -257,10 +291,12 @@ PostgreSQL driver:
 - **MotherDuck only.** The driver connects only to MotherDuck's PostgreSQL
   endpoint. Plain PostgreSQL servers aren't supported, because every connection
   sets `attach_mode`.
+- **Connection URI.** The URI must use the `motherduck://` scheme (or `md://`, or `md:`),
+  not `postgresql://`.
 - **Connection settings.** The MotherDuck token is the password, and the user
   defaults to `postgres`. `PGUSER`, `PGPASSWORD`, `PGAPPNAME`, password files,
   and connection service files are never used, and `sslmode` defaults to
-  `verify-full`. The `adbc.motherduck.*` options have no PostgreSQL equivalent.
+  `verify-full`. The `motherduck.*` options have no PostgreSQL equivalent.
 - **Options that differ.** `adbc.postgresql.use_copy` defaults to `false`, and
   setting it to `true` fails. `adbc.postgresql.type_resolver_mode` is accepted
   and ignored. `adbc.connection.db_schema` names a schema, not an arbitrary

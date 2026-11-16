@@ -68,7 +68,7 @@ TEST(MotherduckDriverTest, DatabaseLifecycle) {
   AdbcDatabase database = {};
   ASSERT_EQ(ADBC_STATUS_OK, driver.DatabaseNew(&database, nullptr));
   EXPECT_EQ(ADBC_STATUS_OK,
-            driver.DatabaseSetOption(&database, "uri", "postgresql://localhost/postgres",
+            driver.DatabaseSetOption(&database, "uri", "motherduck://localhost/postgres",
                                      nullptr));
   EXPECT_EQ(ADBC_STATUS_OK, driver.DatabaseRelease(&database, nullptr));
   EXPECT_EQ(nullptr, database.private_data);

@@ -17,7 +17,7 @@ import pytest
 
 
 def test_package() -> None:
-    uri = "postgresql://example:foo@nonexistent/test"
+    uri = "motherduck://example:foo@nonexistent/test"
     # Just ensure the driver itself loads
     with (
         pytest.raises(adbc_driver_manager.dbapi.Error, match="Failed to connect"),
