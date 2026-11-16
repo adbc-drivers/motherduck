@@ -14,6 +14,7 @@
 
 // Tests for masking credentials in SQL text that appears in error messages.
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -336,13 +337,36 @@ TEST(MotherDuckRedactTest, EveryPrefixOfAnEchoHidesTheStatement) {
 TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
   const char* env_uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   if (!env_uri) GTEST_SKIP() << "ADBC_POSTGRESQL_TEST_URI not set";
-  // libpq connects directly here, so it needs the URI in its own form.
-  const std::string normalized_uri = adbcpq::NormalizeUri(env_uri);
+  // libpq connects directly here, so it needs the URI in its own form, without
+  // the query the driver interprets itself. The driver also reads the CA bundle
+  // from the query's motherduck.tls_root_cert_path, so pass that to libpq.
+  std::string base_uri = env_uri;
+  base_uri.resize(std::min(base_uri.find('?'), base_uri.size()));
+  const std::string normalized_uri = adbcpq::NormalizeUri(base_uri);
   const char* uri = normalized_uri.c_str();
+  std::string rootcert;
+  {
+    adbcpq::MotherduckDatabase database;
+    struct AdbcError error = {};
+    ASSERT_EQ(database.SetOption("uri", env_uri, &error), ADBC_STATUS_OK);
+    char value[4096];
+    size_t length = sizeof(value);
+    if (database.GetOption(ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH, value, &length,
+                           &error) == ADBC_STATUS_OK) {
+      rootcert = value;
+    }
+    if (error.release) error.release(&error);
+  }
   // The driver adds the token; so does this.
   const char* token = std::getenv("MOTHERDUCK_TOKEN");
-  const char* keywords[] = {"dbname", "password", nullptr, nullptr};
-  const char* values[] = {uri, token != nullptr ? token : "", nullptr, nullptr};
+  const char* keywords[] = {"dbname",  "password", "sslrootcert",
+                            "sslmode", nullptr,    nullptr};
+  const char* values[] = {uri,
+                          token != nullptr ? token : "",
+                          rootcert.c_str(),
+                          rootcert.empty() ? "require" : "verify-full",
+                          nullptr,
+                          nullptr};
   PGconn* conn = PQconnectdbParams(keywords, values, /*expand_dbname=*/1);
   if (PQstatus(conn) != CONNECTION_OK &&
       std::string(PQerrorMessage(conn)).find("no database") != std::string::npos) {
@@ -350,8 +374,8 @@ TEST(MotherDuckRedactTest, ErrorTextOmitsStatementEcho) {
     // database will do, so try the workspace; a later dbname overrides the URI's.
     // Other failures, like a bad token, must fail the test rather than skip it.
     PQfinish(conn);
-    keywords[2] = "dbname";
-    values[2] = "md:";
+    keywords[4] = "dbname";
+    values[4] = "md:";
     conn = PQconnectdbParams(keywords, values, /*expand_dbname=*/1);
   }
   if (PQstatus(conn) != CONNECTION_OK) {
