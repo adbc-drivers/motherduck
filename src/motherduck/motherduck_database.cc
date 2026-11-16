@@ -225,7 +225,10 @@ AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
     // The file is checked when connecting.
     settings->tls_root_cert_path = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY) == 0) {
-    if (std::strcmp(value, ADBC_OPTION_VALUE_ENABLED) == 0) {
+    if (*value == '\0') {
+      // Unset, so the URI's value, or the default (true), applies.
+      settings->tls_verify.reset();
+    } else if (std::strcmp(value, ADBC_OPTION_VALUE_ENABLED) == 0) {
       settings->tls_verify = true;
     } else if (std::strcmp(value, ADBC_OPTION_VALUE_DISABLED) == 0) {
       settings->tls_verify = false;

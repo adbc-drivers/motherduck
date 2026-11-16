@@ -944,12 +944,22 @@ TEST(MotherDuckTlsOptionsTest, OptionSetGet) {
                     &database.value, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, &error),
                 ::testing::Optional(value));
   }
-  for (const char* value : {"", "no", "FALSE", "0"}) {
+  for (const char* value : {"no", "FALSE", "0"}) {
     EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY,
                                       value, &error),
                 IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
     if (error.release) error.release(&error);
   }
+  // An empty value unsets it, which reads back as the default.
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY,
+                                    "false", &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY,
+                                    "", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, &error),
+              ::testing::Optional("true"s));
 }
 
 // A PEM file for motherduck.tls_root_cert_path, removed afterwards.
@@ -1018,6 +1028,9 @@ TEST_F(MotherDuckTlsRootCertPathTest, Conflicts) {
                     "&motherduck.tls_verify=false")
                        .c_str());
   EXPECT_EQ(Status(), ADBC_STATUS_OK);
+  // Unset, the URI's value applies again.
+  SetOption(ADBC_MOTHERDUCK_OPTION_TLS_VERIFY, "");
+  EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
 }
 
 TEST_F(MotherDuckTlsRootCertPathTest, UnreadableFile) {

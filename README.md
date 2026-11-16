@@ -253,8 +253,8 @@ cases:
   service file, but libpq still checks the server's CA when `PGSSLROOTCERT`
   or its default file (`~/.postgresql/root.crt`) names root certificates.
 
-Setting both is an error. Unlike the other options, `tls_verify` can't be unset
-with an empty value, so a `tls_verify` set on the database outranks the URI's.
+Setting both is an error. An empty `tls_verify` unsets it, like the other
+options.
 
 ## PostgreSQL settings are not supported
 
