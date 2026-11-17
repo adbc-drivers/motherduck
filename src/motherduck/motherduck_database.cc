@@ -21,7 +21,6 @@
 #include "motherduck_database.h"
 
 #include <atomic>
-#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -188,11 +187,12 @@ bool IsHostLabel(std::string_view value) {
 
 // Whether value is empty or a whole number of seconds, which fits in an int.
 bool IsTimeoutSeconds(std::string_view value) {
-  if (value.size() > 9) return false;
   for (char c : value) {
     if (c < '0' || c > '9') return false;
   }
-  return true;
+  // Leading zeros don't count towards the limit.
+  size_t digits = value.find_first_not_of('0');
+  return digits == std::string_view::npos || value.size() - digits <= 9;
 }
 
 // The settings a URI query parameter can set, named like the database options.
@@ -404,14 +404,25 @@ bool DriverChoosesSslmode() {
 
 std::string ScrubConnectError(std::string_view message, std::string_view user,
                               std::string_view password) {
-  std::string scrubbed(message);
+  constexpr std::string_view kRedacted = "<redacted>";
   // The server and libpq quote the user, which is a token if it was put in the
   // user's place. The default user isn't a secret, and stays readable.
-  for (std::string_view secret : {password, user == kDefaultUser ? "" : user}) {
-    if (secret.empty()) continue;
-    for (size_t at = scrubbed.find(secret); at != std::string::npos;
-         at = scrubbed.find(secret, at + 10)) {
-      scrubbed.replace(at, secret.size(), "<redacted>");
+  std::string_view secrets[] = {password, user == kDefaultUser ? "" : user};
+  // One pass over the original message, so a replacement is never searched
+  // again, and the longest secret wins where two start at the same place.
+  std::string scrubbed;
+  for (size_t i = 0; i < message.size();) {
+    size_t match = 0;
+    for (std::string_view secret : secrets) {
+      if (secret.size() > match && message.substr(i).starts_with(secret)) {
+        match = secret.size();
+      }
+    }
+    if (match > 0) {
+      scrubbed += kRedacted;
+      i += match;
+    } else {
+      scrubbed += message[i++];
     }
   }
   return scrubbed;
@@ -483,16 +494,13 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     // The user the driver connects as.
     output = username_;
-    if (output.empty() && !uri_.empty() && !UriValue(uri_, "user", &output)) {
-      InternalAdbcSetError(error,
-                           "[libpq] database option '%s' is unknown: the URI doesn't "
-                           "parse",
-                           option);
-      return ADBC_STATUS_INVALID_STATE;
-    }
+    // uri_ was validated when set, so it parses.
+    if (output.empty() && !uri_.empty()) UriValue(uri_, "user", &output);
     if (output.empty()) output = kDefaultUser;
   } else if (std::strcmp(option, ADBC_OPTION_PASSWORD) == 0 ||
-             std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0) {
+             std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TOKEN) == 0 ||
+             std::strcmp(option, "uri") == 0) {
+    // The URI may hold a token.
     InternalAdbcSetError(error, "[libpq] database option '%s' can't be read", option);
     return ADBC_STATUS_NOT_FOUND;
   } else if (std::strcmp(option, "adbc.postgresql.type_resolver_mode") == 0) {
@@ -612,12 +620,10 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   char* parse_error = nullptr;
   PQconninfoOption* conninfo = PQconninfoParse(uri_.c_str(), &parse_error);
   if (conninfo == nullptr) {
-    // libpq's message quotes the URI, which can hold a token, and has the
-    // postgresql:// scheme the driver hides.
+    // uri_ was validated when set, so this is out of memory. libpq's message
+    // would quote the URI, which can hold a token.
     PQfreemem(parse_error);
-    InternalAdbcSetError(error, "%s",
-                         "[libpq] Failed to connect: the URI doesn't parse; check its "
-                         "host, port and percent-encoding");
+    InternalAdbcSetError(error, "%s", "[libpq] Failed to connect: out of memory");
     return ADBC_STATUS_IO;
   }
 

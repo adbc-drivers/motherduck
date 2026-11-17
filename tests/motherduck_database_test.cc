@@ -187,7 +187,10 @@ TEST(MotherDuckConnectTimeoutTest, LeadingZeros) {
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
   for (const auto& [written, read] :
-       {std::pair{"007", "7"}, std::pair{"000", "0"}, std::pair{"0010", "10"}}) {
+       {std::pair{"007", "7"}, std::pair{"000", "0"}, std::pair{"0010", "10"},
+        // Leading zeros don't count towards the 9 digits.
+        std::pair{"0000000010", "10"}, std::pair{"000000000000000000000", "0"},
+        std::pair{"0999999999", "999999999"}}) {
     ASSERT_THAT(
         AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT,
                               written, &error),
@@ -203,7 +206,8 @@ TEST(MotherDuckConnectTimeoutTest, OptionInvalid) {
   struct AdbcError error = {};
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  for (const char* timeout : {"-1", "1.5", "ten", "10s", " 10", "1000000000"}) {
+  for (const char* timeout :
+       {"-1", "1.5", "ten", "10s", " 10", "1000000000", "01000000000"}) {
     SCOPED_TRACE(timeout);
     EXPECT_THAT(
         AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT,
@@ -718,6 +722,10 @@ TEST(MotherDuckScrubConnectErrorTest, HidesTokenAndNonDefaultUser) {
   EXPECT_EQ(adbcpq::ScrubConnectError("failed for user \"postgres\"", "postgres", ""),
             "failed for user \"postgres\"");
   EXPECT_EQ(adbcpq::ScrubConnectError("a b", "", ""), "a b");
+  // A user that matches part of the marker doesn't change what was replaced, and
+  // the longer of two secrets at the same place wins.
+  EXPECT_EQ(adbcpq::ScrubConnectError("pw red", "red", "pw"), "<redacted> <redacted>");
+  EXPECT_EQ(adbcpq::ScrubConnectError("tokenX", "token", "tokenX"), "<redacted>");
 }
 
 TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {

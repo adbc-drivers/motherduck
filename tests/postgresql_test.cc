@@ -658,7 +658,7 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
 
 // The test URI with a bad password in its authority, which takes precedence over
 // MOTHERDUCK_TOKEN. The URI may have no user. False for a URI with no authority,
-// such as md:my_db, which can't carry a password.
+// such as md:my_db, which can't carry a password; callers use the password option.
 static bool UriWithBadPassword(const char* uri, std::string* bad_uri) {
   *bad_uri = uri;
   size_t scheme_end = bad_uri->find("://");
@@ -679,12 +679,19 @@ TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
   // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
   std::string bad_uri;
-  if (!UriWithBadPassword(uri, &bad_uri)) GTEST_SKIP() << "the test URI has no authority";
-
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
-              IsOkStatus(&error));
+  if (UriWithBadPassword(uri, &bad_uri)) {
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
+                IsOkStatus(&error));
+  } else {
+    // A URI with no authority, such as md:my_db, can't carry a password.
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", uri, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcDatabaseSetOption(&database.value, ADBC_OPTION_PASSWORD, "invalid", &error),
+        IsOkStatus(&error));
+  }
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error),
               IsStatus(ADBC_STATUS_IO, &error));
 }
@@ -741,10 +748,11 @@ TEST_F(PostgresDatabaseTest, PasswordOption) {
   const char* token = std::getenv("MOTHERDUCK_TOKEN");
   ASSERT_NE(token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
   std::string bad_uri;
-  if (!UriWithBadPassword(uri, &bad_uri)) GTEST_SKIP() << "the test URI has no authority";
+  const bool has_authority = UriWithBadPassword(uri, &bad_uri);
 
-  // The option takes precedence over a password in the URI.
-  {
+  // The option takes precedence over a password in the URI, which a URI with no
+  // authority, such as md:my_db, can't carry.
+  if (has_authority) {
     adbc_validation::Handle<struct AdbcDatabase> database;
     ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
     ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
