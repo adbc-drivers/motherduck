@@ -646,12 +646,15 @@ TEST_F(MotherDuckConnectParamsTest, OptionsOutrankUriQuery) {
 // A token must not come back in an error, nor must the scheme the driver hides.
 TEST_F(MotherDuckConnectParamsTest, ErrorsOmitTokens) {
   // Rejected when the URI is set: a '?' in a password ends the authority early.
-  for (const char* uri : {"motherduck:///db?my_secret_token",
-                          "motherduck://alice:sec?ret_token@elsewhere/db",
-                          "motherduck://alice:sec?ret_token=x@elsewhere/db",
-                          "motherduck:///db?motherduck.region=us-east-1&SECRET%40TOKEN",
-                          "motherduck:///db?motherduck.connect_timeout=SECRET_TOKEN",
-                          "md:SECRET_TOKEN@my_db"}) {
+  for (const char* uri :
+       {"motherduck:///db?my_secret_token",
+        "motherduck://alice:sec?ret_token@elsewhere/db",
+        "motherduck://alice:sec?ret_token=x@elsewhere/db",
+        "motherduck:///db?motherduck.region=us-east-1&SECRET%40TOKEN",
+        "motherduck:///db?motherduck.connect_timeout=SECRET_TOKEN",
+        "motherduck://alice:p?adbc.SECRET=1@elsewhere/db",
+        "motherduck://alice:p?motherduck.SECRET=1@elsewhere/db",
+        "motherduck://alice:p?password=SECRET@elsewhere/db", "md:SECRET_TOKEN@my_db"}) {
     SCOPED_TRACE(uri);
     EXPECT_EQ(database_.SetOption("uri", uri, &error_), ADBC_STATUS_INVALID_ARGUMENT);
     ASSERT_NE(error_.message, nullptr);
@@ -707,13 +710,14 @@ TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {
     EXPECT_THAT(Values("user"), ::testing::ElementsAre("alice"));
     EXPECT_THAT(Values("connect_timeout"), ::testing::ElementsAre("4"));
   }
-  // The error names the parameter and what the query takes.
+  // The error says what the query takes, without naming the parameter, which may
+  // be part of a token.
   EXPECT_EQ(database_.SetOption("uri", "md:db?sslmode=require", &error_),
             ADBC_STATUS_INVALID_ARGUMENT);
   EXPECT_THAT(error_.message,
-              ::testing::AllOf(::testing::HasSubstr("unsupported query parameter "
-                                                    "'sslmode'"),
-                               ::testing::HasSubstr(ADBC_MOTHERDUCK_OPTION_REGION)));
+              ::testing::AllOf(::testing::HasSubstr("unsupported query parameter"),
+                               ::testing::HasSubstr(ADBC_MOTHERDUCK_OPTION_REGION),
+                               ::testing::Not(::testing::HasSubstr("sslmode"))));
   if (error_.release) error_.release(&error_);
   error_ = {};
   // Invalid values and percent-encoding are rejected too.

@@ -314,20 +314,12 @@ AdbcStatusCode ParseUri(std::string_view uri, std::string* libpq_uri,
         if (!supported.empty()) supported += ", ";
         supported += name;
       }
-      // Name the parameter only if it's one of libpq's, or one of ours with a
-      // prefix, so a password with an unencoded '?' in it isn't repeated.
-      bool name_it = key.starts_with("motherduck.") || key.starts_with("adbc.");
-      if (PQconninfoOption* defaults = PQconndefaults()) {
-        for (PQconninfoOption* option = defaults; option->keyword != nullptr; option++) {
-          name_it = name_it || key == option->keyword;
-        }
-        PQconninfoFree(defaults);
-      }
+      // The parameter isn't named: with an unencoded '?' in a password, what
+      // follows it looks like one.
       InternalAdbcSetError(error,
-                           "Invalid database option 'uri': unsupported query parameter "
-                           "%s%s%s. The URI's query takes only the options %s",
-                           name_it ? "'" : "", name_it ? key.c_str() : "",
-                           name_it ? "'" : "", supported.c_str());
+                           "Invalid database option 'uri': unsupported query parameter. "
+                           "The URI's query takes only the options %s",
+                           supported.c_str());
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
     // The value isn't repeated in the error, in case it's part of a token.
