@@ -726,6 +726,13 @@ TEST(MotherDuckScrubConnectErrorTest, HidesTokenAndNonDefaultUser) {
   // the longer of two secrets at the same place wins.
   EXPECT_EQ(adbcpq::ScrubConnectError("pw red", "red", "pw"), "<redacted> <redacted>");
   EXPECT_EQ(adbcpq::ScrubConnectError("tokenX", "token", "tokenX"), "<redacted>");
+  // A secret at either end of the message, twice in a row, and as both user and
+  // password.
+  EXPECT_EQ(adbcpq::ScrubConnectError("TOKEN failed", "TOKEN", ""), "<redacted> failed");
+  EXPECT_EQ(adbcpq::ScrubConnectError("failed TOKEN", "TOKEN", ""), "failed <redacted>");
+  EXPECT_EQ(adbcpq::ScrubConnectError("TOKEN", "", "TOKEN"), "<redacted>");
+  EXPECT_EQ(adbcpq::ScrubConnectError("tokentoken", "token", ""), "<redacted>");
+  EXPECT_EQ(adbcpq::ScrubConnectError("a TOKEN b", "TOKEN", "TOKEN"), "a <redacted> b");
   // Secrets that overlap leave nothing of either.
   EXPECT_EQ(adbcpq::ScrubConnectError("for xab here", "xa", "ab"), "for <redacted> here");
   EXPECT_EQ(adbcpq::ScrubConnectError("for xab here", "ab", "xa"), "for <redacted> here");

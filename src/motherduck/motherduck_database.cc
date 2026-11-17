@@ -624,8 +624,8 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   PQconninfoOption* conninfo = PQconninfoParse(uri_.c_str(), &parse_error);
   if (conninfo == nullptr) {
     // libpq's message quotes the URI, which can hold a token, and has the
-    // postgresql:// scheme the driver hides. SetOption validates the URI, so
-    // this is rare.
+    // postgresql:// scheme the driver hides. uri_ only comes from SetOption, which
+    // validates it with PQconninfoParse, so this is out of memory in practice.
     PQfreemem(parse_error);
     InternalAdbcSetError(error, "%s",
                          "[libpq] Failed to connect: the URI doesn't parse; check its "
