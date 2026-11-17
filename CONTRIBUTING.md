@@ -250,12 +250,7 @@ until you publish the draft.
    Actions tab on `main`
    (`gh workflow run "Custom Release" --ref main`). A manual run does everything
    except create the release.
-3. Write the release notes in `docs/release-notes/<tag>.md` and merge them. The
-   release tooling generates notes from the commits since the previous stable
-   tag, and it ignores pre-release tags. Until the first stable release that is
-   the whole history, including the upstream PostgreSQL driver's, so replace the
-   generated notes with the hand-written ones.
-4. Tag and push. Use SemVer, with a pre-release suffix for alphas and betas
+3. Tag and push. Use SemVer, with a pre-release suffix for alphas and betas
    (`v0.1.0-alpha.1`, not `v0.1.0a1`):
 
    ```sh
@@ -264,20 +259,26 @@ until you publish the draft.
    git push origin v0.1.0-alpha.1
    ```
 
-5. Wait for the workflow to finish, then open the draft release and check that
+4. Wait for the workflow to finish, then open the draft release and check that
    it has the four platform packages, `manifest.yaml`, and the docs page.
-6. Replace the generated notes, mark pre-releases, and publish:
+5. Review the generated notes, and edit them if needed. The tooling lists the
+   commits since the previous *stable* tag, ignoring pre-release tags, so until
+   the first stable release that is the whole history, including the upstream
+   PostgreSQL driver's. For those releases write the notes by hand, covering the
+   changes since the first MotherDuck commit, and replace the generated ones.
+   Then mark pre-releases and publish:
 
    ```sh
    gh release edit v0.1.0-alpha.1 \
      --title "ADBC Driver for MotherDuck v0.1.0-alpha.1" \
-     --notes-file docs/release-notes/v0.1.0-alpha.1.md \
+     --notes-file notes.md \
      --prerelease
    gh release edit v0.1.0-alpha.1 --draft=false
    ```
 
-   Drop `--prerelease` for a stable release. The release tooling doesn't set it
-   for you, and without it GitHub shows the release as the latest one.
+   Leave out `--title` and `--notes-file` to keep the generated ones, and drop
+   `--prerelease` for a stable release. The tooling never sets the pre-release
+   flag itself, and without it GitHub shows an alpha as the latest release.
 
 If the workflow fails, nothing is published. Fix the problem, delete the tag
 (`git tag -d <tag> && git push origin :refs/tags/<tag>`), and tag again, or move
