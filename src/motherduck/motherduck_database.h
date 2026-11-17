@@ -82,6 +82,12 @@ std::string RegionHost(std::string_view region);
 /// default to verify-full.
 bool DriverChoosesSslmode();
 
+/// \brief message with every occurrence of the password, and of the user unless it's
+/// the default one, replaced by <redacted>. libpq's connection errors quote the
+/// user, which is a token if it was put where the user goes.
+std::string ScrubConnectError(std::string_view message, std::string_view user,
+                              std::string_view password);
+
 /// \brief A libpq session option, --<name>=<value>, with whitespace and
 /// backslashes in value escaped.
 std::string SessionOption(std::string_view name, std::string_view value);

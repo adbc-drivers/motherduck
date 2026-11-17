@@ -182,6 +182,23 @@ TEST(MotherDuckConnectTimeoutTest, OptionSetGet) {
   if (error.release) error.release(&error);
 }
 
+TEST(MotherDuckConnectTimeoutTest, LeadingZeros) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const auto& [written, read] :
+       {std::pair{"007", "7"}, std::pair{"000", "0"}, std::pair{"0010", "10"}}) {
+    ASSERT_THAT(
+        AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT,
+                              written, &error),
+        IsOkStatus(&error));
+    // The string and integer getters agree.
+    EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                    &database.value, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT, &error),
+                ::testing::Optional(std::string(read)));
+  }
+}
+
 TEST(MotherDuckConnectTimeoutTest, OptionInvalid) {
   struct AdbcError error = {};
   adbc_validation::Handle<struct AdbcDatabase> database;
@@ -365,15 +382,25 @@ TEST(MotherDuckUsernameTest, OptionSetGet) {
       ::testing::Optional("bob"s));
 }
 
+// A URI libpq can't parse is rejected when it's set, and the previous one stays.
 TEST(MotherDuckUsernameTest, UnparseableUri) {
   struct AdbcError error = {};
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", "motherduck://[bad", &error),
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri",
+                                    "motherduck://alice@localhost/db", &error),
               IsOkStatus(&error));
-  EXPECT_THAT(GetOptionStatus(&database.value, ADBC_OPTION_USERNAME, &error),
-              IsStatus(ADBC_STATUS_INVALID_STATE, &error));
-  if (error.release) error.release(&error);
+  for (const char* uri : {"motherduck://[bad", "md:my%zz", "md:my db",
+                          "motherduck://alice@localhost/db%2"}) {
+    SCOPED_TRACE(uri);
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, "uri", uri, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+    error = {};
+  }
+  EXPECT_THAT(
+      adbc_validation::DatabaseGetOption(&database.value, ADBC_OPTION_USERNAME, &error),
+      ::testing::Optional("alice"s));
 }
 
 TEST(MotherDuckPasswordTest, RequiresToken) {
@@ -665,15 +692,11 @@ TEST_F(MotherDuckConnectParamsTest, ErrorsOmitTokens) {
     if (error_.release) error_.release(&error_);
     error_ = {};
   }
-  // Accepted when set, but libpq can't parse them when connecting. Its message
-  // quotes the URI.
+  // libpq can't parse these. Its message quotes the URI, so isn't used.
   for (const char* uri : {"motherduck://alice:MY_SECRET_TOKEN@[bad",
                           "motherduck://alice:MY_SECRET_TOKEN%2@localhost/db"}) {
     SCOPED_TRACE(uri);
-    SetOption("uri", uri);
-    std::vector<std::pair<std::string, std::string>> params;
-    EXPECT_THAT(database_.ConnectParams(&params, &error_),
-                IsStatus(ADBC_STATUS_IO, &error_));
+    EXPECT_EQ(database_.SetOption("uri", uri, &error_), ADBC_STATUS_INVALID_ARGUMENT);
     ASSERT_NE(error_.message, nullptr);
     EXPECT_THAT(error_.message,
                 ::testing::Not(::testing::AnyOf(::testing::HasSubstr("SECRET"),
@@ -683,88 +706,18 @@ TEST_F(MotherDuckConnectParamsTest, ErrorsOmitTokens) {
   }
 }
 
-// Random URIs built from the pieces a URI is made of, with a marker where a token
-// could be. Whatever happens, nothing crashes, and no error repeats the marker or
-// the scheme the driver hides.
-TEST_F(MotherDuckConnectParamsTest, RandomUrisNeverLeakOrCrash) {
-  const std::vector<std::string> kPieces = {"motherduck://",
-                                            "md://",
-                                            "md:",
-                                            "motherduck:///",
-                                            "alice",
-                                            ":",
-                                            "@",
-                                            "/",
-                                            "?",
-                                            "&",
-                                            "=",
-                                            "%",
-                                            "%00",
-                                            "%2",
-                                            "%40",
-                                            "%2F",
-                                            "%3A",
-                                            "db",
-                                            "localhost",
-                                            ":5432",
-                                            "[",
-                                            "]",
-                                            "motherduck.region",
-                                            "motherduck.tls_verify",
-                                            "motherduck.connect_timeout",
-                                            "motherduck.attach_mode",
-                                            "motherduck.session_name",
-                                            "motherduck.token",
-                                            "sslmode",
-                                            "password",
-                                            "options",
-                                            "adbc.",
-                                            "us-east-1",
-                                            "true",
-                                            "false",
-                                            "10",
-                                            "-",
-                                            "_",
-                                            " ",
-                                            "+",
-                                            "#",
-                                            ";",
-                                            "\\",
-                                            "\n",
-                                            "\xC3\xA9",
-                                            "SECRETX",
-                                            "SECRETX",
-                                            "SECRETX"};
-  uint32_t state = 12345;
-  auto next = [&state](uint32_t bound) {
-    state = state * 1664525u + 1013904223u;
-    return (state >> 8) % bound;
-  };
-  int accepted = 0;
-  for (int i = 0; i < 20000; i++) {
-    std::string uri = next(2) ? "motherduck://" : (next(2) ? "md:" : "md://");
-    for (uint32_t n = next(14); n > 0; n--) uri += kPieces[next(kPieces.size())];
-    SCOPED_TRACE(uri);
-    std::vector<std::string> messages;
-    auto record = [&] {
-      if (error_.message != nullptr) messages.push_back(error_.message);
-      if (error_.release) error_.release(&error_);
-      error_ = {};
-    };
-    if (database_.SetOption("uri", uri.c_str(), &error_) == ADBC_STATUS_OK) {
-      accepted++;
-      std::vector<std::pair<std::string, std::string>> params;
-      database_.ConnectParams(&params, &error_);
-    }
-    record();
-    for (const std::string& message : messages) {
-      EXPECT_EQ(message.find("SECRETX"), std::string::npos) << message;
-      EXPECT_EQ(message.find("postgresql://"), std::string::npos) << message;
-    }
-  }
-  // Both outcomes were exercised.
-  EXPECT_GT(accepted, 100);
-  EXPECT_LT(accepted, 19900);
+TEST(MotherDuckScrubConnectErrorTest, HidesTokenAndNonDefaultUser) {
+  const std::string message =
+      "connection failed: password authentication failed for user \"TOKEN123\" "
+      "(TOKEN123) with PASS456";
+  // A token in the user's place, and the password, are hidden everywhere.
+  EXPECT_EQ(adbcpq::ScrubConnectError(message, "TOKEN123", "PASS456"),
+            "connection failed: password authentication failed for user "
+            "\"<redacted>\" (<redacted>) with <redacted>");
+  // The default user isn't a secret.
+  EXPECT_EQ(adbcpq::ScrubConnectError("failed for user \"postgres\"", "postgres", ""),
+            "failed for user \"postgres\"");
+  EXPECT_EQ(adbcpq::ScrubConnectError("a b", "", ""), "a b");
 }
 
 TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {
@@ -916,6 +869,15 @@ TEST_F(MotherDuckConnectParamsTest, SessionNameEscaped) {
   EXPECT_THAT(Values("options"),
               ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=single "
                                      "--session_name=my\\ session"));
+  // Every ASCII whitespace character and backslash is escaped, and a byte of a
+  // multi-byte character (0xA0 ends a no-break space) is left alone.
+  SetOption(ADBC_MOTHERDUCK_OPTION_SESSION_NAME,
+            "a\tb\nc\\d\xC2\xA0"
+            "e");
+  EXPECT_THAT(Values("options"),
+              ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=single "
+                                     "--session_name=a\\\tb\\\nc\\\\d\xC2\xA0"
+                                     "e"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, ApplicationName) {

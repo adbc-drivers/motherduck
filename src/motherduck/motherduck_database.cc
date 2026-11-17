@@ -248,9 +248,10 @@ AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
     // A whole number of seconds; 0 waits indefinitely.
     if (!IsTimeoutSeconds(value)) {
-      return invalid("a whole number of seconds, such as 10");
+      return invalid("a whole number of seconds from 0 to 999999999, such as 10");
     }
-    settings->connect_timeout = value;
+    // Read back the same however it was written: 007 is 7.
+    settings->connect_timeout = *value == '\0' ? "" : std::to_string(std::stoll(value));
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     // The region becomes part of a hostname.
     std::string region = AsciiLower(value);
@@ -290,6 +291,20 @@ AdbcStatusCode ParseUri(std::string_view uri, std::string* libpq_uri,
   std::string normalized = NormalizeUri(uri);
   size_t query_start = normalized.find('?');
   *libpq_uri = normalized.substr(0, query_start);
+  // Fail now, not when connecting, on a host, port or percent-encoding libpq
+  // rejects. Its message quotes the URI, which can hold a token, so isn't used.
+  {
+    char* parse_error = nullptr;
+    PQconninfoOption* parsed = PQconninfoParse(libpq_uri->c_str(), &parse_error);
+    PQfreemem(parse_error);
+    if (parsed == nullptr) {
+      InternalAdbcSetError(error,
+                           "Invalid database option 'uri': the URI doesn't parse; check "
+                           "its host, port and percent-encoding");
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    PQconninfoFree(parsed);
+  }
   if (query_start == std::string::npos) return ADBC_STATUS_OK;
   std::string_view query = std::string_view(normalized).substr(query_start + 1);
   while (!query.empty()) {
@@ -340,7 +355,9 @@ AdbcStatusCode ParseUri(std::string_view uri, std::string* libpq_uri,
 std::string EscapeOptionValue(std::string_view value) {
   std::string escaped;
   for (char c : value) {
-    if (c == '\\' || std::isspace(static_cast<unsigned char>(c))) escaped += '\\';
+    // ASCII whitespace only: isspace follows the host application's locale, and
+    // could escape a byte of a multi-byte character.
+    if (c == '\\' || c == ' ' || (c >= '\t' && c <= '\r')) escaped += '\\';
     escaped += c;
   }
   return escaped;
@@ -383,6 +400,21 @@ bool DriverChoosesSslmode() {
   // With sslrootcert=system, libpq already defaults to verify-full and rejects
   // anything weaker.
   return GetEnv("PGSSLROOTCERT") != "system";
+}
+
+std::string ScrubConnectError(std::string_view message, std::string_view user,
+                              std::string_view password) {
+  std::string scrubbed(message);
+  // The server and libpq quote the user, which is a token if it was put in the
+  // user's place. The default user isn't a secret, and stays readable.
+  for (std::string_view secret : {password, user == kDefaultUser ? "" : user}) {
+    if (secret.empty()) continue;
+    for (size_t at = scrubbed.find(secret); at != std::string::npos;
+         at = scrubbed.find(secret, at + 10)) {
+      scrubbed.replace(at, secret.size(), "<redacted>");
+    }
+  }
+  return scrubbed;
 }
 
 std::string SessionOption(std::string_view name, std::string_view value) {
@@ -810,8 +842,14 @@ AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* erro
 
   *conn = PQconnectdbParams(keywords.data(), values.data(), /*expand_dbname=*/0);
   if (PQstatus(*conn) != CONNECTION_OK) {
-    InternalAdbcSetError(error, "%s%s",
-                         "[libpq] Failed to connect: ", PQerrorMessage(*conn));
+    std::string user, password;
+    for (const auto& [keyword, value] : params) {
+      if (keyword == "user") user = value;
+      if (keyword == "password") password = value;
+    }
+    InternalAdbcSetError(
+        error, "%s%s", "[libpq] Failed to connect: ",
+        RedactMessage(ScrubConnectError(PQerrorMessage(*conn), user, password)).c_str());
     PQfinish(*conn);
     *conn = nullptr;
     return ADBC_STATUS_IO;
