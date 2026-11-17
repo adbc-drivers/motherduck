@@ -676,16 +676,14 @@ TEST_F(MotherDuckConnectParamsTest, OptionsOutrankUriQuery) {
 
 // A token must not come back in an error, nor must the scheme the driver hides.
 TEST_F(MotherDuckConnectParamsTest, ErrorsOmitTokens) {
-  // Rejected when the URI is set: a '?' in a password ends the authority early.
+  // Rejected when the URI is set.
   for (const char* uri :
        {"motherduck:///db?my_secret_token",
-        "motherduck://alice:sec?ret_token@elsewhere/db",
-        "motherduck://alice:sec?ret_token=x@elsewhere/db",
         "motherduck:///db?motherduck.region=us-east-1&SECRET%40TOKEN",
         "motherduck:///db?motherduck.connect_timeout=SECRET_TOKEN",
-        "motherduck://alice:p?adbc.SECRET=1@elsewhere/db",
-        "motherduck://alice:p?motherduck.SECRET=1@elsewhere/db",
-        "motherduck://alice:p?password=SECRET@elsewhere/db", "md:SECRET_TOKEN@my_db"}) {
+        // A token where a port goes, for want of an '@': libpq would quote it.
+        "motherduck://alice:SECRET_TOKEN/db", "motherduck://host:SECRET_TOKEN",
+        "motherduck://h1:1,h2:SECRET_TOKEN/db", "md:SECRET_TOKEN@my_db"}) {
     SCOPED_TRACE(uri);
     EXPECT_EQ(database_.SetOption("uri", uri, &error_), ADBC_STATUS_INVALID_ARGUMENT);
     ASSERT_NE(error_.message, nullptr);
@@ -736,6 +734,55 @@ TEST(MotherDuckScrubConnectErrorTest, HidesTokenAndNonDefaultUser) {
   // Secrets that overlap leave nothing of either.
   EXPECT_EQ(adbcpq::ScrubConnectError("for xab here", "xa", "ab"), "for <redacted> here");
   EXPECT_EQ(adbcpq::ScrubConnectError("for xab here", "ab", "xa"), "for <redacted> here");
+}
+
+// libpq reads a password up to the '@' that ends the user info, whatever it holds,
+// so a '?' in a password isn't the start of the query.
+TEST_F(MotherDuckConnectParamsTest, QuestionMarkInPassword) {
+  SetOption(ADBC_OPTION_PASSWORD, "");
+  // What looks like an option is part of the password, and sets nothing.
+  SetOption("uri",
+            "motherduck://alice:eyJhbGci?motherduck.tls_root_cert_path=rest.of.token@"
+            "db.example/analytics");
+  EXPECT_THAT(Values("password"),
+              ::testing::ElementsAre("eyJhbGci?motherduck.tls_root_cert_path="
+                                     "rest.of.token"));
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("db.example"));
+  EXPECT_THAT(Values("dbname"), ::testing::ElementsAre("analytics"));
+  EXPECT_THAT(Values("sslrootcert"), ::testing::ElementsAre(kBundle));
+  // A password with a '?' and then a real query.
+  SetOption("uri",
+            "motherduck://alice:p?ss@pg.us-east-1-aws.motherduck.com/analytics?"
+            "motherduck.session_name=s");
+  EXPECT_THAT(Values("password"), ::testing::ElementsAre("p?ss"));
+  EXPECT_THAT(Values("options"),
+              ::testing::ElementsAre("--return_pg_command_tags=on --attach_mode=single "
+                                     "--session_name=s"));
+  // The same, with the real query setting the region.
+  SetOption("uri", "motherduck://alice:p?ss@/analytics?motherduck.region=us-east-1");
+  EXPECT_THAT(Values("password"), ::testing::ElementsAre("p?ss"));
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
+  // Without user info, the first '?' still starts the query.
+  EXPECT_EQ(database_.SetOption("uri", "motherduck://host/db?SECRET", &error_),
+            ADBC_STATUS_INVALID_ARGUMENT);
+  if (error_.release) error_.release(&error_);
+  error_ = {};
+}
+
+TEST_F(MotherDuckConnectParamsTest, Ports) {
+  for (const char* uri : {"motherduck://host:5432/db", "motherduck://host/db",
+                          "motherduck://h1:1,h2:2/db", "motherduck://h1,h2:2/db"}) {
+    SCOPED_TRACE(uri);
+    EXPECT_EQ(database_.SetOption("uri", uri, &error_), ADBC_STATUS_OK);
+    if (error_.release) error_.release(&error_);
+    error_ = {};
+  }
+  for (const char* uri : {"motherduck://host:54a2/db", "motherduck://host:%2B1/db"}) {
+    SCOPED_TRACE(uri);
+    EXPECT_EQ(database_.SetOption("uri", uri, &error_), ADBC_STATUS_INVALID_ARGUMENT);
+    if (error_.release) error_.release(&error_);
+    error_ = {};
+  }
 }
 
 TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {

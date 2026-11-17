@@ -283,6 +283,19 @@ AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
   return ADBC_STATUS_OK;
 }
 
+// Where the query starts in a postgresql:// URI, or npos. libpq reads user info up
+// to the first '@' that comes before a '/', and a password can hold a '?', so the
+// query is the first '?' after that '@'. Without user info it's the first '?'.
+size_t QueryStart(std::string_view normalized) {
+  constexpr std::string_view kScheme = "postgresql://";
+  size_t authority = kScheme.size();
+  size_t after_user_info = normalized.find_first_of("@/", authority);
+  if (after_user_info != std::string_view::npos && normalized[after_user_info] == '@') {
+    authority = after_user_info + 1;
+  }
+  return normalized.find('?', authority);
+}
+
 // Splits uri, already accepted by IsAcceptedUri, into the URI libpq parses, which
 // has no query, and the settings its query parameters set. The query takes only
 // the settings named like database options; anything else, including libpq's own
@@ -290,7 +303,7 @@ AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
 AdbcStatusCode ParseUri(std::string_view uri, std::string* libpq_uri,
                         MotherduckSettings* settings, struct AdbcError* error) {
   std::string normalized = NormalizeUri(uri);
-  size_t query_start = normalized.find('?');
+  size_t query_start = QueryStart(normalized);
   *libpq_uri = normalized.substr(0, query_start);
   // Fail now, not when connecting, on a host, port or percent-encoding libpq
   // rejects. Its message quotes the URI, which can hold a token, so isn't used.
@@ -298,13 +311,24 @@ AdbcStatusCode ParseUri(std::string_view uri, std::string* libpq_uri,
     char* parse_error = nullptr;
     PQconninfoOption* parsed = PQconninfoParse(libpq_uri->c_str(), &parse_error);
     PQfreemem(parse_error);
-    if (parsed == nullptr) {
+    // libpq only checks the port when connecting, and then quotes it. A
+    // non-numeric port is usually a token put where a host:port goes, as in
+    // user:token/db. A list of hosts has a list of ports.
+    bool port_ok = parsed != nullptr;
+    for (PQconninfoOption* option = parsed; port_ok && option->keyword != nullptr;
+         option++) {
+      if (option->val != nullptr && std::strcmp(option->keyword, "port") == 0) {
+        port_ok = std::string_view(option->val).find_first_not_of("0123456789,") ==
+                  std::string_view::npos;
+      }
+    }
+    if (parsed != nullptr) PQconninfoFree(parsed);
+    if (!port_ok) {
       InternalAdbcSetError(error,
                            "Invalid database option 'uri': the URI doesn't parse; check "
                            "its host, port and percent-encoding");
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    PQconninfoFree(parsed);
   }
   if (query_start == std::string::npos) return ADBC_STATUS_OK;
   std::string_view query = std::string_view(normalized).substr(query_start + 1);

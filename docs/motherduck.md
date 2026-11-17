@@ -120,7 +120,11 @@ Percent-encode values; an empty value is unset. Every option except
 `motherduck.token` can be set this way (a token doesn't belong in a query, which
 is more likely to be logged than the URI's password), and an option set on the
 database takes precedence over the URI's. Any other query parameter, including
-the PostgreSQL settings below, is rejected with `INVALID_ARGUMENT`.
+the PostgreSQL settings below, is rejected with `INVALID_ARGUMENT`. The query
+starts at the first `?` after the user info (the part before the `@`), so a `?`
+in a password doesn't start it, though percent-encoding it is safer. A port that
+isn't a number is rejected, so a token written where a port goes, as in
+`user:TOKEN/db` with no `@`, never reaches an error message.
 
 ### PostgreSQL settings are not supported
 
