@@ -20,6 +20,7 @@
 
 #include "motherduck_database.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -408,21 +409,23 @@ std::string ScrubConnectError(std::string_view message, std::string_view user,
   // The server and libpq quote the user, which is a token if it was put in the
   // user's place. The default user isn't a secret, and stays readable.
   std::string_view secrets[] = {password, user == kDefaultUser ? "" : user};
-  // One pass over the original message, so a replacement is never searched
-  // again, and the longest secret wins where two start at the same place.
-  std::string scrubbed;
-  for (size_t i = 0; i < message.size();) {
-    size_t match = 0;
-    for (std::string_view secret : secrets) {
-      if (secret.size() > match && message.substr(i).starts_with(secret)) {
-        match = secret.size();
-      }
+  // Mark every byte any occurrence of a secret covers, overlapping ones too,
+  // then replace each marked run once. The marker is never searched, and
+  // nothing of a secret is left where it overlaps another.
+  std::vector<bool> covered(message.size(), false);
+  for (std::string_view secret : secrets) {
+    if (secret.empty()) continue;
+    for (size_t at = message.find(secret); at != std::string_view::npos;
+         at = message.find(secret, at + 1)) {
+      std::fill_n(covered.begin() + at, secret.size(), true);
     }
-    if (match > 0) {
+  }
+  std::string scrubbed;
+  for (size_t i = 0; i < message.size(); i++) {
+    if (!covered[i]) {
+      scrubbed += message[i];
+    } else if (i == 0 || !covered[i - 1]) {
       scrubbed += kRedacted;
-      i += match;
-    } else {
-      scrubbed += message[i++];
     }
   }
   return scrubbed;
@@ -620,10 +623,13 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
   char* parse_error = nullptr;
   PQconninfoOption* conninfo = PQconninfoParse(uri_.c_str(), &parse_error);
   if (conninfo == nullptr) {
-    // uri_ was validated when set, so this is out of memory. libpq's message
-    // would quote the URI, which can hold a token.
+    // libpq's message quotes the URI, which can hold a token, and has the
+    // postgresql:// scheme the driver hides. SetOption validates the URI, so
+    // this is rare.
     PQfreemem(parse_error);
-    InternalAdbcSetError(error, "%s", "[libpq] Failed to connect: out of memory");
+    InternalAdbcSetError(error, "%s",
+                         "[libpq] Failed to connect: the URI doesn't parse; check its "
+                         "host, port and percent-encoding");
     return ADBC_STATUS_IO;
   }
 

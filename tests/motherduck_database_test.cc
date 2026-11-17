@@ -726,6 +726,9 @@ TEST(MotherDuckScrubConnectErrorTest, HidesTokenAndNonDefaultUser) {
   // the longer of two secrets at the same place wins.
   EXPECT_EQ(adbcpq::ScrubConnectError("pw red", "red", "pw"), "<redacted> <redacted>");
   EXPECT_EQ(adbcpq::ScrubConnectError("tokenX", "token", "tokenX"), "<redacted>");
+  // Secrets that overlap leave nothing of either.
+  EXPECT_EQ(adbcpq::ScrubConnectError("for xab here", "xa", "ab"), "for <redacted> here");
+  EXPECT_EQ(adbcpq::ScrubConnectError("for xab here", "ab", "xa"), "for <redacted> here");
 }
 
 TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {
