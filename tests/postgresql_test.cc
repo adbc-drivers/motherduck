@@ -677,7 +677,8 @@ static bool UriWithBadPassword(const char* uri, std::string* bad_uri) {
 TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
-  // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
+  // A bad password, in the URI or the password option, takes precedence over
+  // MOTHERDUCK_TOKEN.
   std::string bad_uri;
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
