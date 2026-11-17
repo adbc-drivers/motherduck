@@ -657,25 +657,29 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
 }
 
 // The test URI with a bad password in its authority, which takes precedence over
-// MOTHERDUCK_TOKEN. The URI may have no user.
-static std::string UriWithBadPassword(const char* uri) {
-  std::string bad_uri = uri;
-  size_t authority = bad_uri.find("://") + 3;
-  size_t end = bad_uri.find_first_of("/?", authority);
-  size_t at = bad_uri.find('@', authority);
+// MOTHERDUCK_TOKEN. The URI may have no user. False for a URI with no authority,
+// such as md:my_db, which can't carry a password.
+static bool UriWithBadPassword(const char* uri, std::string* bad_uri) {
+  *bad_uri = uri;
+  size_t scheme_end = bad_uri->find("://");
+  if (scheme_end == std::string::npos) return false;
+  size_t authority = scheme_end + 3;
+  size_t end = bad_uri->find_first_of("/?", authority);
+  size_t at = bad_uri->find('@', authority);
   if (at != std::string::npos && at < end) {
-    bad_uri.insert(at, ":invalid");
+    bad_uri->insert(at, ":invalid");
   } else {
-    bad_uri.insert(authority, "postgres:invalid@");
+    bad_uri->insert(authority, "postgres:invalid@");
   }
-  return bad_uri;
+  return true;
 }
 
 TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
   // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
-  const std::string bad_uri = UriWithBadPassword(uri);
+  std::string bad_uri;
+  if (!UriWithBadPassword(uri, &bad_uri)) GTEST_SKIP() << "the test URI has no authority";
 
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
@@ -736,7 +740,8 @@ TEST_F(PostgresDatabaseTest, PasswordOption) {
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
   const char* token = std::getenv("MOTHERDUCK_TOKEN");
   ASSERT_NE(token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
-  const std::string bad_uri = UriWithBadPassword(uri);
+  std::string bad_uri;
+  if (!UriWithBadPassword(uri, &bad_uri)) GTEST_SKIP() << "the test URI has no authority";
 
   // The option takes precedence over a password in the URI.
   {

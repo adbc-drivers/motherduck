@@ -61,19 +61,49 @@ size_t MotherduckSchemeLength(std::string_view uri) {
   return 0;
 }
 
+// Decodes %XX sequences. False for a malformed sequence, or %00, which would end
+// the C string the result is used as. libpq's own URI parser rejects %00 too.
+bool PercentDecode(std::string_view in, std::string* out) {
+  auto hex = [](char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  out->clear();
+  for (size_t i = 0; i < in.size(); i++) {
+    if (in[i] != '%') {
+      *out += in[i];
+      continue;
+    }
+    if (i + 2 >= in.size()) return false;
+    int high = hex(in[i + 1]);
+    int low = hex(in[i + 2]);
+    if (high < 0 || low < 0) return false;
+    // A NUL would end the C string the value is validated and used as.
+    if (high == 0 && low == 0) return false;
+    *out += static_cast<char>(high * 16 + low);
+    i += 2;
+  }
+  return true;
+}
+
 // DuckDB's md:[database][?parameters] form, which has no slashes. md: alone names
 // the workspace.
 constexpr std::string_view kShortFormPrefix = "md:";
 constexpr std::string_view kWorkspaceDatabase = "md%3A";
 
-// A database name has no '/' or '@': md:host/db is a mistyped md://host/db, and
-// md:token@db is DuckDB's token form, which would send the token to the server
-// as a database name.
+// A database name has no '/' or '@', even percent-encoded: md:host/db is a
+// mistyped md://host/db, and md:token@db is DuckDB's token form, which would send
+// the token to the server as a database name. The name must also decode.
 bool IsShortForm(std::string_view uri) {
   if (!uri.starts_with(kShortFormPrefix)) return false;
   std::string_view database = uri.substr(kShortFormPrefix.size());
   database = database.substr(0, database.find('?'));
-  return database.find_first_of("/@") == std::string_view::npos;
+  std::string decoded;
+  return PercentDecode(database, &decoded) &&
+         database.find_first_of("/@") == std::string_view::npos &&
+         decoded.find_first_of("/@") == std::string::npos;
 }
 
 bool IsAcceptedUri(std::string_view uri) {
@@ -186,17 +216,29 @@ bool IsUriSettingKey(std::string_view key) {
   return false;
 }
 
-// Sets the setting named key, after validating value. *known is false, and
-// nothing is set, if key names none of them. An empty value unsets it.
+// Sets the setting named key, after validating value, which is a database
+// option's or a URI query parameter's (from_uri). An empty value unsets it.
+// NOT_FOUND, with no error set, if key names none of them. A rejected URI value
+// isn't repeated in the error, in case it's part of a token.
 AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
-                          const char* value, bool* known, struct AdbcError* error) {
-  *known = true;
+                          const char* value, bool from_uri, struct AdbcError* error) {
+  auto invalid = [&](const char* expected) {
+    if (from_uri) {
+      InternalAdbcSetError(error,
+                           "Invalid database option 'uri': invalid value for query "
+                           "parameter %s: expected %s",
+                           key, expected);
+    } else {
+      InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s: expected %s",
+                           key, value, expected);
+    }
+    return ADBC_STATUS_INVALID_ARGUMENT;
+  };
   if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_ATTACH_MODE) == 0) {
     // Unset, it's the URI's, or single.
     if (*value != '\0' && std::strcmp(value, "single") != 0 &&
         std::strcmp(value, "workspace") != 0) {
-      InternalAdbcSetError(error, "[libpq] Invalid value for option %s=%s", key, value);
-      return ADBC_STATUS_INVALID_ARGUMENT;
+      return invalid("single or workspace");
     }
     settings->attach_mode = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_SESSION_NAME) == 0) {
@@ -206,23 +248,15 @@ AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
     // A whole number of seconds; 0 waits indefinitely.
     if (!IsTimeoutSeconds(value)) {
-      InternalAdbcSetError(error,
-                           "Invalid value for option %s=%s: expected a whole number "
-                           "of seconds, such as 10",
-                           key, value);
-      return ADBC_STATUS_INVALID_ARGUMENT;
+      return invalid("a whole number of seconds, such as 10");
     }
     settings->connect_timeout = value;
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_REGION) == 0) {
     // The region becomes part of a hostname.
     std::string region = AsciiLower(value);
     if (!region.empty() && RegionHost(region).empty()) {
-      InternalAdbcSetError(error,
-                           "[libpq] Invalid value for option %s=%s: expected a region "
-                           "such as us-east-1 or eastus2, of letters, digits and "
-                           "dashes",
-                           key, value);
-      return ADBC_STATUS_INVALID_ARGUMENT;
+      return invalid(
+          "a region such as us-east-1 or eastus2, of letters, digits and dashes");
     }
     settings->region = std::move(region);
   } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_DB_SCHEMA) == 0) {
@@ -239,40 +273,12 @@ AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
     } else if (std::strcmp(value, ADBC_OPTION_VALUE_DISABLED) == 0) {
       settings->tls_verify = false;
     } else {
-      InternalAdbcSetError(
-          error, "[libpq] Invalid value for option %s=%s: expected %s or %s", key, value,
-          ADBC_OPTION_VALUE_ENABLED, ADBC_OPTION_VALUE_DISABLED);
-      return ADBC_STATUS_INVALID_ARGUMENT;
+      return invalid("true or false");
     }
   } else {
-    *known = false;
+    return ADBC_STATUS_NOT_FOUND;
   }
   return ADBC_STATUS_OK;
-}
-
-bool PercentDecode(std::string_view in, std::string* out) {
-  auto hex = [](char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-  };
-  out->clear();
-  for (size_t i = 0; i < in.size(); i++) {
-    if (in[i] != '%') {
-      *out += in[i];
-      continue;
-    }
-    if (i + 2 >= in.size()) return false;
-    int high = hex(in[i + 1]);
-    int low = hex(in[i + 2]);
-    if (high < 0 || low < 0) return false;
-    // A NUL would end the C string the value is validated and used as.
-    if (high == 0 && low == 0) return false;
-    *out += static_cast<char>(high * 16 + low);
-    i += 2;
-  }
-  return true;
 }
 
 // Splits uri, already accepted by IsAcceptedUri, into the URI libpq parses, which
@@ -322,18 +328,9 @@ AdbcStatusCode ParseUri(std::string_view uri, std::string* libpq_uri,
                            supported.c_str());
       return ADBC_STATUS_INVALID_ARGUMENT;
     }
-    // The value isn't repeated in the error, in case it's part of a token.
-    bool known = false;
-    struct AdbcError setting_error = ADBC_ERROR_INIT;
-    if (SetSetting(settings, key.c_str(), value.c_str(), &known, &setting_error) !=
-        ADBC_STATUS_OK) {
-      if (setting_error.release) setting_error.release(&setting_error);
-      InternalAdbcSetError(error,
-                           "Invalid database option 'uri': invalid value for query "
-                           "parameter '%s'",
-                           key.c_str());
-      return ADBC_STATUS_INVALID_ARGUMENT;
-    }
+    // IsUriSettingKey checked the key, so this only fails on the value.
+    RAISE_ADBC(
+        SetSetting(settings, key.c_str(), value.c_str(), /*from_uri=*/true, error));
   }
   return ADBC_STATUS_OK;
 }
@@ -535,9 +532,9 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
   }
   // Database options set the settings that a URI's query parameters also can. An
   // empty value unsets them, which lets the URI's value apply again.
-  bool known = false;
-  AdbcStatusCode status = SetSetting(&option_settings_, key, value, &known, error);
-  if (known) return status;
+  AdbcStatusCode status =
+      SetSetting(&option_settings_, key, value, /*from_uri=*/false, error);
+  if (status != ADBC_STATUS_NOT_FOUND) return status;
   if (std::strcmp(key, ADBC_OPTION_USERNAME) == 0) {
     username_ = value;
   } else if (std::strcmp(key, ADBC_OPTION_PASSWORD) == 0 ||

@@ -683,6 +683,90 @@ TEST_F(MotherDuckConnectParamsTest, ErrorsOmitTokens) {
   }
 }
 
+// Random URIs built from the pieces a URI is made of, with a marker where a token
+// could be. Whatever happens, nothing crashes, and no error repeats the marker or
+// the scheme the driver hides.
+TEST_F(MotherDuckConnectParamsTest, RandomUrisNeverLeakOrCrash) {
+  const std::vector<std::string> kPieces = {"motherduck://",
+                                            "md://",
+                                            "md:",
+                                            "motherduck:///",
+                                            "alice",
+                                            ":",
+                                            "@",
+                                            "/",
+                                            "?",
+                                            "&",
+                                            "=",
+                                            "%",
+                                            "%00",
+                                            "%2",
+                                            "%40",
+                                            "%2F",
+                                            "%3A",
+                                            "db",
+                                            "localhost",
+                                            ":5432",
+                                            "[",
+                                            "]",
+                                            "motherduck.region",
+                                            "motherduck.tls_verify",
+                                            "motherduck.connect_timeout",
+                                            "motherduck.attach_mode",
+                                            "motherduck.session_name",
+                                            "motherduck.token",
+                                            "sslmode",
+                                            "password",
+                                            "options",
+                                            "adbc.",
+                                            "us-east-1",
+                                            "true",
+                                            "false",
+                                            "10",
+                                            "-",
+                                            "_",
+                                            " ",
+                                            "+",
+                                            "#",
+                                            ";",
+                                            "\\",
+                                            "\n",
+                                            "\xC3\xA9",
+                                            "SECRETX",
+                                            "SECRETX",
+                                            "SECRETX"};
+  uint32_t state = 12345;
+  auto next = [&state](uint32_t bound) {
+    state = state * 1664525u + 1013904223u;
+    return (state >> 8) % bound;
+  };
+  int accepted = 0;
+  for (int i = 0; i < 20000; i++) {
+    std::string uri = next(2) ? "motherduck://" : (next(2) ? "md:" : "md://");
+    for (uint32_t n = next(14); n > 0; n--) uri += kPieces[next(kPieces.size())];
+    SCOPED_TRACE(uri);
+    std::vector<std::string> messages;
+    auto record = [&] {
+      if (error_.message != nullptr) messages.push_back(error_.message);
+      if (error_.release) error_.release(&error_);
+      error_ = {};
+    };
+    if (database_.SetOption("uri", uri.c_str(), &error_) == ADBC_STATUS_OK) {
+      accepted++;
+      std::vector<std::pair<std::string, std::string>> params;
+      database_.ConnectParams(&params, &error_);
+    }
+    record();
+    for (const std::string& message : messages) {
+      EXPECT_EQ(message.find("SECRETX"), std::string::npos) << message;
+      EXPECT_EQ(message.find("postgresql://"), std::string::npos) << message;
+    }
+  }
+  // Both outcomes were exercised.
+  EXPECT_GT(accepted, 100);
+  EXPECT_LT(accepted, 19900);
+}
+
 TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {
   SetOption("uri", "motherduck://alice@localhost/db?motherduck.connect_timeout=4");
   // libpq's own parameters, PostgreSQL's names for supported settings, and
@@ -723,8 +807,22 @@ TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {
   // Invalid values and percent-encoding are rejected too.
   for (const char* query :
        {"motherduck.connect_timeout=ten", "motherduck.attach_mode=both",
-        "motherduck.region=Not%20A%20Region", "motherduck.tls_verify=maybe",
-        "motherduck.region=%zz", "motherduck.region=%4"}) {
+        "motherduck.region=Not%20A%20Region", "motherduck.tls_verify=maybe"}) {
+    SCOPED_TRACE(query);
+    const std::string uri = std::string("motherduck:///db?") + query;
+    EXPECT_EQ(database_.SetOption("uri", uri.c_str(), &error_),
+              ADBC_STATUS_INVALID_ARGUMENT);
+    // It says what the option expects, without repeating the value.
+    ASSERT_NE(error_.message, nullptr);
+    EXPECT_THAT(error_.message, ::testing::HasSubstr("expected"));
+    EXPECT_THAT(error_.message,
+                ::testing::Not(::testing::AnyOf(
+                    ::testing::HasSubstr("ten"), ::testing::HasSubstr("both"),
+                    ::testing::HasSubstr("Not%20"), ::testing::HasSubstr("maybe"))));
+    if (error_.release) error_.release(&error_);
+    error_ = {};
+  }
+  for (const char* query : {"motherduck.region=%zz", "motherduck.region=%4"}) {
     SCOPED_TRACE(query);
     const std::string uri = std::string("motherduck:///db?") + query;
     EXPECT_EQ(database_.SetOption("uri", uri.c_str(), &error_),
@@ -736,6 +834,32 @@ TEST_F(MotherDuckConnectParamsTest, UriQueryRejectsOtherParameters) {
   // Unsetting the URI clears its settings.
   SetOption("uri", "");
   EXPECT_EQ(Status(), ADBC_STATUS_INVALID_STATE);
+}
+
+TEST_F(MotherDuckConnectParamsTest, ShortFormDatabaseNames) {
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  // '@' and '/' after the '?' belong to the query, whose values may hold them.
+  SetOption("uri", "md:my_db?motherduck.application_name=a%40b");
+  EXPECT_THAT(Values("dbname"), ::testing::ElementsAre("my_db"));
+  SetOption("uri", "md:my_db?motherduck.session_name=a/b@c");
+  EXPECT_THAT(Values("dbname"), ::testing::ElementsAre("my_db"));
+  // An encoded ':' is the workspace's own spelling.
+  SetOption("uri", "md:md%3A");
+  EXPECT_THAT(Values("dbname"), ::testing::ElementsAre("md:"));
+  // '@' and '/' in the database name are rejected in every spelling, since the
+  // name would reach the server, which echoes it.
+  for (const char* uri :
+       {"md:SECRET@db", "md:SECRET%40db", "md:SECRET%40", "md:a%2Fb", "md:a%2fb",
+        "md:a/b", "md:%00db", "md:db%00", "md:%zz", "md:%4", "md:%"}) {
+    SCOPED_TRACE(uri);
+    EXPECT_EQ(database_.SetOption("uri", uri, &error_), ADBC_STATUS_INVALID_ARGUMENT);
+    ASSERT_NE(error_.message, nullptr);
+    EXPECT_THAT(error_.message, ::testing::Not(::testing::HasSubstr("SECRET")));
+    if (error_.release) error_.release(&error_);
+    error_ = {};
+  }
+  // The rejected ones left the last good URI in place.
+  EXPECT_THAT(Values("dbname"), ::testing::ElementsAre("md:"));
 }
 
 TEST_F(MotherDuckConnectParamsTest, RegionConflictsWithUriHost) {
