@@ -52,14 +52,15 @@ class PostgresDatabase {
                                 struct AdbcError* error);
   AdbcStatusCode GetOptionDouble(const char* option, double* value,
                                  struct AdbcError* error);
-  AdbcStatusCode GetOptionInt(const char* option, int64_t* value,
-                              struct AdbcError* error);
+  virtual AdbcStatusCode GetOptionInt(const char* option, int64_t* value,
+                                      struct AdbcError* error);
   virtual AdbcStatusCode SetOption(const char* key, const char* value,
                                    struct AdbcError* error);
   AdbcStatusCode SetOptionBytes(const char* key, const uint8_t* value, size_t length,
                                 struct AdbcError* error);
   AdbcStatusCode SetOptionDouble(const char* key, double value, struct AdbcError* error);
-  AdbcStatusCode SetOptionInt(const char* key, int64_t value, struct AdbcError* error);
+  virtual AdbcStatusCode SetOptionInt(const char* key, int64_t value,
+                                      struct AdbcError* error);
 
   // Internal implementation
 

@@ -29,6 +29,7 @@
 #include <nanoarrow/nanoarrow.hpp>
 
 #include "database.h"
+#include "motherduck_database.h"
 #include "postgres_type.h"
 #include "type_resolver_init.h"
 
@@ -600,7 +601,7 @@ TEST(PostgresTypeTest, BuiltinResolver) {
     FAIL() << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
   }
 
-  auto* conn = PQconnectdb(uri);
+  auto* conn = PQconnectdb(adbcpq::NormalizeUri(uri).c_str());
   if (auto status = PQstatus(conn); status != CONNECTION_OK) {
     std::string message = PQerrorMessage(conn);
     PQfinish(conn);

@@ -48,7 +48,7 @@ _database_args = {
     "uri": model.FromEnv("ADBC_POSTGRESQL_TEST_URI"),
 }
 if TEST_SCHEMA:
-    _database_args["adbc.motherduck.db_schema"] = TEST_SCHEMA
+    _database_args["motherduck.db_schema"] = TEST_SCHEMA
 
 
 class PostgreSQLQuirks(model.DriverQuirks):
