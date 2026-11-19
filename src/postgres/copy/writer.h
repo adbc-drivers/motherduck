@@ -102,6 +102,40 @@ ArrowErrorCode WriteChecked(ArrowBuffer* buffer, T in, ArrowError* error) {
   return NANOARROW_OK;
 }
 
+// Lengths on the wire are int32. A truncated length followed by all of the
+// value's bytes would make the server parse the remainder as more fields/rows.
+inline ArrowErrorCode CheckWireLength(int64_t length, const char* what, int64_t index,
+                                      ArrowError* error) {
+  if (length < 0) {
+    ArrowErrorSet(error, "[libpq] %s at row %" PRId64 " has negative length %" PRId64,
+                  what, index, length);
+    return EINVAL;
+  }
+  if (length > (std::numeric_limits<int32_t>::max)()) {
+    ArrowErrorSet(error,
+                  "[libpq] %s at row %" PRId64 " is too large (%" PRId64
+                  " bytes or elements, maximum is %" PRId32 ")",
+                  what, index, length, (std::numeric_limits<int32_t>::max)());
+    return EOVERFLOW;
+  }
+  return NANOARROW_OK;
+}
+
+// Dictionary indices come from the client array and are not validated by
+// ArrowArrayViewSetArray, so check them before reading the dictionary.
+inline ArrowErrorCode CheckDictionaryIndex(const struct ArrowArrayView* array_view,
+                                           int64_t index, int64_t dict_index,
+                                           ArrowError* error) {
+  if (dict_index < 0 || dict_index >= array_view->dictionary->length) {
+    ArrowErrorSet(error,
+                  "[libpq] Dictionary index %" PRId64 " at row %" PRId64
+                  " is out of range for dictionary of length %" PRId64,
+                  dict_index, index, array_view->dictionary->length);
+    return EINVAL;
+  }
+  return NANOARROW_OK;
+}
+
 class PostgresCopyFieldWriter {
  public:
   virtual ~PostgresCopyFieldWriter() {}
@@ -146,7 +180,12 @@ class PostgresCopyFieldTupleWriter : public PostgresCopyFieldWriter {
       return ENODATA;
     }
 
-    const int16_t n_fields = children_.size();
+    if (children_.size() > static_cast<size_t>((std::numeric_limits<int16_t>::max)())) {
+      ArrowErrorSet(error, "[libpq] Cannot write a row with %zu fields (maximum is %d)",
+                    children_.size(), (std::numeric_limits<int16_t>::max)());
+      return EOVERFLOW;
+    }
+    const int16_t n_fields = static_cast<int16_t>(children_.size());
     NANOARROW_RETURN_NOT_OK(WriteChecked<int16_t>(buffer, n_fields, error));
 
     for (int16_t i = 0; i < n_fields; i++) {
@@ -818,6 +857,8 @@ class PostgresCopyBinaryFieldWriter : public PostgresCopyFieldWriter {
  public:
   ArrowErrorCode Write(ArrowBuffer* buffer, int64_t index, ArrowError* error) override {
     struct ArrowBufferView buffer_view = ArrowArrayViewGetBytesUnsafe(array_view_, index);
+    NANOARROW_RETURN_NOT_OK(
+        CheckWireLength(buffer_view.size_bytes, "Value", index, error));
     NANOARROW_RETURN_NOT_OK(WriteChecked<int32_t>(buffer, buffer_view.size_bytes, error));
     NANOARROW_RETURN_NOT_OK(
         ArrowBufferAppend(buffer, buffer_view.data.as_uint8, buffer_view.size_bytes));
@@ -830,10 +871,9 @@ class PostgresCopyJsonbFieldWriter : public PostgresCopyFieldWriter {
  public:
   ArrowErrorCode Write(ArrowBuffer* buffer, int64_t index, ArrowError* error) override {
     struct ArrowBufferView buffer_view = ArrowArrayViewGetBytesUnsafe(array_view_, index);
-    if (buffer_view.size_bytes >= (std::numeric_limits<int32_t>::max)()) {
-      ArrowErrorSet(error, "[libpq] JSON value at row %" PRId64 " is too large", index);
-      return EOVERFLOW;
-    }
+    // The wire length is the value plus the one-byte jsonb version
+    NANOARROW_RETURN_NOT_OK(
+        CheckWireLength(buffer_view.size_bytes + 1, "JSON value", index, error));
 
     const int32_t field_size_bytes = static_cast<int32_t>(buffer_view.size_bytes) + 1;
     constexpr int8_t kJsonbVersion = 1;
@@ -850,12 +890,15 @@ class PostgresCopyBinaryDictFieldWriter : public PostgresCopyFieldWriter {
  public:
   ArrowErrorCode Write(ArrowBuffer* buffer, int64_t index, ArrowError* error) override {
     int64_t dict_index = ArrowArrayViewGetIntUnsafe(array_view_, index);
+    NANOARROW_RETURN_NOT_OK(CheckDictionaryIndex(array_view_, index, dict_index, error));
     if (ArrowArrayViewIsNull(array_view_->dictionary, dict_index)) {
       constexpr int32_t field_size_bytes = -1;
       NANOARROW_RETURN_NOT_OK(WriteChecked<int32_t>(buffer, field_size_bytes, error));
     } else {
       struct ArrowBufferView buffer_view =
           ArrowArrayViewGetBytesUnsafe(array_view_->dictionary, dict_index);
+      NANOARROW_RETURN_NOT_OK(
+          CheckWireLength(buffer_view.size_bytes, "Value", index, error));
       NANOARROW_RETURN_NOT_OK(
           WriteChecked<int32_t>(buffer, buffer_view.size_bytes, error));
       NANOARROW_RETURN_NOT_OK(
@@ -881,8 +924,7 @@ class PostgresCopyListFieldWriter : public PostgresCopyFieldWriter {
     constexpr int32_t ndim = 1;
     int32_t has_null_flags = 0;
 
-    // TODO: the LARGE_LIST should use 64 bit indexes
-    int32_t start, end;
+    int64_t start, end;
     const int64_t logical = array_view_->offset + index;
     if constexpr (IsFixedSize) {
       start = logical * array_view_->layout.child_size_elements;
@@ -892,7 +934,9 @@ class PostgresCopyListFieldWriter : public PostgresCopyFieldWriter {
       end = ArrowArrayViewListChildOffset(array_view_, logical + 1);
     }
 
-    const int32_t dim = end - start;
+    // LARGE_LIST offsets are int64 but the array dimension is int32
+    NANOARROW_RETURN_NOT_OK(CheckWireLength(end - start, "List", index, error));
+    const int32_t dim = static_cast<int32_t>(end - start);
     constexpr int32_t lb = 1;
 
     // for children of a fixed size T we could avoid the use of a temporary buffer
@@ -911,6 +955,9 @@ class PostgresCopyListFieldWriter : public PostgresCopyFieldWriter {
       bool is_null = ArrowArrayViewIsNull(child_view, i);
       if (!is_null && child_view->dictionary != nullptr) {
         const int64_t dict_index = ArrowArrayViewGetIntUnsafe(child_view, i);
+        // Report the list's row, not the child element's index.
+        NANOARROW_RETURN_NOT_OK(
+            CheckDictionaryIndex(child_view, index, dict_index, error));
         is_null = ArrowArrayViewIsNull(child_view->dictionary, dict_index);
       }
       if (is_null) {
@@ -921,12 +968,16 @@ class PostgresCopyListFieldWriter : public PostgresCopyFieldWriter {
       } else {
         NANOARROW_RETURN_NOT_OK(child_->Write(tmp.get(), i, error));
       }
+      // Fail early rather than buffering a payload that can't be sent
+      NANOARROW_RETURN_NOT_OK(CheckWireLength(tmp->size_bytes, "List", index, error));
     }
-    const int32_t field_size_bytes = sizeof(ndim) + sizeof(has_null_flags) +
+    const int64_t field_size_bytes = sizeof(ndim) + sizeof(has_null_flags) +
                                      sizeof(child_oid_) + sizeof(dim) * ndim +
                                      sizeof(lb) * ndim + tmp->size_bytes;
+    NANOARROW_RETURN_NOT_OK(CheckWireLength(field_size_bytes, "List", index, error));
 
-    NANOARROW_RETURN_NOT_OK(WriteChecked<int32_t>(buffer, field_size_bytes, error));
+    NANOARROW_RETURN_NOT_OK(
+        WriteChecked<int32_t>(buffer, static_cast<int32_t>(field_size_bytes), error));
     NANOARROW_RETURN_NOT_OK(WriteChecked<int32_t>(buffer, ndim, error));
     NANOARROW_RETURN_NOT_OK(WriteChecked<int32_t>(buffer, has_null_flags, error));
     NANOARROW_RETURN_NOT_OK(WriteChecked<uint32_t>(buffer, child_oid_, error));
