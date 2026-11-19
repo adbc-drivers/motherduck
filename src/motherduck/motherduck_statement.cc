@@ -219,8 +219,10 @@ Status MotherduckResultReader::ExecuteAll(int64_t* affected_rows) {
 
     UNWRAP_STATUS(ResolveNullParamTypes());
 
-    UNWRAP_STATUS(bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_));
-    UNWRAP_STATUS(PrepareWithParamTypes());
+    // SetParamTypes() may begin a transaction, so from here on errors abort.
+    UNWRAP_STATUS(AbortBindOnError(
+        bind_stream_->SetParamTypes(conn_, *type_resolver_, autocommit_)));
+    UNWRAP_STATUS(AbortBindOnError(PrepareWithParamTypes()));
 
     // Send every row through one pipeline instead of waiting on each in turn.
     // The rows share one sync, so they run in one implicit transaction.
@@ -266,7 +268,7 @@ Status MotherduckResultReader::ExecuteAll(int64_t* affected_rows) {
     if (affected_rows) {
       *affected_rows = rows_unknown ? -1 : total_rows;
     }
-    UNWRAP_STATUS(bind_stream_->Cleanup(conn_));
+    UNWRAP_STATUS(AbortBindOnError(bind_stream_->Cleanup(conn_)));
     bind_stream_.reset();
   } else {
     UNWRAP_STATUS(ExecuteScript(conn_, query_, &helper_));

@@ -5554,23 +5554,44 @@ void CountRows(struct AdbcStatement* statement, const std::string& table,
   ASSERT_NO_FATAL_FAILURE(QueryScalar(statement, query.c_str(), out, error));
 }
 
+// A batch with one UTC TIMESTAMP column, ts, holding the given microseconds.
+void MakeTimestampTzBatch(struct ArrowSchema* schema, struct ArrowArray* batch,
+                          const std::vector<std::optional<int64_t>>& values) {
+  ArrowSchemaInit(schema);
+  ASSERT_THAT(ArrowSchemaSetTypeStruct(schema, 1), adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIMESTAMP,
+                                         NANOARROW_TIME_UNIT_MICRO, "UTC"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT(ArrowSchemaSetName(schema->children[0], "ts"),
+              adbc_validation::IsOkErrno());
+  ASSERT_THAT((adbc_validation::MakeBatch<int64_t>(
+                  schema, batch, static_cast<struct ArrowError*>(nullptr), values)),
+              adbc_validation::IsOkErrno());
+}
+
 // A bind stream that yields one batch of $1 values and then fails, as a
-// broken upstream reader would.
+// broken upstream reader would. The values are BIGINTs, or with timestamptz,
+// UTC timestamps in microseconds.
 struct FailingBindStream {
   adbc_validation::Handle<struct ArrowSchema> schema;
   adbc_validation::Handle<struct ArrowArray> batch;
   bool sent_batch = false;
 
   static void Make(const std::vector<std::optional<int64_t>>& values,
-                   struct ArrowArrayStream* out) {
+                   struct ArrowArrayStream* out, bool timestamptz = false) {
     auto* data = new FailingBindStream();
-    ASSERT_THAT(adbc_validation::MakeSchema(&data->schema.value,
-                                            {{"ints", NANOARROW_TYPE_INT64}}),
-                adbc_validation::IsOkErrno());
-    ASSERT_THAT(adbc_validation::MakeBatch<int64_t>(
-                    &data->schema.value, &data->batch.value,
-                    static_cast<struct ArrowError*>(nullptr), values),
-                adbc_validation::IsOkErrno());
+    if (timestamptz) {
+      ASSERT_NO_FATAL_FAILURE(
+          MakeTimestampTzBatch(&data->schema.value, &data->batch.value, values));
+    } else {
+      ASSERT_THAT(adbc_validation::MakeSchema(&data->schema.value,
+                                              {{"ints", NANOARROW_TYPE_INT64}}),
+                  adbc_validation::IsOkErrno());
+      ASSERT_THAT(adbc_validation::MakeBatch<int64_t>(
+                      &data->schema.value, &data->batch.value,
+                      static_cast<struct ArrowError*>(nullptr), values),
+                  adbc_validation::IsOkErrno());
+    }
     out->private_data = data;
     out->get_schema = [](struct ArrowArrayStream* stream, struct ArrowSchema* schema) {
       auto* data = static_cast<FailingBindStream*>(stream->private_data);
@@ -5732,17 +5753,7 @@ TEST_F(PostgresStatementTest, ExecuteManyTimestampTzError) {
   // connection is left usable.
   adbc_validation::Handle<struct ArrowSchema> schema;
   adbc_validation::Handle<struct ArrowArray> batch;
-  ArrowSchemaInit(&schema.value);
-  ASSERT_THAT(ArrowSchemaSetTypeStruct(&schema.value, 1), adbc_validation::IsOkErrno());
-  ASSERT_THAT(ArrowSchemaSetTypeDateTime(schema->children[0], NANOARROW_TYPE_TIMESTAMP,
-                                         NANOARROW_TIME_UNIT_MICRO, "UTC"),
-              adbc_validation::IsOkErrno());
-  ASSERT_THAT(ArrowSchemaSetName(schema->children[0], "ts"),
-              adbc_validation::IsOkErrno());
-  ASSERT_THAT(
-      (adbc_validation::MakeBatch<int64_t>(
-          &schema.value, &batch.value, static_cast<struct ArrowError*>(nullptr), {0, 0})),
-      adbc_validation::IsOkErrno());
+  ASSERT_NO_FATAL_FAILURE(MakeTimestampTzBatch(&schema.value, &batch.value, {0, 0}));
   ASSERT_THAT(
       AdbcStatementSetSqlQuery(
           &statement, "INSERT INTO test_execute_many_tz_error VALUES ($1)", &error),
@@ -5762,6 +5773,249 @@ TEST_F(PostgresStatementTest, ExecuteManyTimestampTzError) {
   ASSERT_NO_FATAL_FAILURE(
       CountRows(&statement, "test_execute_many_tz_error", &rows, &error));
   ASSERT_EQ("0", rows);
+}
+
+// After a failed bind that set the time zone to UTC, check that the session's
+// America/New_York is back and that the connection commits again. A
+// transaction left open would keep an insert from committing, which only
+// another connection can see.
+void ExpectBindUndone(struct AdbcDatabase* database, struct AdbcStatement* statement,
+                      const std::string& table, struct AdbcError* error) {
+  std::string time_zone;
+  ASSERT_NO_FATAL_FAILURE(QueryScalar(
+      statement, "SELECT CAST(current_setting('TimeZone') AS TEXT)", &time_zone, error));
+  ASSERT_EQ("America/New_York", time_zone);
+  const std::string insert = "INSERT INTO " + table + " VALUES (1)";
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(statement, {insert.c_str()}, error));
+  adbc_validation::Handle<struct AdbcConnection> other;
+  adbc_validation::Handle<struct AdbcStatement> other_statement;
+  ASSERT_THAT(AdbcConnectionNew(&other.value, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcConnectionInit(&other.value, database, error), IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementNew(&other.value, &other_statement.value, error),
+              IsOkStatus(error));
+  std::string rows;
+  ASSERT_NO_FATAL_FAILURE(CountRows(&other_statement.value, table, &rows, error));
+  ASSERT_EQ("1", rows);
+}
+
+TEST_F(PostgresStatementTest, PrepareErrorRestoresTimeZone) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+
+  // Binding a TIMESTAMPTZ under autocommit begins a transaction and sets the
+  // time zone to UTC before the query is prepared. When the prepare fails, both
+  // must be undone. MotherDuck's ROLLBACK leaves the time zone alone, so this
+  // also checks that the driver sets it back itself. Without a result stream
+  // the driver runs every row up front (ExecuteAll); with one it prepares in
+  // Initialize().
+  for (bool with_stream : {false, true}) {
+    SCOPED_TRACE(with_stream ? "with a result stream" : "without a result stream");
+    ASSERT_NO_FATAL_FAILURE(ExecuteEach(&statement,
+                                        {"DROP TABLE IF EXISTS test_prepare_error_tz",
+                                         "CREATE TABLE test_prepare_error_tz (x INT)",
+                                         "SET TimeZone = 'America/New_York'"},
+                                        &error));
+    adbc_validation::Handle<struct ArrowSchema> schema;
+    adbc_validation::Handle<struct ArrowArray> batch;
+    ASSERT_NO_FATAL_FAILURE(MakeTimestampTzBatch(&schema.value, &batch.value, {0}));
+    ASSERT_THAT(AdbcStatementSetSqlQuery(
+                    &statement,
+                    "SELECT * FROM test_prepare_error_tz_missing WHERE ts = $1", &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+                IsOkStatus(&error));
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(
+        AdbcStatementExecuteQuery(
+            &statement, with_stream ? &reader.stream.value : nullptr, nullptr, &error),
+        ::testing::Not(IsOkStatus(&error)));
+    error.release(&error);
+
+    ASSERT_NO_FATAL_FAILURE(
+        ExpectBindUndone(&database, &statement, "test_prepare_error_tz", &error));
+  }
+}
+
+TEST_F(PostgresStatementTest, DecodeErrorRestoresTimeZone) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(
+      &statement,
+      {"DROP TABLE IF EXISTS test_decode_error_tz",
+       "CREATE TABLE test_decode_error_tz (x INT)", "SET TimeZone = 'America/New_York'"},
+      &error));
+
+  // The query runs, but the interval overflows nanoseconds, so reading the
+  // result fails. That must undo the bind like an error from the server.
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ASSERT_NO_FATAL_FAILURE(MakeTimestampTzBatch(&schema.value, &batch.value, {0}));
+  ASSERT_THAT(AdbcStatementSetSqlQuery(&statement,
+                                       "SELECT INTERVAL '3000000 hours' AS v "
+                                       "WHERE CAST($1 AS TIMESTAMPTZ) IS NOT NULL",
+                                       &error),
+              IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementBind(&statement, &batch.value, &schema.value, &error),
+              IsOkStatus(&error));
+  {
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                          &reader.rows_affected, &error),
+                IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NE(0, reader.MaybeNext());
+    // The failure reaches the error detail, and a retry fails again instead of
+    // ending the stream, though the bind was rolled back.
+    AdbcStatusCode code = ADBC_STATUS_OK;
+    const struct AdbcError* detail =
+        AdbcErrorFromArrayStream(&reader.stream.value, &code);
+    ASSERT_NE(nullptr, detail);
+    ASSERT_NE(ADBC_STATUS_OK, code);
+    ASSERT_NE(nullptr, detail->message);
+    ASSERT_NE(0, reader.MaybeNext());
+  }
+
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectBindUndone(&database, &statement, "test_decode_error_tz", &error));
+}
+
+// Run a two-row TIMESTAMPTZ bind with a result stream under autocommit and
+// read the first batch, leaving the bind stream running. The bind has begun a
+// transaction and set the time zone to UTC.
+void StartTimestampTzStream(struct AdbcStatement* statement, const char* table,
+                            adbc_validation::StreamReader* reader,
+                            struct AdbcError* error) {
+  const std::string drop = std::string("DROP TABLE IF EXISTS ") + table;
+  const std::string create = std::string("CREATE TABLE ") + table + " (x INT)";
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(
+      statement, {drop.c_str(), create.c_str(), "SET TimeZone = 'America/New_York'"},
+      error));
+  adbc_validation::Handle<struct ArrowSchema> schema;
+  adbc_validation::Handle<struct ArrowArray> batch;
+  ASSERT_NO_FATAL_FAILURE(MakeTimestampTzBatch(&schema.value, &batch.value, {0, 1}));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(statement, "SELECT CAST($1 AS TIMESTAMPTZ) AS v", error),
+      IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementBind(statement, &batch.value, &schema.value, error),
+              IsOkStatus(error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(statement, &reader->stream.value,
+                                        &reader->rows_affected, error),
+              IsOkStatus(error));
+  ASSERT_NO_FATAL_FAILURE(reader->GetSchema());
+  ASSERT_NO_FATAL_FAILURE(reader->Next());
+  ASSERT_EQ(reader->array->length, 1);
+}
+
+TEST_F(PostgresStatementTest, ReleaseEarlyRestoresTimeZone) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  {
+    adbc_validation::StreamReader reader;
+    ASSERT_NO_FATAL_FAILURE(
+        StartTimestampTzStream(&statement, "test_release_early_tz", &reader, &error));
+    // The reader is released with the second bind row still to run.
+  }
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectBindUndone(&database, &statement, "test_release_early_tz", &error));
+}
+
+TEST_F(PostgresStatementTest, CancelMidStreamRestoresTimeZone) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  {
+    adbc_validation::StreamReader reader;
+    ASSERT_NO_FATAL_FAILURE(
+        StartTimestampTzStream(&statement, "test_cancel_mid_tz", &reader, &error));
+    ASSERT_THAT(AdbcStatementCancel(&statement, &error), IsOkStatus(&error));
+    ASSERT_EQ(ECANCELED, reader.MaybeNext());
+  }
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectBindUndone(&database, &statement, "test_cancel_mid_tz", &error));
+}
+
+// When the bind stream fails after the first batch was returned, the bind is
+// rolled back. The failure has to reach the error detail and survive a retry,
+// not turn into a clean end of stream.
+TEST_F(PostgresStatementTest, BindErrorMidStreamFailsStickily) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(ExecuteEach(
+      &statement,
+      {"DROP TABLE IF EXISTS test_bind_error_mid",
+       "CREATE TABLE test_bind_error_mid (x INT)", "SET TimeZone = 'America/New_York'"},
+      &error));
+  ASSERT_THAT(
+      AdbcStatementSetSqlQuery(&statement, "SELECT CAST($1 AS TIMESTAMPTZ) AS v", &error),
+      IsOkStatus(&error));
+  struct ArrowArrayStream stream = {};
+  ASSERT_NO_FATAL_FAILURE(FailingBindStream::Make({0}, &stream, /*timestamptz=*/true));
+  ASSERT_THAT(AdbcStatementBindStream(&statement, &stream, &error), IsOkStatus(&error));
+  {
+    adbc_validation::StreamReader reader;
+    ASSERT_THAT(AdbcStatementExecuteQuery(&statement, &reader.stream.value,
+                                          &reader.rows_affected, &error),
+                IsOkStatus(&error));
+    ASSERT_NO_FATAL_FAILURE(reader.GetSchema());
+    ASSERT_NO_FATAL_FAILURE(reader.Next());
+    ASSERT_EQ(reader.array->length, 1);
+
+    const int code = reader.MaybeNext();
+    ASSERT_NE(0, code);
+    AdbcStatusCode status = ADBC_STATUS_OK;
+    const struct AdbcError* detail =
+        AdbcErrorFromArrayStream(&reader.stream.value, &status);
+    ASSERT_NE(nullptr, detail);
+    ASSERT_NE(ADBC_STATUS_OK, status);
+    ASSERT_THAT(detail->message, ::testing::HasSubstr("the bind stream failed"));
+    ASSERT_EQ(code, reader.MaybeNext());
+    ASSERT_NE(ADBC_STATUS_OK, status);
+  }
+  ASSERT_NO_FATAL_FAILURE(
+      ExpectBindUndone(&database, &statement, "test_bind_error_mid", &error));
+}
+
+TEST_F(PostgresStatementTest, BindStreamErrorRestoresTimeZoneWithoutAutocommit) {
+  ASSERT_THAT(AdbcStatementNew(&connection, &statement, &error), IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(
+      ExecuteEach(&statement,
+                  {"DROP TABLE IF EXISTS test_bind_error_tz_txn",
+                   "CREATE TABLE test_bind_error_tz_txn (ts TIMESTAMPTZ)"},
+                  &error));
+  ASSERT_THAT(AdbcConnectionSetOption(&connection, ADBC_CONNECTION_OPTION_AUTOCOMMIT,
+                                      ADBC_OPTION_VALUE_DISABLED, &error),
+              IsOkStatus(&error));
+  ASSERT_NO_FATAL_FAILURE(
+      ExecuteEach(&statement, {"SET TimeZone = 'America/New_York'"}, &error));
+
+  // With autocommit off the transaction is the user's. When binding fails in
+  // the driver (here the bind stream), the time zone must be restored and the
+  // transaction left open and usable.
+  ASSERT_THAT(AdbcStatementSetSqlQuery(
+                  &statement, "INSERT INTO test_bind_error_tz_txn VALUES ($1)", &error),
+              IsOkStatus(&error));
+  struct ArrowArrayStream stream = {};
+  ASSERT_NO_FATAL_FAILURE(FailingBindStream::Make({0}, &stream, /*timestamptz=*/true));
+  ASSERT_THAT(AdbcStatementBindStream(&statement, &stream, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementExecuteQuery(&statement, nullptr, nullptr, &error),
+              ::testing::Not(IsOkStatus(&error)));
+  ASSERT_THAT(error.message, ::testing::HasSubstr("the bind stream failed"));
+  error.release(&error);
+
+  std::string time_zone;
+  ASSERT_NO_FATAL_FAILURE(QueryScalar(&statement,
+                                      "SELECT CAST(current_setting('TimeZone') AS TEXT)",
+                                      &time_zone, &error));
+  ASSERT_EQ("America/New_York", time_zone);
+  ASSERT_THAT(AdbcConnectionCommit(&connection, &error), IsOkStatus(&error));
+
+  // The stream sent its row before it failed. Rolling the user's transaction
+  // back would drop it, and Commit succeeds with nothing open, so count the
+  // row from another connection.
+  adbc_validation::Handle<struct AdbcConnection> other;
+  adbc_validation::Handle<struct AdbcStatement> other_statement;
+  ASSERT_THAT(AdbcConnectionNew(&other.value, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcConnectionInit(&other.value, &database, &error), IsOkStatus(&error));
+  ASSERT_THAT(AdbcStatementNew(&other.value, &other_statement.value, &error),
+              IsOkStatus(&error));
+  std::string rows;
+  ASSERT_NO_FATAL_FAILURE(
+      CountRows(&other_statement.value, "test_bind_error_tz_txn", &rows, &error));
+  ASSERT_EQ("1", rows);
 }
 
 TEST_F(PostgresStatementTest, IngestReplaceKeepsTableOnBadColumnName) {

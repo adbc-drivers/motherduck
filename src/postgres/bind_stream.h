@@ -160,9 +160,11 @@ struct BindStream {
       // tz-aware timestamps require special handling to set the timezone to UTC
       // prior to sending over the binary protocol; must be reset after execute
       if (!has_tz_field && type.type_id() == PostgresTypeId::kTimestamptz) {
-        UNWRAP_STATUS(SetDatabaseTimezoneUTC(pg_conn, autocommit));
+        // Set these before SetDatabaseTimezoneUTC, which may begin a transaction
+        // and then fail, so that Abort() still undoes it.
         has_tz_field = true;
         this->autocommit = autocommit;
+        UNWRAP_STATUS(SetDatabaseTimezoneUTC(pg_conn, autocommit));
       }
 
       std::unique_ptr<PostgresCopyFieldWriter> writer;
@@ -311,21 +313,34 @@ struct BindStream {
     return Status::Ok();
   }
 
-  // Undo SetDatabaseTimezoneUTC after a failure. Under autocommit, rolling
-  // back the transaction it began also restores the time zone. Otherwise the
-  // user's transaction has failed, and rolling it back restores it.
+  // Undo SetDatabaseTimezoneUTC after a failure. Under autocommit, roll back
+  // the transaction it began, then restore the time zone: PostgreSQL's ROLLBACK
+  // restores it, but MotherDuck's doesn't. Otherwise the transaction is the
+  // user's, so leave it open. If it has failed, the server rejects the SET until
+  // the user rolls back; on MotherDuck the session then stays in UTC, since
+  // the rollback doesn't restore it. If it hasn't (the error came from the
+  // driver, not the server), restore the time zone here, as Cleanup() does.
   void Abort(PGconn* pg_conn) {
-    if (has_tz_field && autocommit) {
+    if (!has_tz_field) return;
+    // The failure that got us here is the error worth reporting, so ignore
+    // errors from undoing it.
+    if (autocommit) {
       PqResultHelper rollback(pg_conn, "ROLLBACK");
-      // The failure that got us here is the error worth reporting.
       (void)rollback.Execute();
     }
+    if (!tz_setting.empty() && PQtransactionStatus(pg_conn) != PQTRANS_INERROR) {
+      (void)RestoreTimezone(pg_conn);
+    }
+  }
+
+  Status RestoreTimezone(PGconn* pg_conn) {
+    PqResultHelper reset(pg_conn, "SET TIME ZONE '" + tz_setting + "'");
+    return reset.Execute();
   }
 
   Status Cleanup(PGconn* pg_conn) {
     if (has_tz_field) {
-      PqResultHelper reset(pg_conn, "SET TIME ZONE '" + tz_setting + "'");
-      UNWRAP_STATUS(reset.Execute());
+      UNWRAP_STATUS(RestoreTimezone(pg_conn));
 
       if (autocommit) {
         // SetDatabaseTimezoneUTC will start a transaction if autocommit is

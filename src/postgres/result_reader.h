@@ -99,6 +99,12 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
 
   Status Initialize(int64_t* affected_rows);
 
+  // Check that a result has the columns and types of the first result, which
+  // the schema and field readers were built from. bind_row is the index of the
+  // bind row that produced the result, for the error message.
+  static Status CheckResultMatches(const PqResultHelper& result,
+                                   const std::vector<Oid>& field_types, int64_t bind_row);
+
  protected:
   std::shared_ptr<PostgresConnection> connection_;
   PGconn* conn_;
@@ -106,6 +112,13 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   std::unique_ptr<BindStream> bind_stream_;
   std::shared_ptr<PostgresTypeResolver> type_resolver_;
   std::vector<std::unique_ptr<PostgresCopyFieldReader>> field_readers_;
+  // The column types of the first result
+  std::vector<Oid> field_types_;
+  // The 0-based index of the bind row last executed, for error messages
+  int64_t bind_row_ = -1;
+  // The errno of the failure that aborted the bind, which GetNext keeps
+  // returning. Zero until then.
+  int bind_failed_errno_ = 0;
   nanoarrow::UniqueSchema schema_;
   bool autocommit_;
   std::string vendor_name_;
@@ -131,6 +144,9 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
         bind_stream_(std::move(other->bind_stream_)),
         type_resolver_(std::move(other->type_resolver_)),
         field_readers_(std::move(other->field_readers_)),
+        field_types_(std::move(other->field_types_)),
+        bind_row_(other->bind_row_),
+        bind_failed_errno_(other->bind_failed_errno_),
         schema_(std::move(other->schema_)),
         batch_size_hint_bytes_(other->batch_size_hint_bytes_),
         next_row_(other->next_row_),
@@ -149,6 +165,26 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   }
 
   Status BindNextAndExecute(int64_t* affected_rows);
+
+  // Decode the current result into out. Returns an errno code, with the
+  // message in na_error_.
+  int ReadResult(struct ArrowArray* out);
+
+  // Undo what the bind stream set up (BindStream::Abort()) and drop it, so the
+  // transaction it may have begun isn't left open and a retry doesn't run more
+  // rows.
+  void AbortBind() {
+    if (bind_stream_) {
+      bind_stream_->Abort(conn_);
+      bind_stream_.reset();
+    }
+  }
+
+  // AbortBind() if status is an error. Returns status.
+  Status AbortBindOnError(Status status) {
+    if (!status.ok()) AbortBind();
+    return status;
+  }
   virtual Status ExecuteAll(int64_t* affected_rows);
   Status OpenRowStream();
   // A command tag is success. A subclass may also accept a tuples result.
@@ -158,6 +194,8 @@ class PqResultArrayReader : public std::enable_shared_from_this<PqResultArrayRea
   Status EndOwnedTransaction(bool commit);
   int GetNextStream(struct ArrowArray* out);
   int Fail(const Status& status);
+  // Abort the bind and fail with status, now and on every later GetNext().
+  int FailBind(const Status& status);
   int FailArrow(int code);
   // Record a client-side read failure so Close rolls the script back.
   int FailRead(int code);
