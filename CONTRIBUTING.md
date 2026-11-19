@@ -221,7 +221,7 @@ When writing the pull request description:
   be a directory path relative to the repo root, e.g. `fix(src): ...` or
   `test(tests): ...`; most titles here leave it out.  Example titles:
 
-  - `feat: add adbc.motherduck.db_schema and qualify the current schema`
+  - `feat: add motherduck.db_schema and qualify the current schema`
   - `fix: strip DuckDB's statement echo from error text`
   - `fix!: return us instead of ms`
 
@@ -234,6 +234,56 @@ When writing the pull request description:
 
 Pull requests are squash-merged, so the title becomes the commit message on
 `main`.
+
+## Releasing
+
+A release is a `v*` git tag pushed to `main`. The tag starts the Custom
+Release workflow ([`script_release.yaml`](.github/workflows/script_release.yaml)),
+which tests, validates against MotherDuck, builds for linux (amd64, arm64),
+macOS (arm64) and Windows (amd64), packages, tests the packages with `dbc`, and
+creates a **draft** GitHub release with the packages attached. Nothing is public
+until you publish the draft.
+
+1. Make sure `main` is green, then run the validation suite against MotherDuck
+   locally (`pixi run validate`, with `MOTHERDUCK_TOKEN` set).
+2. Optionally rehearse the workflow: run **Custom Release** manually from the
+   Actions tab on `main`
+   (`gh workflow run "Custom Release" --ref main`). A manual run does everything
+   except create the release.
+3. Tag and push. Use SemVer, with a pre-release suffix for alphas and betas
+   (`v0.1.0-alpha.1`, not `v0.1.0a1`):
+
+   ```sh
+   git checkout main && git pull
+   git tag v0.1.0-alpha.1
+   git push origin v0.1.0-alpha.1
+   ```
+
+4. Wait for the workflow to finish, then open the draft release and check that
+   it has the four platform packages, `manifest.yaml`, and the docs page.
+5. Review the generated notes, and edit them if needed. The tooling lists the
+   commits since the previous *stable* tag, ignoring pre-release tags, so until
+   the first stable release that is the whole history, including the upstream
+   PostgreSQL driver's. For those releases write the notes by hand, covering the
+   changes since the first MotherDuck commit, and replace the generated ones.
+   Then mark pre-releases and publish:
+
+   ```sh
+   gh release edit v0.1.0-alpha.1 \
+     --title "ADBC Driver for MotherDuck v0.1.0-alpha.1" \
+     --notes-file notes.md \
+     --prerelease
+   gh release edit v0.1.0-alpha.1 --draft=false
+   ```
+
+   Leave out `--title` and `--notes-file` to keep the generated ones, and drop
+   `--prerelease` for a stable release. The tooling never sets the pre-release
+   flag itself, and without it GitHub shows an alpha as the latest release.
+
+If the workflow fails, nothing is published. Fix the problem, delete the tag
+(`git tag -d <tag> && git push origin :refs/tags/<tag>`), and tag again, or move
+to the next pre-release number. Once a stable tag such as `v0.1.0` exists, the
+generated notes for later releases cover only the new commits.
 
 ## License
 
