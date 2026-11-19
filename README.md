@@ -111,9 +111,10 @@ is more likely to be logged than the URI's password. An option set on the
 database takes precedence over the URI's. Any other query parameter, including
 the [PostgreSQL settings](#postgresql-settings-are-not-supported) such as
 `sslmode`, is rejected with `INVALID_ARGUMENT`, and the driver never passes the
-query to libpq. The query starts at the first `?` after the user info (the part
-before the `@`), so a `?` in a password doesn't start it, though
-percent-encoding it is safer. A port that isn't a number is rejected.
+query to libpq. Write a `?` in a password as `%3F`. An unencoded one is read as part of the
+password only when the text before it can't be a host and port, as in
+`user:pass?word@host`; in `host?motherduck.session_name=a@b` the `?` starts the
+query, so the `@` stays in the option's value. A port that isn't a number is rejected.
 
 A `motherduck://` URI passed in place of a driver name, as in
 `dbapi.connect("motherduck:///my_db")`, lets an ADBC driver manager load this

@@ -769,6 +769,43 @@ TEST_F(MotherDuckConnectParamsTest, QuestionMarkInPassword) {
   error_ = {};
 }
 
+// A query value with an '@' must not turn the text before the '?' into user info,
+// which would send the token to the host after the '@'.
+TEST_F(MotherDuckConnectParamsTest, AtSignInQueryValue) {
+  SetOption(ADBC_OPTION_PASSWORD, "");
+  const char* kSession =
+      "--return_pg_command_tags=on --attach_mode=single "
+      "--session_name=analyst@other.example";
+  for (const char* uri :
+       {"motherduck://expected.example?motherduck.session_name=analyst@other.example",
+        "motherduck://"
+        "expected.example:5432?motherduck.session_name=analyst@other.example",
+        "motherduck://expected.example/db?motherduck.session_name=analyst@other.example",
+        // A password that could be a port is read as one.
+        "motherduck://"
+        "expected.example:1234?motherduck.session_name=analyst@other.example"}) {
+    SCOPED_TRACE(uri);
+    SetOption("uri", uri);
+    EXPECT_THAT(Values("host"), ::testing::ElementsAre("expected.example"));
+    EXPECT_THAT(Values("options"), ::testing::ElementsAre(kSession));
+    // Neither a user from the query nor the default one changes.
+    EXPECT_THAT(Values("user"), ::testing::ElementsAre("postgres"));
+  }
+  SetOption("uri", "motherduck://[::1]?motherduck.session_name=analyst@other.example");
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("::1"));
+  EXPECT_THAT(Values("options"), ::testing::ElementsAre(kSession));
+  // Ambiguous input, where the text before the '?' could be a host and port, is a
+  // query; at worst it fails, and doesn't send the token anywhere else.
+  for (const char* uri :
+       {"motherduck://tok?en@host/db", "motherduck://alice:1234?x@host/db",
+        "motherduck://alice?x=y@host/db"}) {
+    SCOPED_TRACE(uri);
+    EXPECT_EQ(database_.SetOption("uri", uri, &error_), ADBC_STATUS_INVALID_ARGUMENT);
+    if (error_.release) error_.release(&error_);
+    error_ = {};
+  }
+}
+
 TEST_F(MotherDuckConnectParamsTest, Ports) {
   for (const char* uri : {"motherduck://host:5432/db", "motherduck://host/db",
                           "motherduck://h1:1,h2:2/db", "motherduck://h1,h2:2/db"}) {
