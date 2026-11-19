@@ -91,7 +91,9 @@ motherduck://[USER[:TOKEN]@][HOST[:PORT]]/DATABASE[?PARAMETER=VALUE&...]
 Two short forms are accepted: `md://`, with the same syntax, and DuckDB's
 `md:[DATABASE][?PARAMETER=VALUE&...]`, which has no host, so set
 `motherduck.region` too. `md:` alone is the workspace, the same as
-`md%3A` as the database. The driver accepts no other scheme, and the scheme is
+`md%3A` as the database. The `md:` form's database name can't contain `/` or
+`@`, so DuckDB's `md:<TOKEN>@<DATABASE>` is rejected; use `MOTHERDUCK_TOKEN` or
+the `password` option. The driver accepts no other scheme, and the scheme is
 lowercase.
 
 Components:
@@ -111,7 +113,13 @@ Percent-encode values; an empty value is unset. Every option except
 `motherduck.token` can be set this way (a token doesn't belong in a query, which
 is more likely to be logged than the URI's password), and an option set on the
 database takes precedence over the URI's. Any other query parameter, including
-the PostgreSQL settings below, is rejected with `INVALID_ARGUMENT`.
+the PostgreSQL settings below, is rejected with `INVALID_ARGUMENT`. Write a `?` in
+a password as `%3F`. An unencoded one is read as part of the password only when
+the text before it can't be a host and port, as in `user:pass?word@host`; in
+`host?motherduck.session_name=a@b` the `?` starts the query, so the `@` stays in
+the option's value. A port that
+isn't a number is rejected, so a token written where a port goes, as in
+`user:TOKEN/db` with no `@`, never reaches an error message.
 
 ### Authentication
 

@@ -656,17 +656,43 @@ TEST_F(PostgresDatabaseTest, MotherDuckDefaultsInit) {
               IsOkStatus(&error));
 }
 
+// The test URI with a bad password in its authority, which takes precedence over
+// MOTHERDUCK_TOKEN. The URI may have no user. False for a URI with no authority,
+// such as md:my_db, which can't carry a password; callers use the password option.
+static bool UriWithBadPassword(const char* uri, std::string* bad_uri) {
+  *bad_uri = uri;
+  size_t scheme_end = bad_uri->find("://");
+  if (scheme_end == std::string::npos) return false;
+  size_t authority = scheme_end + 3;
+  size_t end = bad_uri->find_first_of("/?", authority);
+  size_t at = bad_uri->find('@', authority);
+  if (at != std::string::npos && at < end) {
+    bad_uri->insert(at, ":invalid");
+  } else {
+    bad_uri->insert(authority, "postgres:invalid@");
+  }
+  return true;
+}
+
 TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
   const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
-  // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
-  std::string bad_uri = uri;
-  bad_uri.insert(bad_uri.find('@'), ":invalid");
-
+  // A bad password, in the URI or the password option, takes precedence over
+  // MOTHERDUCK_TOKEN.
+  std::string bad_uri;
   adbc_validation::Handle<struct AdbcDatabase> database;
   ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
-  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
-              IsOkStatus(&error));
+  if (UriWithBadPassword(uri, &bad_uri)) {
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
+                IsOkStatus(&error));
+  } else {
+    // A URI with no authority, such as md:my_db, can't carry a password.
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", uri, &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(
+        AdbcDatabaseSetOption(&database.value, ADBC_OPTION_PASSWORD, "invalid", &error),
+        IsOkStatus(&error));
+  }
   ASSERT_THAT(AdbcDatabaseInit(&database.value, &error),
               IsStatus(ADBC_STATUS_IO, &error));
 }
@@ -722,11 +748,12 @@ TEST_F(PostgresDatabaseTest, PasswordOption) {
   ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
   const char* token = std::getenv("MOTHERDUCK_TOKEN");
   ASSERT_NE(token, nullptr) << "Must provide env var MOTHERDUCK_TOKEN";
-  std::string bad_uri = uri;
-  bad_uri.insert(bad_uri.find('@'), ":invalid");
+  std::string bad_uri;
+  const bool has_authority = UriWithBadPassword(uri, &bad_uri);
 
-  // The option takes precedence over a password in the URI.
-  {
+  // The option takes precedence over a password in the URI, which a URI with no
+  // authority, such as md:my_db, can't carry.
+  if (has_authority) {
     adbc_validation::Handle<struct AdbcDatabase> database;
     ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
     ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
@@ -838,22 +865,6 @@ TEST_F(PostgresDatabaseTest, ApplicationNameAndConnectTimeoutOptions) {
   ASSERT_THAT(AdbcConnectionNew(&connection.value, &error), IsOkStatus(&error));
   ASSERT_THAT(AdbcConnectionInit(&connection.value, &database.value, &error),
               IsOkStatus(&error));
-}
-
-// Percent-encodes everything but unreserved characters and '/', for a URI component.
-static std::string PercentEncode(const std::string& text) {
-  static const char kHex[] = "0123456789ABCDEF";
-  std::string encoded;
-  for (unsigned char c : text) {
-    if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~' || c == '/') {
-      encoded += static_cast<char>(c);
-    } else {
-      encoded += '%';
-      encoded += kHex[c >> 4];
-      encoded += kHex[c & 0xF];
-    }
-  }
-  return encoded;
 }
 
 // The test URI without its query, and the root certificates its

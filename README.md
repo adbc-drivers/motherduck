@@ -98,7 +98,9 @@ The URI is a `motherduck://` URI:
 `motherduck://[user[:token]@][host][:port]/database[?parameters]`. Two short
 forms are accepted: `md://` with the same syntax, and DuckDB's
 `md:[database][?parameters]`, which has no host and so needs
-`motherduck.region`; `md:` alone is the workspace. The
+`motherduck.region`; `md:` alone is the workspace. The `md:` form's database
+name can't contain `/` or `@`, so DuckDB's `md:<token>@<database>` is rejected;
+put the token in `MOTHERDUCK_TOKEN` or the `password` option. The
 driver accepts no other scheme, and the scheme is lowercase.
 
 The query takes the `motherduck.*` database options by name, such as
@@ -109,10 +111,14 @@ is more likely to be logged than the URI's password. An option set on the
 database takes precedence over the URI's. Any other query parameter, including
 the [PostgreSQL settings](#postgresql-settings-are-not-supported) such as
 `sslmode`, is rejected with `INVALID_ARGUMENT`, and the driver never passes the
-query to libpq. Passed
-in place of a driver name, as in `dbapi.connect("motherduck:///my_db")`, a
-`motherduck://` URI lets an ADBC driver manager load this driver from its
-scheme. The `md` forms don't, because the scheme has to match the driver's
+query to libpq. Write a `?` in a password as `%3F`. An unencoded one is read as part of the
+password only when the text before it can't be a host and port, as in
+`user:pass?word@host`; in `host?motherduck.session_name=a@b` the `?` starts the
+query, so the `@` stays in the option's value. A port that isn't a number is rejected.
+
+A `motherduck://` URI passed in place of a driver name, as in
+`dbapi.connect("motherduck:///my_db")`, lets an ADBC driver manager load this
+driver from its scheme. The `md` forms don't, because the scheme has to match the driver's
 name, so name the driver as well: `driver="motherduck"`.
 See [Options](#options) for everything else you can set, including how the
 driver finds the token.
