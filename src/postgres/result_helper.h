@@ -24,12 +24,15 @@
 
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -51,9 +54,15 @@ struct PqRecord {
   const bool is_null;
 
   std::optional<double> ParseDouble() const {
+    if (is_null || len == 0) {
+      return std::nullopt;
+    }
+    // libpq NUL-terminates every value, so strtod can't run past the field; still
+    // require it to consume the whole field so trailing garbage is rejected.
     char* end;
+    errno = 0;
     double result = std::strtod(data, &end);
-    if (errno != 0 || end == data) {
+    if (errno != 0 || end != data + len) {
       return std::nullopt;
     }
     return result;
@@ -66,24 +75,102 @@ struct PqRecord {
     if (result.ec == std::errc() && result.ptr == last) {
       return value;
     } else {
-      return Status::Internal("Can't parse '", data, "' as integer");
+      return Status::IO("Can't parse '", std::string_view(data, len), "' as integer");
     }
   }
 
+  /// \brief Parse a one-dimensional PostgreSQL text array, e.g. {a,"b,c"}.
+  ///
+  /// Follows array_out's element syntax: elements are separated by commas,
+  /// unquoted elements have surrounding whitespace trimmed, and double-quoted
+  /// elements may contain any character, with backslash escaping the next one.
+  /// An unquoted NULL element is returned as the text "NULL", since callers
+  /// (catalog queries over non-null names) have no way to represent a NULL.
   Result<std::vector<std::string>> ParseTextArray() const {
-    std::string text_array(data, len);
-    text_array.erase(0, 1);
-    text_array.erase(text_array.size() - 1);
+    auto malformed = [this](const char* reason) {
+      return Status::IO("Can't parse '", std::string_view(data, len),
+                        "' as text array: ", reason);
+    };
+    auto is_space = [](char c) {
+      return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+    };
 
-    std::vector<std::string> elements;
-    std::stringstream ss(std::move(text_array));
-    std::string tmp;
-
-    while (getline(ss, tmp, ',')) {
-      elements.push_back(std::move(tmp));
+    if (is_null) {
+      return malformed("value is NULL");
+    }
+    if (len < 2 || data[0] != '{' || data[len - 1] != '}') {
+      return malformed("expected '{' and '}'");
     }
 
-    return elements;
+    const char* pos = data + 1;
+    const char* const end = data + len - 1;
+    std::vector<std::string> elements;
+
+    auto skip_space = [&]() {
+      while (pos < end && is_space(*pos)) ++pos;
+    };
+
+    skip_space();
+    if (pos == end) {
+      return elements;
+    }
+
+    while (true) {
+      skip_space();
+      std::string element;
+      if (pos < end && *pos == '"') {
+        ++pos;
+        bool closed = false;
+        while (pos < end) {
+          char c = *pos++;
+          if (c == '"') {
+            closed = true;
+            break;
+          } else if (c == '\\') {
+            if (pos == end) break;
+            element.push_back(*pos++);
+          } else {
+            element.push_back(c);
+          }
+        }
+        if (!closed) {
+          return malformed("unterminated quoted element");
+        }
+        skip_space();
+      } else {
+        // Length of element up to its last non-whitespace or escaped character,
+        // so trailing whitespace is trimmed but escaped whitespace is kept.
+        size_t keep = 0;
+        while (pos < end && *pos != ',') {
+          char c = *pos++;
+          if (c == '"' || c == '{' || c == '}') {
+            return malformed("unexpected character in unquoted element");
+          } else if (c == '\\') {
+            if (pos == end) {
+              return malformed("trailing backslash");
+            }
+            element.push_back(*pos++);
+            keep = element.size();
+          } else {
+            element.push_back(c);
+            if (!is_space(c)) keep = element.size();
+          }
+        }
+        element.resize(keep);
+        if (element.empty()) {
+          return malformed("empty unquoted element");
+        }
+      }
+      elements.push_back(std::move(element));
+
+      if (pos == end) {
+        return elements;
+      }
+      if (*pos != ',') {
+        return malformed("expected ',' after element");
+      }
+      ++pos;
+    }
   }
 
   std::string_view value() { return std::string_view(data, len); }
