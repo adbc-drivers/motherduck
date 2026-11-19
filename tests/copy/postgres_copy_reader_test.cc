@@ -677,6 +677,7 @@ TEST(PostgresCopyUtilsTest, PostgresCopyReadJsonb) {
   input_type.AppendChild("col", col_type);
 
   struct ArrowError error;
+  ArrowErrorInit(&error);
   PostgresCopyStreamTester tester;
   ASSERT_EQ(tester.Init(input_type), NANOARROW_OK);
   ASSERT_EQ(tester.ReadAll(&data, &error), ENODATA) << error.message;
@@ -817,6 +818,7 @@ TEST(PostgresCopyUtilsTest, PostgresCopyReadInt2vector) {
 
   PostgresCopyStreamTester tester;
   ArrowError error;
+  ArrowErrorInit(&error);
   ASSERT_EQ(tester.Init(input_type, &error), NANOARROW_OK) << error.message;
   ASSERT_EQ(tester.ReadAll(&data), ENODATA);
   ASSERT_EQ(data.data.as_uint8 - kTestPgCopyInt2vector, sizeof(kTestPgCopyInt2vector));
@@ -1070,6 +1072,184 @@ TEST_F(PostgresCopyJsonbFieldReaderTest, ValidJsonb) {
   ASSERT_EQ(view->length, 1);
   ArrowStringView value = ArrowArrayViewGetStringUnsafe(view.get(), 0);
   ASSERT_EQ(std::string(value.data, value.size_bytes), "{}");
+}
+
+// A row whose last fixed-width field claims more bytes than remain in the
+// buffer must fail instead of reading past the end of it. Each truncation test
+// points at a valid fixture but cuts size_bytes short partway through the first
+// row, so the bytes past the cut are still owned by the test.
+
+// Fixture offset of the first field's data: header (19 bytes), field count
+// (2 bytes), field length (4 bytes)
+constexpr int64_t kFirstFieldDataOffset = 25;
+
+// Fixture offset of the low byte of the first field's length
+constexpr size_t kFirstFieldLengthLowByte = kFirstFieldDataOffset - 1;
+
+void ExpectRecordFails(const PostgresType& col_type, const uint8_t* buffer,
+                       int64_t size_bytes, const std::string& expected_message) {
+  PostgresType input_type(PostgresTypeId::kRecord);
+  input_type.AppendChild("col", col_type);
+
+  PostgresCopyStreamReader reader;
+  ASSERT_EQ(reader.Init(input_type), NANOARROW_OK);
+  ASSERT_EQ(reader.InferOutputSchema("PostgreSQL Tester", nullptr), NANOARROW_OK);
+  ASSERT_EQ(reader.InitFieldReaders(nullptr), NANOARROW_OK);
+
+  ArrowBufferView data;
+  data.data.as_uint8 = buffer;
+  data.size_bytes = size_bytes;
+
+  ArrowError error;
+  ArrowErrorInit(&error);
+  ASSERT_EQ(reader.ReadHeader(&data, &error), NANOARROW_OK) << error.message;
+  ASSERT_EQ(reader.ReadRecord(&data, &error), EINVAL);
+  ASSERT_NE(std::string(error.message).find(expected_message), std::string::npos)
+      << error.message;
+}
+
+void ExpectTruncatedRecordFails(const PostgresType& col_type, const uint8_t* buffer,
+                                int64_t size_bytes) {
+  ExpectRecordFails(col_type, buffer, size_bytes, "Unexpected end of input");
+}
+
+// Copy a fixture and overwrite the declared length of its first field (which
+// is always less than 256 in these fixtures)
+template <size_t N>
+std::vector<uint8_t> WithFirstFieldLength(const uint8_t (&fixture)[N], uint8_t length) {
+  std::vector<uint8_t> out(fixture, fixture + N);
+  EXPECT_EQ(out[kFirstFieldLengthLowByte - 3], 0);
+  EXPECT_EQ(out[kFirstFieldLengthLowByte - 2], 0);
+  EXPECT_EQ(out[kFirstFieldLengthLowByte - 1], 0);
+  out[kFirstFieldLengthLowByte] = length;
+  return out;
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedBoolean) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kBool), kTestPgCopyBoolean,
+                             kFirstFieldDataOffset);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedSmallInt) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt2), kTestPgCopySmallInt,
+                             kFirstFieldDataOffset + 1);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedInteger) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt4), kTestPgCopyInteger,
+                             kFirstFieldDataOffset + 2);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedReal) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kFloat4), kTestPgCopyReal,
+                             kFirstFieldDataOffset + 3);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedBigInt) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt8), kTestPgCopyBigInt,
+                             kFirstFieldDataOffset + 3);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedDoublePrecision) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kFloat8),
+                             kTestPgCopyDoublePrecision, kFirstFieldDataOffset + 7);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedInterval) {
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInterval), kTestPgCopyInterval,
+                             kFirstFieldDataOffset + 10);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedArrayElement) {
+  // The first array is 36 bytes; cut the last 2 bytes of its last element
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kInt4).Array(),
+                             kTestPgCopyIntegerArray, kFirstFieldDataOffset + 36 - 2);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadTruncatedNumeric) {
+  // The first numeric is 10 bytes (8-byte header + 1 digit); cut it after the
+  // header
+  ExpectTruncatedRecordFails(PostgresType(PostgresTypeId::kNumeric), kTestPgCopyNumeric,
+                             kFirstFieldDataOffset + 8);
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadNumericDeclaredLengthTooShort) {
+  // The first numeric has one digit (10 bytes). Declaring 8 bytes would make
+  // its digit come out of the next field's length.
+  auto buffer = WithFirstFieldLength(kTestPgCopyNumeric, 8);
+  ExpectRecordFails(PostgresType(PostgresTypeId::kNumeric), buffer.data(),
+                    static_cast<int64_t>(buffer.size()),
+                    "Expected numeric field with 1 digits to have 10 bytes but found "
+                    "field with 8 bytes");
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadNumericDeclaredLengthTooLong) {
+  auto buffer = WithFirstFieldLength(kTestPgCopyNumeric, 12);
+  ExpectRecordFails(PostgresType(PostgresTypeId::kNumeric), buffer.data(),
+                    static_cast<int64_t>(buffer.size()),
+                    "Expected numeric field with 1 digits to have 10 bytes but found "
+                    "field with 12 bytes");
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadNumericShorterThanHeader) {
+  auto buffer = WithFirstFieldLength(kTestPgCopyNumeric, 4);
+  ExpectRecordFails(PostgresType(PostgresTypeId::kNumeric), buffer.data(),
+                    static_cast<int64_t>(buffer.size()),
+                    "Expected numeric field with at least 8 bytes");
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadJsonbEmptyField) {
+  // A JSONB field must include its version byte
+  auto buffer = WithFirstFieldLength(kTestPgCopyJsonb, 0);
+  ExpectRecordFails(PostgresType(PostgresTypeId::kJsonb), buffer.data(),
+                    static_cast<int64_t>(buffer.size()),
+                    "Expected JSONB field with at least 1 byte");
+}
+
+TEST(PostgresCopyUtilsTest, PostgresCopyReadArrayInvalidDimensions) {
+  PostgresType input_type(PostgresTypeId::kInt4);
+  input_type = input_type.Array();
+  PostgresCopyArrayFieldReader reader;
+  reader.Init(input_type);
+  reader.InitChild(std::make_unique<PostgresCopyNetworkEndianFieldReader<int32_t>>());
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_EQ(ArrowSchemaInitFromType(schema.get(), NANOARROW_TYPE_LIST), NANOARROW_OK);
+  ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT32), NANOARROW_OK);
+  ASSERT_EQ(reader.InitSchema(schema.get()), NANOARROW_OK);
+
+  // n_dim, flags, element oid, then (dim_size, lower_bound) pairs
+  auto be32 = [](std::vector<uint8_t>* v, uint32_t x) {
+    for (int shift = 24; shift >= 0; shift -= 8) v->push_back((x >> shift) & 0xff);
+  };
+
+  // Three dimensions of INT32_MAX multiply past INT64_MAX; negative dim_size
+  for (std::vector<int32_t> dims : {std::vector<int32_t>{INT32_MAX, INT32_MAX, INT32_MAX},
+                                    std::vector<int32_t>{-1}}) {
+    nanoarrow::UniqueArray array;
+    ASSERT_EQ(ArrowArrayInitFromSchema(array.get(), schema.get(), nullptr), NANOARROW_OK);
+    ASSERT_EQ(ArrowArrayStartAppending(array.get()), NANOARROW_OK);
+    ASSERT_EQ(reader.InitArray(array.get()), NANOARROW_OK);
+
+    std::vector<uint8_t> buf;
+    be32(&buf, static_cast<uint32_t>(dims.size()));
+    be32(&buf, 0);
+    be32(&buf, 23);
+    for (int32_t d : dims) {
+      be32(&buf, static_cast<uint32_t>(d));
+      be32(&buf, 1);
+    }
+
+    ArrowBufferView data;
+    data.data.as_uint8 = buf.data();
+    data.size_bytes = buf.size();
+    ArrowError error;
+    ASSERT_EQ(reader.Read(&data, static_cast<int32_t>(buf.size()), array.get(), &error),
+              EINVAL);
+    ASSERT_NE(std::string(error.message).find("Invalid array dimension"),
+              std::string::npos)
+        << error.message;
+  }
 }
 
 // N.B. unfortunately testing with NUMERIC is difficult since we can't add all
