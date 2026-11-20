@@ -50,6 +50,10 @@ lives in `src/motherduck/`, mostly as subclasses of the upstream classes:
   libpq, which can't read them itself.
 - `motherduck_factory`: the subclasses `postgresql.cc` creates.
 - `motherduck.cc`: the `AdbcDriverMotherduckInit` entry point.
+- `auth/`: browser login. `login` runs the device flow, the MotherDuck API
+  calls and opening the browser; `token_cache` keeps the token in memory and in
+  the shared credentials file, and serializes logins within the process and
+  across processes; `http_client` and `json` wrap cpp-httplib and yyjson.
 
 The upstream files still differ from Apache's in these ways:
 

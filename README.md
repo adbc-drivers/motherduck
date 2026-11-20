@@ -262,6 +262,69 @@ cases:
 Setting both is an error. An empty `tls_verify` unsets it, like the other
 options.
 
+## Browser login
+
+`motherduck.auth_type` chooses how the driver gets the MotherDuck token it
+sends as the password: `token` (the default) takes it as described under
+[Options](#options), and `browser` logs in through the browser, so
+organizations that enforce SSO get their identity provider's login page. With
+`browser`, set no token (no `password` or `motherduck.token` option, and no
+password in the URI; `MOTHERDUCK_TOKEN` is ignored). The URI may leave out the
+host and the region, as in `md:my_db?motherduck.auth_type=browser`.
+
+`AdbcDatabaseInit` logs in if needed: it prints a URL and code to stderr,
+opens the browser, and blocks until the login is approved in the browser, for
+at most `motherduck.login_timeout`. It doesn't open a browser on Linux without
+`DISPLAY` or `WAYLAND_DISPLAY`; open the printed URL on any device instead.
+Like the MotherDuck DuckDB extension's login, it doesn't use an HTTP proxy.
+
+- The login gives a short-lived MotherDuck token, valid for 24 hours; after
+  that, the next connection logs in again.
+- The token is saved to `~/.motherduck/credentials.json` (or
+  `$MOTHERDUCK_HOME/credentials.json`, which must be absolute), readable only
+  by the user, and a saved token is used without opening a browser. The driver
+  reads and writes only the file's top-level `motherduck_token` (in a
+  version 1 file) and keeps everything else in it, such as other tools' saved
+  profiles; a rejected token is removed from the file, not the whole file. The
+  driver refuses to use a credentials directory that other users can write to.
+- Processes that use the same file take turns logging in, through
+  `credentials.json.lock` next to it, so they share one login. The process
+  logging in writes its process ID and when its login ends at the latest to
+  `credentials.json.login`. The others wait for that login as long as it takes,
+  and give up once it has been overdue for 10 seconds, naming the stuck
+  process. They wait at most `login_timeout` (or 30 seconds with `0`) for a
+  process that holds the lock without logging in.
+- Connections opened at the same time in one process, such as one per thread,
+  share one login: they wait for it as long as it takes, then use its token. If
+  it fails (it times out or is denied), they all fail with its error instead of
+  opening the browser again.
+- After a login is denied, or finds no MotherDuck account, new connections in
+  the process that log in to the same account (the same credentials file,
+  `oauth_client_id` and API host), from any database, fail with that error
+  for 60 seconds instead of opening the browser again. A login that times out
+  doesn't pause anything, and databases set up differently don't share each
+  other's failures.
+- Without a host from the URI, `PGHOST`, `PGHOSTADDR`, `motherduck.region` or
+  a connection service, the driver connects to the Postgres endpoint of the
+  user's organization, which it looks up at
+  `https://api.motherduck.com/mom/lookup-user-with-token`.
+- If the endpoint rejects a saved token and the MotherDuck API confirms that
+  it expired or was revoked, the driver removes it and logs in again, once,
+  both in `AdbcDatabaseInit` and in `AdbcConnectionInit`.
+
+Related options and environment variables:
+
+| Name | Purpose |
+| --- | --- |
+| `motherduck.auth_type` (database option) | `token` (default) or `browser`. |
+| `motherduck.login_timeout` (database option) | Seconds to wait for the login (default `120`, at most `999999999`); `0` waits until the code expires, after 15 minutes. |
+| `motherduck.oauth_client_id` (database option) | The Auth0 application to log in through. |
+| `motherduck_host` (environment) | The MotherDuck API host, for example `api.staging.motherduck.com`. |
+| `motherduck.tls_root_cert_path` (database option) or `PGSSLROOTCERT` (environment) | A CA bundle that the login's HTTPS requests trust as well as the system's trust store. One that can't be read is skipped for the login. |
+
+Like the other options, these can be set in the URI's query, and they're read
+when the database is initialized: changing them afterwards has no effect.
+
 ## PostgreSQL settings are not supported
 
 The driver reaches MotherDuck through a PostgreSQL client library, which has

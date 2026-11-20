@@ -14,7 +14,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -24,6 +26,7 @@
 #include <arrow-adbc/adbc.h>
 #include <libpq-fe.h>
 
+#include "auth/token_cache.h"
 #include "database.h"
 #include "motherduck_trust_store.h"
 
@@ -45,6 +48,14 @@
 /// "false" encrypts the connection without verifying the server's
 /// certificate (sslmode=require). Defaults to "true".
 #define ADBC_MOTHERDUCK_OPTION_TLS_VERIFY "motherduck.tls_verify"
+/// How the driver gets the token: "token" (the default) or "browser", which logs in
+/// through the browser.
+#define ADBC_MOTHERDUCK_OPTION_AUTH_TYPE "motherduck.auth_type"
+/// The Auth0 application browser login goes through.
+#define ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID "motherduck.oauth_client_id"
+/// How long browser login waits for the user, in seconds; 0 waits until the login
+/// code expires. Defaults to 120.
+#define ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT "motherduck.login_timeout"
 
 namespace adbcpq {
 
@@ -69,6 +80,9 @@ struct MotherduckSettings {
   std::string db_schema;
   std::string tls_root_cert_path;
   std::optional<bool> tls_verify;
+  std::string auth_type;
+  std::string oauth_client_id;
+  std::string login_timeout;
 };
 
 /// \brief The Postgres endpoint host for a MotherDuck region, e.g.
@@ -87,6 +101,21 @@ bool DriverChoosesSslmode();
 /// user, which is a token if it was put where the user goes.
 std::string ScrubConnectError(std::string_view message, std::string_view user,
                               std::string_view password);
+
+/// \brief libpq connection parameters, as keyword/value pairs.
+using LibpqParams = std::vector<std::pair<std::string, std::string>>;
+
+/// \brief Whether a libpq connection error may mean the endpoint rejected the
+///   token, so it's worth asking the MotherDuck API.
+///
+/// libpq drops the SQLSTATE of errors raised while connecting, so this matches
+/// the messages of MotherDuck's Postgres endpoint.
+bool IsAuthFailure(std::string_view message);
+
+/// \brief The parameters with browser login's token as the password and, if
+///   need_host, the organization's endpoint as the host.
+LibpqParams AddCredentials(LibpqParams params, const auth::Credentials& credentials,
+                           bool need_host);
 
 /// \brief A libpq session option, --<name>=<value>, with whitespace and
 /// backslashes in value escaped.
@@ -109,7 +138,9 @@ class MotherduckDatabase : public PostgresDatabase {
                               struct AdbcError* error) override;
   AdbcStatusCode Connect(PGconn** conn, struct AdbcError* error) override;
 
-  /// \brief The libpq keywords and values Connect passes, in order.
+  /// \brief The libpq keywords and values Connect passes, in order. With browser
+  ///   login, these don't include the token, and they include the host only if
+  ///   the URI, an environment variable or the region names one.
   AdbcStatusCode ConnectParams(std::vector<std::pair<std::string, std::string>>* params,
                                struct AdbcError* error) const;
 
@@ -134,6 +165,12 @@ class MotherduckDatabase : public PostgresDatabase {
   std::string password_;
   // Empty for FindCaBundle.
   std::function<std::string()> find_ca_bundle_;
+  // Set by Init with browser login. Connect logs in exactly when it's set, so
+  // changing motherduck.auth_type after Init has no effect.
+  std::unique_ptr<auth::TokenCache> token_cache_;
+
+  AdbcStatusCode ConnectParams(std::vector<std::pair<std::string, std::string>>* params,
+                               bool browser_login, struct AdbcError* error) const;
 };
 
 }  // namespace adbcpq

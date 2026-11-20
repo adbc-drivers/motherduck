@@ -56,8 +56,8 @@ update bundled third-party code, update `NOTICE.txt` and `LICENSE.txt` to match.
 
 ### Build
 
-Requires CMake 3.24+, a C++20 compiler, and libpq 15 or newer. The driver bundles the Apache common/framework code, nanoarrow,
-fmt, portable-snippets, and boost.int128 it needs. Test builds also require
+Requires CMake 3.24+, a C++20 compiler, libpq 15 or newer, and OpenSSL. The driver bundles the Apache common/framework code, nanoarrow,
+fmt, portable-snippets, boost.int128, cpp-httplib, and yyjson it needs. Test builds also require
 GoogleTest/GoogleMock; CMake downloads GoogleTest 1.15.2 if it is not installed.
 
 For a native development build, set `PostgreSQL_ROOT` or `CMAKE_PREFIX_PATH`

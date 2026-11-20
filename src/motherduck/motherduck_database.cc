@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +35,7 @@
 #include <libpq-fe.h>
 
 #include "adbc_driver_motherduck_config.h"
+#include "auth/login.h"
 #include "driver/common/utils.h"
 #include "error.h"
 #include "motherduck_ascii.h"
@@ -43,8 +45,14 @@
 
 namespace adbcpq {
 
+using adbc::driver::Result;
+
 namespace {
 constexpr char kDefaultAttachMode[] = "single";
+constexpr std::string_view kAuthTypeToken = "token";
+constexpr std::string_view kAuthTypeBrowser = "browser";
+// The default motherduck.login_timeout, in seconds.
+constexpr int64_t kDefaultLoginTimeout = 120;
 // MotherDuck's endpoint expects the user postgres.
 constexpr char kDefaultUser[] = "postgres";
 // The URI schemes the driver accepts, and the only ones, so it doesn't commit to
@@ -208,6 +216,9 @@ constexpr std::string_view kUriSettingKeys[] = {
     ADBC_MOTHERDUCK_OPTION_DB_SCHEMA,
     ADBC_MOTHERDUCK_OPTION_TLS_ROOT_CERT_PATH,
     ADBC_MOTHERDUCK_OPTION_TLS_VERIFY,
+    ADBC_MOTHERDUCK_OPTION_AUTH_TYPE,
+    ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID,
+    ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT,
 };
 
 bool IsUriSettingKey(std::string_view key) {
@@ -277,6 +288,19 @@ AdbcStatusCode SetSetting(MotherduckSettings* settings, const char* key,
     } else {
       return invalid("true or false");
     }
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE) == 0) {
+    if (*value != '\0' && value != kAuthTypeToken && value != kAuthTypeBrowser) {
+      return invalid("token or browser");
+    }
+    settings->auth_type = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID) == 0) {
+    settings->oauth_client_id = value;
+  } else if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT) == 0) {
+    // At most 999999999, so a deadline this far away can't overflow.
+    if (!IsTimeoutSeconds(value)) {
+      return invalid("a whole number of seconds from 0 to 999999999, such as 120");
+    }
+    settings->login_timeout = *value == '\0' ? "" : std::to_string(std::stoll(value));
   } else {
     return ADBC_STATUS_NOT_FOUND;
   }
@@ -385,6 +409,53 @@ AdbcStatusCode ParseUri(std::string_view uri, std::string* libpq_uri,
 
 // Backslash-escapes whitespace and backslashes for libpq options. MotherDuck
 // removes the escapes, so "a b" arrives as is.
+bool HasParam(const LibpqParams& params, std::string_view keyword) {
+  for (const auto& [name, value] : params) {
+    if (name == keyword && !value.empty()) return true;
+  }
+  return false;
+}
+
+// Connect with params, with the token and a user that may be one scrubbed from
+// the error.
+Status OpenConnection(const LibpqParams& params, PGconn** conn) {
+  std::vector<const char*> keywords;
+  std::vector<const char*> values;
+  for (const auto& [keyword, value] : params) {
+    keywords.push_back(keyword.c_str());
+    values.push_back(value.c_str());
+  }
+  keywords.push_back(nullptr);
+  values.push_back(nullptr);
+  *conn = PQconnectdbParams(keywords.data(), values.data(), /*expand_dbname=*/0);
+  if (PQstatus(*conn) == CONNECTION_OK) return Status::Ok();
+  std::string user, password;
+  for (const auto& [keyword, value] : params) {
+    if (keyword == "user") user = value;
+    if (keyword == "password") password = value;
+  }
+  Status status(ADBC_STATUS_IO, "[libpq] Failed to connect: " +
+                                    RedactMessage(ScrubConnectError(PQerrorMessage(*conn),
+                                                                    user, password)));
+  PQfinish(*conn);
+  *conn = nullptr;
+  return status;
+}
+
+// The parameters with browser login's token as the password and, if nothing names
+// a host, the organization's Postgres endpoint as the host.
+Result<LibpqParams> WithBrowserLogin(auth::TokenCache& token_cache,
+                                     const LibpqParams& params, uint64_t logins,
+                                     auth::Credentials* credentials) {
+  // Without a host, libpq would try a local socket. MotherDuck's endpoints are
+  // regional, so use the one of the user's organization.
+  const bool need_host = !HasParam(params, "host") && !HasParam(params, "hostaddr") &&
+                         !HasParam(params, "service") && GetEnv("PGHOST").empty() &&
+                         GetEnv("PGHOSTADDR").empty() && GetEnv("PGSERVICE").empty();
+  UNWRAP_STATUS(token_cache.Get(need_host, credentials, logins));
+  return AddCredentials(params, *credentials, need_host);
+}
+
 std::string EscapeOptionValue(std::string_view value) {
   std::string escaped;
   for (char c : value) {
@@ -396,6 +467,25 @@ std::string EscapeOptionValue(std::string_view value) {
   return escaped;
 }
 }  // namespace
+
+bool IsAuthFailure(std::string_view message) {
+  // The first answers a password that isn't a MotherDuck token at all; the others
+  // come from validating one.
+  constexpr std::string_view kMessages[] = {"invalid username/password",
+                                            "Invalid token or user", "Jwt is expired",
+                                            "user not found", "not authenticated"};
+  for (std::string_view known : kMessages) {
+    if (message.find(known) != std::string_view::npos) return true;
+  }
+  return false;
+}
+
+LibpqParams AddCredentials(LibpqParams params, const auth::Credentials& credentials,
+                           bool need_host) {
+  params.emplace_back("password", credentials.token);
+  if (need_host) params.emplace_back("host", credentials.host);
+  return params;
+}
 
 std::string NormalizeUri(std::string_view uri) {
   if (size_t length = MotherduckSchemeLength(uri); length > 0) {
@@ -476,7 +566,30 @@ std::string_view MotherduckDatabase::DriverVersion() {
 }
 
 AdbcStatusCode MotherduckDatabase::Init(struct AdbcError* error) {
-  // Fail fast on a bad URI or token. This replaces PostgresDatabase::Init
+  const MotherduckSettings settings = Settings();
+  // A failed Init may be retried with other options.
+  token_cache_.reset();
+  if (settings.auth_type == kAuthTypeBrowser) {
+    auth::LoginOptions options;
+    options.client_id = settings.oauth_client_id.empty()
+                            ? std::string(auth::kDefaultClientId)
+                            : settings.oauth_client_id;
+    options.auth_origin = auth::kAuthOrigin;
+    options.api_origin = auth::ApiOrigin();
+    options.timeout = std::chrono::seconds(settings.login_timeout.empty()
+                                               ? kDefaultLoginTimeout
+                                               : std::stoll(settings.login_timeout));
+    // The roots the connection is pinned to, if any, are trusted on top of the
+    // system's, as for a proxy that intercepts TLS.
+    std::string extra_roots = settings.tls_root_cert_path;
+    if (extra_roots.empty()) extra_roots = GetEnv("PGSSLROOTCERT");
+    if (extra_roots == "system") extra_roots.clear();
+    token_cache_ = std::make_unique<auth::TokenCache>(
+        auth::DefaultLoginEnvironment(extra_roots), std::move(options));
+  }
+
+  // Fail fast on a bad URI or token; with browser login, this logs in. This
+  // replaces PostgresDatabase::Init
   // rather than calling it: the server version and pg_type it reads are
   // PostgreSQL's, and mustn't reach MotherDuck users.
   PGconn* conn = nullptr;
@@ -500,6 +613,9 @@ MotherduckSettings MotherduckDatabase::Settings() const {
   fill(&settings.db_schema, uri_settings_.db_schema);
   fill(&settings.tls_root_cert_path, uri_settings_.tls_root_cert_path);
   if (!settings.tls_verify) settings.tls_verify = uri_settings_.tls_verify;
+  fill(&settings.auth_type, uri_settings_.auth_type);
+  fill(&settings.oauth_client_id, uri_settings_.oauth_client_id);
+  fill(&settings.login_timeout, uri_settings_.login_timeout);
   return settings;
 }
 
@@ -526,6 +642,14 @@ AdbcStatusCode MotherduckDatabase::GetOption(const char* option, char* value,
   } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_TLS_VERIFY) == 0) {
     output = settings.tls_verify.value_or(true) ? ADBC_OPTION_VALUE_ENABLED
                                                 : ADBC_OPTION_VALUE_DISABLED;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE) == 0) {
+    output = settings.auth_type.empty() ? kAuthTypeToken : settings.auth_type;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID) == 0) {
+    output = settings.oauth_client_id.empty() ? auth::kDefaultClientId
+                                              : settings.oauth_client_id;
+  } else if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT) == 0) {
+    output = settings.login_timeout.empty() ? std::to_string(kDefaultLoginTimeout)
+                                            : settings.login_timeout;
   } else if (std::strcmp(option, ADBC_OPTION_USERNAME) == 0) {
     // The user the driver connects as.
     output = username_;
@@ -574,12 +698,22 @@ AdbcStatusCode MotherduckDatabase::GetOptionInt(const char* option, int64_t* val
     *value = std::stoll(timeout);
     return ADBC_STATUS_OK;
   }
+  if (std::strcmp(option, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT) == 0) {
+    if (value == nullptr) {
+      InternalAdbcSetError(error, "[libpq] Option %s requires an output pointer", option);
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+    const std::string timeout = Settings().login_timeout;
+    *value = timeout.empty() ? kDefaultLoginTimeout : std::stoll(timeout);
+    return ADBC_STATUS_OK;
+  }
   return PostgresDatabase::GetOptionInt(option, value, error);
 }
 
 AdbcStatusCode MotherduckDatabase::SetOptionInt(const char* key, int64_t value,
                                                 struct AdbcError* error) {
-  if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0) {
+  if (std::strcmp(key, ADBC_MOTHERDUCK_OPTION_CONNECT_TIMEOUT) == 0 ||
+      std::strcmp(key, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT) == 0) {
     // Languages like Python send a number through the integer setter.
     return SetOption(key, std::to_string(value).c_str(), error);
   }
@@ -644,6 +778,12 @@ AdbcStatusCode MotherduckDatabase::SetOption(const char* key, const char* value,
 
 AdbcStatusCode MotherduckDatabase::ConnectParams(
     std::vector<std::pair<std::string, std::string>>* params,
+    struct AdbcError* error) const {
+  return ConnectParams(params, Settings().auth_type == kAuthTypeBrowser, error);
+}
+
+AdbcStatusCode MotherduckDatabase::ConnectParams(
+    std::vector<std::pair<std::string, std::string>>* params, bool browser_login,
     struct AdbcError* error) const {
   if (uri_.empty()) {
     InternalAdbcSetError(
@@ -800,15 +940,26 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
     }
   }
   if (!password_.empty()) password = password_;
-  if (password.empty()) password = GetEnv("MOTHERDUCK_TOKEN");
-  if (password.empty()) {
-    InternalAdbcSetError(error, "%s",
-                         "[libpq] No MotherDuck token: set the 'password' (or "
-                         "'motherduck.token') database option, a password in "
-                         "the URI, or MOTHERDUCK_TOKEN");
-    return ADBC_STATUS_UNAUTHENTICATED;
+  if (browser_login) {
+    // Connect adds the token from the login; MOTHERDUCK_TOKEN is ignored.
+    if (!password.empty()) {
+      InternalAdbcSetError(error, "%s",
+                           "[libpq] With motherduck.auth_type browser, set no token: "
+                           "no 'password' (or 'motherduck.token') database option "
+                           "and no password in the URI");
+      return ADBC_STATUS_INVALID_ARGUMENT;
+    }
+  } else {
+    if (password.empty()) password = GetEnv("MOTHERDUCK_TOKEN");
+    if (password.empty()) {
+      InternalAdbcSetError(error, "%s",
+                           "[libpq] No MotherDuck token: set the 'password' (or "
+                           "'motherduck.token') database option, a password in "
+                           "the URI, or MOTHERDUCK_TOKEN");
+      return ADBC_STATUS_UNAUTHENTICATED;
+    }
+    params->emplace_back("password", std::move(password));
   }
-  params->emplace_back("password", std::move(password));
   if (!username_.empty()) user = username_;
   if (user.empty()) user = kDefaultUser;
   params->emplace_back("user", std::move(user));
@@ -873,31 +1024,26 @@ AdbcStatusCode MotherduckDatabase::ConnectParams(
 }
 
 AdbcStatusCode MotherduckDatabase::Connect(PGconn** conn, struct AdbcError* error) {
-  std::vector<std::pair<std::string, std::string>> params;
-  RAISE_ADBC(ConnectParams(&params, error));
-  std::vector<const char*> keywords;
-  std::vector<const char*> values;
-  for (const auto& [keyword, value] : params) {
-    keywords.push_back(keyword.c_str());
-    values.push_back(value.c_str());
+  const bool browser_login = token_cache_ != nullptr;
+  LibpqParams params;
+  RAISE_ADBC(ConnectParams(&params, browser_login, error));
+  LibpqParams connect_params = params;
+  auth::Credentials credentials;
+  // A login that fails during this attempt, retry included, fails it.
+  const uint64_t logins = auth::TokenCache::LoginsFinished();
+  if (browser_login) {
+    RAISE_RESULT(error, connect_params,
+                 WithBrowserLogin(*token_cache_, params, logins, &credentials));
   }
-  keywords.push_back(nullptr);
-  values.push_back(nullptr);
-
-  *conn = PQconnectdbParams(keywords.data(), values.data(), /*expand_dbname=*/0);
-  if (PQstatus(*conn) != CONNECTION_OK) {
-    std::string user, password;
-    for (const auto& [keyword, value] : params) {
-      if (keyword == "user") user = value;
-      if (keyword == "password") password = value;
-    }
-    InternalAdbcSetError(
-        error, "%s%s", "[libpq] Failed to connect: ",
-        RedactMessage(ScrubConnectError(PQerrorMessage(*conn), user, password)).c_str());
-    PQfinish(*conn);
-    *conn = nullptr;
-    return ADBC_STATUS_IO;
+  Status status = OpenConnection(connect_params, conn);
+  if (!status.ok() && browser_login && !credentials.fresh &&
+      IsAuthFailure(status.message()) && token_cache_->Reject(credentials.token)) {
+    // The saved token expired or was revoked: log in again, once.
+    RAISE_RESULT(error, connect_params,
+                 WithBrowserLogin(*token_cache_, params, logins, &credentials));
+    status = OpenConnection(connect_params, conn);
   }
+  RAISE_STATUS(error, status);
 
   // The endpoint rejects search_path as a startup option, so set it once
   // connected. A database the URI names is the connection's current database,

@@ -1,0 +1,695 @@
+// Copyright (c) 2026 ADBC Drivers Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// For #warning Please include winsock2.h before windows.h on RTools/msys2
+#ifdef _WIN32
+#include <winsock2.h>
+#endif
+
+#include "auth/token_cache.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+
+#include <process.h>
+#include <sddl.h>
+#else
+#include <fcntl.h>
+#include <pwd.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#include "auth/env.h"
+#include "auth/json.h"
+
+namespace adbcpq::auth {
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Room for many other tools' profiles, each with a token of about 1 KB.
+constexpr size_t kMaxFileBytes = 1024 * 1024;
+
+std::string PathString(const fs::path& path) {
+  const std::u8string utf8 = path.u8string();
+  return std::string(utf8.begin(), utf8.end());
+}
+
+std::optional<fs::path> EnvPath(const char* name) {
+  const std::optional<std::string> value = GetEnvUtf8(name);
+  if (!value) return std::nullopt;
+  return fs::path(std::u8string(value->begin(), value->end()));
+}
+
+std::optional<fs::path> MotherDuckHome() { return EnvPath("MOTHERDUCK_HOME"); }
+
+#ifdef _WIN32
+std::optional<fs::path> HomeDirectory() { return EnvPath("USERPROFILE"); }
+
+int ProcessId() { return _getpid(); }
+
+// A security descriptor that lets only the current user access a file, whatever
+// the directory passes on, or null. Free it with LocalFree.
+PSECURITY_DESCRIPTOR UserOnlySecurityDescriptor() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return nullptr;
+  DWORD size = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+  std::vector<BYTE> buffer(size);
+  const bool got =
+      size > 0 && GetTokenInformation(token, TokenUser, buffer.data(), size, &size);
+  CloseHandle(token);
+  if (!got) return nullptr;
+  LPWSTR sid = nullptr;
+  if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid,
+                              &sid)) {
+    return nullptr;
+  }
+  // P: protected, so nothing is inherited. FA: full access.
+  const std::wstring sddl = std::wstring(L"D:P(A;;FA;;;") + sid + L")";
+  LocalFree(sid);
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
+                                                            &descriptor, nullptr)) {
+    return nullptr;
+  }
+  return descriptor;
+}
+
+Status WritePrivateFile(const fs::path& path, const std::string& contents) {
+  const std::string name = PathString(path);
+  PSECURITY_DESCRIPTOR descriptor = UserOnlySecurityDescriptor();
+  if (descriptor == nullptr) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not restrict access to " + name);
+  }
+  // Create the file anew, so nothing already at the path, such as a link someone
+  // who can write to the directory put there, is followed.
+  if (!DeleteFileW(path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+    LocalFree(descriptor);
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not replace " + name);
+  }
+  SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, &attributes, CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  LocalFree(descriptor);
+  if (file == INVALID_HANDLE_VALUE) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not create " + name);
+  }
+  DWORD written = 0;
+  bool ok = WriteFile(file, contents.data(), static_cast<DWORD>(contents.size()),
+                      &written, nullptr) &&
+            written == contents.size();
+  ok = CloseHandle(file) && ok;
+  if (!ok) return Status(ADBC_STATUS_IO, "[motherduck] Could not write " + name);
+  return Status::Ok();
+}
+
+// Shares delete access, so a writer can rename over or remove the file meanwhile.
+std::optional<std::string> ReadSmallFile(const fs::path& path, size_t max_bytes) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return std::nullopt;
+  std::string contents;
+  char buffer[4096];
+  bool ok = true;
+  while (true) {
+    DWORD n = 0;
+    if (!ReadFile(file, buffer, sizeof(buffer), &n, nullptr)) {
+      ok = false;
+      break;
+    }
+    if (n == 0) break;
+    contents.append(buffer, n);
+    if (contents.size() > max_bytes) {
+      ok = false;
+      break;
+    }
+  }
+  CloseHandle(file);
+  if (!ok) return std::nullopt;
+  return contents;
+}
+#else
+
+std::optional<fs::path> HomeDirectory() {
+  if (auto home = EnvPath("HOME")) return home;
+  struct passwd entry = {};
+  struct passwd* result = nullptr;
+  std::vector<char> buffer(16 * 1024);
+  if (getpwuid_r(getuid(), &entry, buffer.data(), buffer.size(), &result) == 0 &&
+      result != nullptr && result->pw_dir != nullptr && *result->pw_dir != '\0') {
+    return fs::path(result->pw_dir);
+  }
+  return std::nullopt;
+}
+
+int ProcessId() { return static_cast<int>(getpid()); }
+
+Status WritePrivateFile(const fs::path& path, const std::string& contents) {
+  const std::string name = PathString(path);
+  // Create the file anew, so nothing already at the path, such as a symlink
+  // someone who can write to the directory put there, is followed.
+  if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not replace " + name);
+  }
+  const int fd =
+      open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) return Status(ADBC_STATUS_IO, "[motherduck] Could not create " + name);
+  // Whatever the umask took away.
+  bool ok = fchmod(fd, 0600) == 0;
+  size_t written = 0;
+  while (ok && written < contents.size()) {
+    const ssize_t n = write(fd, contents.data() + written, contents.size() - written);
+    if (n < 0 && errno == EINTR) continue;
+    ok = n > 0;
+    if (ok) written += static_cast<size_t>(n);
+  }
+  ok = (close(fd) == 0) && ok;
+  if (!ok) return Status(ADBC_STATUS_IO, "[motherduck] Could not write " + name);
+  return Status::Ok();
+}
+
+std::optional<std::string> ReadSmallFile(const fs::path& path, size_t max_bytes) {
+  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return std::nullopt;
+  std::string contents;
+  char buffer[4096];
+  bool ok = true;
+  while (true) {
+    const ssize_t n = read(fd, buffer, sizeof(buffer));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      ok = n == 0;
+      break;
+    }
+    contents.append(buffer, static_cast<size_t>(n));
+    if (contents.size() > max_bytes) {
+      ok = false;
+      break;
+    }
+  }
+  close(fd);
+  if (!ok) return std::nullopt;
+  return contents;
+}
+#endif
+
+std::string_view Trim(std::string_view text) {
+  constexpr std::string_view kWhitespace = " \t\n\r\f\v";
+  const size_t start = text.find_first_not_of(kWhitespace);
+  if (start == std::string_view::npos) return {};
+  return text.substr(start, text.find_last_not_of(kWhitespace) - start + 1);
+}
+
+// Polling for the lock starts at the first and backs off to the second.
+constexpr std::chrono::milliseconds kLockPollInterval{100};
+constexpr std::chrono::milliseconds kMaxLockPollInterval{2000};
+
+// Without a login timeout, how long to wait for a lock held without an announced
+// login. Its holder is only saving or deleting a token.
+constexpr std::chrono::seconds kUnannouncedHoldWait{30};
+// How long an announced login must stay overdue to count as stuck.
+constexpr std::chrono::seconds kAnnouncementGrace{10};
+// How long to refuse new logins after a denied one.
+constexpr std::chrono::seconds kDeniedLoginBackoff{60};
+
+Status WaitTimedOut() {
+  return Status(ADBC_STATUS_TIMEOUT,
+                "[motherduck] Timed out waiting for another MotherDuck login to finish");
+}
+
+// An account's latest login, if it failed.
+struct FailedLogin {
+  uint64_t number = 0;  // In SharedLogin::finished.
+  AdbcStatusCode code = ADBC_STATUS_OK;
+  std::string message;
+  std::optional<std::chrono::steady_clock::time_point> paused_until;  // If denied.
+};
+
+struct SharedLogin {
+  // Held while a TokenCache uses its token, including while it logs in, so
+  // other connections wait for that login instead of starting their own.
+  std::mutex mutex;
+  std::atomic<uint64_t> finished{0};
+  // Guarded by mutex. Keyed by credentials file, client ID and API origin, so
+  // databases set up differently don't share failures.
+  std::map<std::string, FailedLogin> failures;
+};
+
+SharedLogin& Shared() {
+  static SharedLogin shared;
+  return shared;
+}
+
+// Create the credentials directory, readable only by the user, if it's missing.
+Status EnsureDirectory(const fs::path& directory) {
+  std::error_code ec;
+  if (fs::exists(directory, ec)) return Status::Ok();
+  fs::create_directories(directory.parent_path(), ec);
+#ifdef _WIN32
+  if (!ec) fs::create_directory(directory, ec);
+#else
+  // 0700 from the start, so it's never open to others.
+  if (!ec && mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
+    ec = std::error_code(errno, std::generic_category());
+  }
+#endif
+  if (ec) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not create " +
+                                      PathString(directory) + ": " + ec.message());
+  }
+  return Status::Ok();
+}
+
+// Someone else who can write to the directory could put their own token in it,
+// so refuse it, as ssh refuses such a ~/.ssh. (Windows: the access list the
+// file gets.)
+Status CheckDirectory(const fs::path& directory) {
+#ifndef _WIN32
+  struct stat info;
+  if (stat(directory.c_str(), &info) != 0) return Status::Ok();
+  const bool owned = info.st_uid == geteuid() || geteuid() == 0;
+  if (!owned || (info.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    return Status(ADBC_STATUS_INVALID_STATE,
+                  "[motherduck] Other users can write to " + PathString(directory) +
+                      ", so they could replace the MotherDuck token in it. Make it "
+                      "yours and writable only by you (chmod 700), or set "
+                      "MOTHERDUCK_HOME to another directory");
+  }
+#endif
+  return Status::Ok();
+}
+
+fs::path LockPath(const fs::path& path) {
+  fs::path lock_path = path;
+  lock_path += ".lock";
+  return lock_path;
+}
+
+fs::path AnnouncementPath(const fs::path& path) {
+  fs::path announcement = path;
+  announcement += ".login";
+  return announcement;
+}
+
+// Write a sibling and rename it over path, so readers never see a partial file.
+Status ReplacePrivateFile(const fs::path& path, const std::string& contents) {
+  std::error_code ec;
+  const fs::path directory = path.parent_path();
+  UNWRAP_STATUS(EnsureDirectory(directory));
+  const fs::path temporary = directory / ("." + PathString(path.filename()) + "." +
+                                          std::to_string(ProcessId()) + ".tmp");
+  Status status = WritePrivateFile(temporary, contents);
+  if (status.ok()) {
+    fs::rename(temporary, path, ec);
+    if (ec) {
+      status = Status(ADBC_STATUS_IO, "[motherduck] Could not replace " +
+                                          PathString(path) + ": " + ec.message());
+    }
+  }
+  if (!status.ok()) fs::remove(temporary, ec);
+  return status;
+}
+
+}  // namespace
+
+#ifdef _WIN32
+Status CredentialsLock::Acquire(const fs::path& path,
+                                std::unique_ptr<CredentialsLock>* lock, bool block) {
+  lock->reset();
+  UNWRAP_STATUS(EnsureDirectory(path.parent_path()));
+  const fs::path lock_path = LockPath(path);
+  HANDLE file = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not open " + PathString(lock_path));
+  }
+  OVERLAPPED overlapped = {};
+  const DWORD flags = LOCKFILE_EXCLUSIVE_LOCK | (block ? 0 : LOCKFILE_FAIL_IMMEDIATELY);
+  if (!LockFileEx(file, flags, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+    const DWORD code = GetLastError();
+    CloseHandle(file);
+    if (!block && code == ERROR_LOCK_VIOLATION) return Status::Ok();
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not lock " + PathString(lock_path));
+  }
+  lock->reset(new CredentialsLock(reinterpret_cast<intptr_t>(file)));
+  return Status::Ok();
+}
+
+// Closing the handle releases the lock.
+CredentialsLock::~CredentialsLock() { CloseHandle(reinterpret_cast<HANDLE>(handle_)); }
+#else
+Status CredentialsLock::Acquire(const fs::path& path,
+                                std::unique_ptr<CredentialsLock>* lock, bool block) {
+  lock->reset();
+  UNWRAP_STATUS(EnsureDirectory(path.parent_path()));
+  const fs::path lock_path = LockPath(path);
+  const int fd = open(lock_path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not open " + PathString(lock_path));
+  }
+  while (flock(fd, LOCK_EX | (block ? 0 : LOCK_NB)) != 0) {
+    const int code = errno;
+    if (code == EINTR) continue;
+    close(fd);
+    if (!block && code == EWOULDBLOCK) return Status::Ok();
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not lock " + PathString(lock_path));
+  }
+  lock->reset(new CredentialsLock(fd));
+  return Status::Ok();
+}
+
+// Closing the descriptor releases the lock.
+CredentialsLock::~CredentialsLock() { close(static_cast<int>(handle_)); }
+#endif
+
+Status CredentialsPath(fs::path* path) {
+  if (auto home = MotherDuckHome()) {
+    // A relative path would silently put credentials somewhere unexpected.
+    if (!home->is_absolute()) {
+      return Status(ADBC_STATUS_INVALID_ARGUMENT,
+                    "[motherduck] MOTHERDUCK_HOME must be an absolute path, got \"" +
+                        PathString(*home) + "\"");
+    }
+    *path = *home / "credentials.json";
+    return Status::Ok();
+  }
+  auto home = HomeDirectory();
+  if (!home) {
+    return Status(ADBC_STATUS_INVALID_STATE,
+                  "[motherduck] Could not find the home directory for the MotherDuck "
+                  "credentials file; set MOTHERDUCK_HOME");
+  }
+  *path = *home / ".motherduck" / "credentials.json";
+  return Status::Ok();
+}
+
+namespace {
+
+std::optional<std::string> ParseSavedToken(std::string_view text) {
+  const JsonObject credentials = JsonObject::Parse(text);
+  if (credentials.GetInt("version") != 1) return std::nullopt;
+  const std::optional<std::string> token = credentials.GetString("motherduck_token");
+  if (!token) return std::nullopt;
+  const std::string_view trimmed = Trim(*token);
+  if (trimmed.empty()) return std::nullopt;
+  return std::string(trimmed);
+}
+
+}  // namespace
+
+std::optional<std::string> LoadSavedToken(const fs::path& path) {
+  const std::optional<std::string> text = ReadSmallFile(path, kMaxFileBytes);
+  if (!text) return std::nullopt;
+  return ParseSavedToken(*text);
+}
+
+Status SaveToken(const fs::path& path, std::string_view token) {
+  // Other tools keep more in the file, so change only the token. Not when the
+  // file can't be read, though: that would replace whatever is in it.
+  std::error_code ec;
+  const std::optional<std::string> existing = ReadSmallFile(path, kMaxFileBytes);
+  if (!existing && fs::exists(path, ec)) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not read " + PathString(path));
+  }
+  const std::optional<std::string> contents =
+      UpdateCredentialsJson(existing.value_or(""), token);
+  if (!contents) {
+    return Status(ADBC_STATUS_INVALID_ARGUMENT,
+                  "[motherduck] Could not save the MotherDuck token in " +
+                      PathString(path) + ", which has an unknown version");
+  }
+  return ReplacePrivateFile(path, *contents);
+}
+
+Status AnnounceLogin(const fs::path& path, std::chrono::system_clock::time_point until) {
+  const int64_t until_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(until.time_since_epoch())
+          .count();
+  return ReplacePrivateFile(AnnouncementPath(path), std::to_string(ProcessId()) + " " +
+                                                        std::to_string(until_ms) + "\n");
+}
+
+std::optional<LoginAnnouncement> ReadLoginAnnouncement(const fs::path& path) {
+  const std::optional<std::string> contents = ReadSmallFile(AnnouncementPath(path), 64);
+  if (!contents) return std::nullopt;
+  const std::string_view text = Trim(*contents);
+  const size_t space = text.find(' ');
+  if (space == std::string_view::npos) return std::nullopt;
+  int64_t pid = 0;
+  int64_t until_ms = 0;
+  const std::string_view pid_text = text.substr(0, space);
+  const std::string_view until_text = text.substr(space + 1);
+  const auto [pid_end, pid_ec] =
+      std::from_chars(pid_text.data(), pid_text.data() + pid_text.size(), pid);
+  const auto [until_end, until_ec] =
+      std::from_chars(until_text.data(), until_text.data() + until_text.size(), until_ms);
+  if (pid_ec != std::errc() || pid_end != pid_text.data() + pid_text.size() ||
+      until_ec != std::errc() || until_end != until_text.data() + until_text.size() ||
+      pid <= 0) {
+    return std::nullopt;
+  }
+  LoginAnnouncement announcement;
+  announcement.pid = pid;
+  announcement.until =
+      std::chrono::system_clock::time_point(std::chrono::milliseconds(until_ms));
+  return announcement;
+}
+
+void RemoveLoginAnnouncement(const fs::path& path) {
+  std::error_code ec;
+  fs::remove(AnnouncementPath(path), ec);
+}
+
+void RemoveSavedToken(const fs::path& path, std::string_view token) {
+  const std::optional<std::string> text = ReadSmallFile(path, kMaxFileBytes);
+  if (!text || ParseSavedToken(*text) != token) return;
+  // Only the token: other tools' profiles in the file stay signed in.
+  const std::optional<std::string> contents = UpdateCredentialsJson(*text, std::nullopt);
+  if (!contents) return;
+  std::error_code ec;
+  if (contents->empty()) {
+    fs::remove(path, ec);
+  } else {
+    ReplacePrivateFile(path, *contents);
+  }
+}
+
+uint64_t TokenCache::LoginsFinished() { return Shared().finished.load(); }
+
+Status TokenCache::Get(bool need_host, Credentials* credentials, uint64_t since) {
+  // No deadline: a login in progress ends by its own timeout, and this
+  // connection needs its token.
+  std::lock_guard<std::mutex> lock(Shared().mutex);
+  const Deadline deadline = LockDeadline();
+  fs::path path;
+  UNWRAP_STATUS(CredentialsPath(&path));
+  UNWRAP_STATUS(CheckDirectory(path.parent_path()));
+
+  // An expired token is used anyway: the server rejects it, and the caller logs
+  // in again.
+  bool fresh = false;
+  if (token_.empty()) {
+    std::optional<std::string> saved = LoadSavedToken(path);
+    if (saved) {
+      token_ = std::move(*saved);
+    } else {
+      UNWRAP_STATUS(Login(path, /*rejected=*/"", deadline, since, &fresh));
+    }
+  }
+
+  if (need_host && host_.empty()) {
+    Status status = LookupPgEndpoint(env_, options_, token_, &host_);
+    if (!status.ok() && !fresh && status.ToAdbc(nullptr) == ADBC_STATUS_UNAUTHENTICATED) {
+      // The saved token expired or was revoked.
+      const std::string rejected = token_;
+      ForgetLocked(path, deadline);
+      UNWRAP_STATUS(Login(path, rejected, deadline, since, &fresh));
+      status =
+          host_.empty() ? LookupPgEndpoint(env_, options_, token_, &host_) : Status::Ok();
+    }
+    UNWRAP_STATUS(std::move(status));
+  }
+
+  credentials->token = token_;
+  credentials->host = host_;
+  credentials->fresh = fresh;
+  return Status::Ok();
+}
+
+bool TokenCache::Reject(const std::string& token) {
+  std::lock_guard<std::mutex> lock(Shared().mutex);
+  const Deadline deadline = LockDeadline();
+  if (token != token_) return true;
+  // Keep the token if the API accepts it, or can't be reached: the failure has
+  // another cause, which logging in again wouldn't fix.
+  std::string pg_endpoint;
+  if (LookupPgEndpoint(env_, options_, token, &pg_endpoint).ToAdbc(nullptr) !=
+      ADBC_STATUS_UNAUTHENTICATED) {
+    return false;
+  }
+  fs::path path;
+  if (CredentialsPath(&path).ok() && CheckDirectory(path.parent_path()).ok()) {
+    ForgetLocked(path, deadline);
+  } else {
+    token_.clear();
+    host_.clear();
+  }
+  return true;
+}
+
+TokenCache::Deadline TokenCache::LockDeadline() const {
+  if (options_.timeout <= std::chrono::seconds::zero()) return std::nullopt;
+  return env_.now() + options_.timeout;
+}
+
+Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadline,
+                                   std::unique_ptr<CredentialsLock>* lock) const {
+  auto unannounced_deadline = deadline ? *deadline : env_.now() + kUnannouncedHoldWait;
+  auto poll = kLockPollInterval;
+  // The overdue announcement seen last, and since when.
+  std::optional<std::pair<LoginAnnouncement, std::chrono::steady_clock::time_point>>
+      overdue;
+  while (true) {
+    UNWRAP_STATUS(CredentialsLock::Acquire(path, lock, /*block=*/false));
+    if (*lock != nullptr) {
+      // Left by a process that no longer holds the lock, such as one that crashed.
+      RemoveLoginAnnouncement(path);
+      return Status::Ok();
+    }
+    // Wait for an announced login however long it takes, unless it's stuck. A
+    // stale announcement is only overdue until the new holder removes it, so
+    // that alone doesn't make the login stuck.
+    if (std::optional<LoginAnnouncement> login = ReadLoginAnnouncement(path)) {
+      if (std::chrono::system_clock::now() <= login->until) {
+        overdue.reset();
+      } else if (!overdue || overdue->first != *login) {
+        overdue.emplace(*login, env_.now());
+      } else if (env_.now() - overdue->second >= kAnnouncementGrace) {
+        return Status(ADBC_STATUS_TIMEOUT,
+                      "[motherduck] Process " + std::to_string(login->pid) +
+                          " has been logging in to MotherDuck for longer than its "
+                          "timeout and still holds " +
+                          PathString(LockPath(path)) + "; end it to log in here");
+      }
+      // After its login, the holder still saves the token; don't time out then.
+      unannounced_deadline =
+          std::max(unannounced_deadline, env_.now() + kUnannouncedHoldWait);
+    } else if (env_.now() >= unannounced_deadline) {
+      return WaitTimedOut();
+    }
+    env_.sleep(poll);
+    poll = std::min(poll * 2, kMaxLockPollInterval);
+  }
+}
+
+Status TokenCache::Login(const fs::path& path, const std::string& rejected,
+                         const Deadline& deadline, uint64_t since, bool* fresh) {
+  // Wait for a login another process is running through the same file, and use
+  // its token. Without the lock, such as in a read-only home directory, log in
+  // anyway.
+  std::unique_ptr<CredentialsLock> lock;
+  Status locked = LockCredentials(path, deadline, &lock);
+  if (locked.ToAdbc(nullptr) == ADBC_STATUS_TIMEOUT) return locked;
+  if (std::optional<std::string> saved = LoadSavedToken(path);
+      saved && *saved != rejected) {
+    token_ = std::move(*saved);
+    host_.clear();
+    *fresh = false;
+    return Status::Ok();
+  }
+
+  SharedLogin& shared = Shared();
+  const std::string account =
+      PathString(path) + '\n' + options_.client_id + '\n' + options_.api_origin;
+  FailedLogin& failure = shared.failures[account];
+  // A login that failed during this connection attempt fails it too.
+  if (failure.number > since) return Status(failure.code, failure.message);
+  // A denial would likely recur; a timeout or network error may not, so only
+  // a denial pauses.
+  if (failure.paused_until && env_.now() < *failure.paused_until) {
+    const auto wait =
+        std::chrono::ceil<std::chrono::seconds>(*failure.paused_until - env_.now());
+    return Status(ADBC_STATUS_UNAUTHENTICATED,
+                  failure.message + " (not opening the browser again for " +
+                      std::to_string(wait.count()) + " seconds)");
+  }
+
+  const bool announced =
+      lock != nullptr &&
+      AnnounceLogin(path, std::chrono::system_clock::now() + MaxLoginDuration(options_))
+          .ok();
+  LoginResult result;
+  Status status = DeviceLogin(env_, options_, &result);
+  const uint64_t number = ++shared.finished;
+  if (!status.ok()) {
+    if (announced) RemoveLoginAnnouncement(path);
+    failure.number = number;
+    failure.code = status.ToAdbc(nullptr);
+    failure.message = status.message();
+    failure.paused_until.reset();
+    if (failure.code == ADBC_STATUS_UNAUTHENTICATED) {
+      failure.paused_until = env_.now() + kDeniedLoginBackoff;
+    }
+    return status;
+  }
+  shared.failures.erase(account);
+  token_ = std::move(result.token);
+  host_ = std::move(result.pg_endpoint);
+  *fresh = true;
+  Status saved = SaveToken(path, token_);
+  if (!saved.ok()) {
+    env_.print(saved.message() + ". You'll be asked to log in again next time.");
+  }
+  // Only after saving, so waiters never see the lock held with neither an
+  // announcement nor a saved token.
+  if (announced) RemoveLoginAnnouncement(path);
+  return Status::Ok();
+}
+
+void TokenCache::ForgetLocked(const fs::path& path, const Deadline& deadline) {
+  {
+    // So another process can't save a new token between the check and the delete.
+    // Without the lock, delete anyway; after waiting for it in vain, leave the
+    // file to the process holding it.
+    std::unique_ptr<CredentialsLock> lock;
+    if (LockCredentials(path, deadline, &lock).ToAdbc(nullptr) != ADBC_STATUS_TIMEOUT) {
+      RemoveSavedToken(path, token_);
+    }
+  }
+  token_.clear();
+  host_.clear();
+}
+
+}  // namespace adbcpq::auth

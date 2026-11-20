@@ -44,4 +44,9 @@ third_party/arrow-adbc/c/vendor/fmt/support/cmake/JoinPaths.cmake
 third_party/arrow-adbc/c/vendor/fmt/support/cmake/fmt-config.cmake.in
 third_party/arrow-adbc/c/vendor/fmt/support/cmake/fmt.pc.in
 third_party/arrow-adbc/c/vendor/portable-snippets/include/portable-snippets/safe-math.h
+third_party/cpp-httplib/LICENSE
+third_party/cpp-httplib/httplib.h
+third_party/yyjson/LICENSE
+third_party/yyjson/yyjson.c
+third_party/yyjson/yyjson.h
 vcpkg.json

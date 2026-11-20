@@ -37,6 +37,7 @@ include(CTest)
 option(MOTHERDUCK_TEST_POSTGRESQL "Run the inherited tests against PostgreSQL" OFF)
 
 find_package(PostgreSQL 15 REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 configure_file(src/motherduck/adbc_driver_motherduck_config.h.in
                generated/adbc_driver_motherduck_config.h @ONLY)

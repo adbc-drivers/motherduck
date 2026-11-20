@@ -697,6 +697,36 @@ TEST_F(PostgresDatabaseTest, InitRejectsBadCredentials) {
               IsStatus(ADBC_STATUS_IO, &error));
 }
 
+TEST_F(PostgresDatabaseTest, RejectedTokensAreAuthFailures) {
+  // Browser login recognizes a rejected token by the endpoint's error text, so
+  // check that text against the real endpoint.
+  const char* uri = std::getenv("ADBC_POSTGRESQL_TEST_URI");
+  ASSERT_NE(uri, nullptr) << "Must provide env var ADBC_POSTGRESQL_TEST_URI";
+  const std::string tokens[] = {
+      // Not a JWT.
+      "invalid",
+      // A JWT with a session claim, so the endpoint validates it, but a forged
+      // signature.
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+      "eyJzZXNzaW9uIjoiYWRiYy1jaSIsInVzZXJJZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwM"
+      "DAwMDAwMCJ9.bm90LWEtc2lnbmF0dXJl",
+  };
+  for (const std::string& token : tokens) {
+    // A password in the URI takes precedence over MOTHERDUCK_TOKEN.
+    std::string bad_uri = uri;
+    bad_uri += (std::strchr(uri, '?') ? "&password=" : "?password=") + token;
+    adbc_validation::Handle<struct AdbcDatabase> database;
+    ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, "uri", bad_uri.c_str(), &error),
+                IsOkStatus(&error));
+    ASSERT_THAT(AdbcDatabaseInit(&database.value, &error),
+                IsStatus(ADBC_STATUS_IO, &error));
+    ASSERT_NE(error.message, nullptr);
+    EXPECT_TRUE(adbcpq::IsAuthFailure(error.message)) << error.message;
+    error.release(&error);
+  }
+}
+
 // A uniquely named file in the temp directory, removed when the object is.
 // A uniquely named file in the temp directory holding contents, readable only
 // by its owner from the moment it exists, and removed when the object is. The

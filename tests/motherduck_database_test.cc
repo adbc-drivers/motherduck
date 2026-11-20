@@ -1598,3 +1598,208 @@ TEST(MotherDuckTypeResolverTest, Shared) {
   ASSERT_TRUE(adbcpq::SharedMotherduckTypeResolver(&second).ok());
   EXPECT_EQ(first.get(), second.get());
 }
+
+TEST(MotherDuckAuthTest, OptionDefaults) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, &error),
+              ::testing::Optional("token"s));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID, &error),
+              ::testing::Optional(std::string(adbcpq::auth::kDefaultClientId)));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, &error),
+              ::testing::Optional("120"s));
+}
+
+TEST(MotherDuckAuthTest, OptionSetGet) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const std::string value : {"browser", "token"}) {
+    ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE,
+                                      value.c_str(), &error),
+                IsOkStatus(&error));
+    EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                    &database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, &error),
+                ::testing::Optional(value));
+  }
+  ASSERT_THAT(
+      AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID,
+                            "staging-client", &error),
+      IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID, &error),
+              ::testing::Optional("staging-client"s));
+
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT,
+                                    "30", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, &error),
+              ::testing::Optional("30"s));
+  ASSERT_THAT(AdbcDatabaseSetOptionInt(&database.value,
+                                       ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, 45, &error),
+              IsOkStatus(&error));
+  int64_t timeout = 0;
+  ASSERT_THAT(
+      AdbcDatabaseGetOptionInt(&database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT,
+                               &timeout, &error),
+      IsOkStatus(&error));
+  EXPECT_EQ(timeout, 45);
+}
+
+TEST(MotherDuckAuthTest, OptionInvalid) {
+  struct AdbcError error = {};
+  adbc_validation::Handle<struct AdbcDatabase> database;
+  ASSERT_THAT(AdbcDatabaseNew(&database.value, &error), IsOkStatus(&error));
+  for (const char* value : {"BROWSER", "oauth"}) {
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE,
+                                      value, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+  // At most 999999999 seconds, so a deadline that far away doesn't overflow.
+  for (const char* value : {"-1", "abc", "1.5", "10s", "1000000000"}) {
+    EXPECT_THAT(AdbcDatabaseSetOption(
+                    &database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, value, &error),
+                IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+    if (error.release) error.release(&error);
+  }
+  EXPECT_THAT(AdbcDatabaseSetOptionInt(&database.value,
+                                       ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, -1, &error),
+              IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+  if (error.release) error.release(&error);
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, &error),
+              ::testing::Optional("token"s));
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT, &error),
+              ::testing::Optional("120"s));
+
+  // An empty value unsets an option, which brings back its default.
+  for (const char* option :
+       {ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID,
+        ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT}) {
+    EXPECT_THAT(AdbcDatabaseSetOption(&database.value, option, "", &error),
+                IsOkStatus(&error));
+  }
+  EXPECT_THAT(adbc_validation::DatabaseGetOption(
+                  &database.value, ADBC_MOTHERDUCK_OPTION_OAUTH_CLIENT_ID, &error),
+              ::testing::Optional(std::string(adbcpq::auth::kDefaultClientId)));
+  ASSERT_THAT(AdbcDatabaseSetOption(&database.value, ADBC_MOTHERDUCK_OPTION_LOGIN_TIMEOUT,
+                                    "999999999", &error),
+              IsOkStatus(&error));
+}
+
+TEST(MotherDuckAuthTest, ConnectUsesTheModeInitSetUp) {
+  // Token mode at Init, browser afterwards: Connect still needs a token, rather
+  // than connecting with no password, which libpq would fill from PGPASSWORD or
+  // a password file.
+  ScopedEnv token("MOTHERDUCK_TOKEN", "");
+  struct AdbcError error = {};
+  adbcpq::MotherduckDatabase database;
+  ASSERT_THAT(database.SetOption("uri", "motherduck://127.0.0.1:1/db", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(database.Init(&error), IsStatus(ADBC_STATUS_UNAUTHENTICATED, &error));
+  if (error.release) error.release(&error);
+  ASSERT_THAT(database.SetOption(ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, "browser", &error),
+              IsOkStatus(&error));
+  PGconn* conn = nullptr;
+  EXPECT_THAT(database.Connect(&conn, &error),
+              IsStatus(ADBC_STATUS_UNAUTHENTICATED, &error));
+  EXPECT_EQ(conn, nullptr);
+  if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckAuthTest, TokenModeAfterFailedBrowserInit) {
+  struct AdbcError error = {};
+  adbcpq::MotherduckDatabase database;
+  // Port 1, so a connection attempt fails right away.
+  ASSERT_THAT(
+      database.SetOption("uri", "motherduck://postgres:secret@127.0.0.1:1/db", &error),
+      IsOkStatus(&error));
+  ASSERT_THAT(database.SetOption(ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, "browser", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(database.Init(&error), IsStatus(ADBC_STATUS_INVALID_ARGUMENT, &error));
+  if (error.release) error.release(&error);
+  // Retried in token mode, Init uses the URI's password instead of logging in.
+  ASSERT_THAT(database.SetOption(ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, "token", &error),
+              IsOkStatus(&error));
+  EXPECT_THAT(database.Init(&error), IsStatus(ADBC_STATUS_IO, &error));
+  if (error.release) error.release(&error);
+}
+
+TEST(MotherDuckAuthTest, IsAuthFailure) {
+  for (const char* message : {
+           "[libpq] Failed to connect: connection to server at \"pg.example\" "
+           "(1.2.3.4), port 5432 failed: FATAL:  invalid username/password",
+           "[libpq] Failed to connect: FATAL:  Jwt is expired",
+           "FATAL:  Invalid Input Error: Invalid token or user",
+           "FATAL:  user not found",
+       }) {
+    EXPECT_TRUE(adbcpq::IsAuthFailure(message)) << message;
+  }
+  for (const char* message : {
+           "[libpq] Failed to connect: could not translate host name \"pg\"",
+           "FATAL:  no database/share named 'db' found",
+       }) {
+    EXPECT_FALSE(adbcpq::IsAuthFailure(message)) << message;
+  }
+}
+
+TEST(MotherDuckAuthTest, AddCredentials) {
+  const adbcpq::LibpqParams params = {{"dbname", "db"}};
+  adbcpq::auth::Credentials credentials;
+  credentials.token = "token";
+  credentials.host = "pg.example";
+  using ::testing::ElementsAre;
+  using ::testing::Pair;
+  EXPECT_THAT(adbcpq::AddCredentials(params, credentials, /*need_host=*/false),
+              ElementsAre(Pair("dbname", "db"), Pair("password", "token")));
+  EXPECT_THAT(adbcpq::AddCredentials(params, credentials, /*need_host=*/true),
+              ElementsAre(Pair("dbname", "db"), Pair("password", "token"),
+                          Pair("host", "pg.example")));
+}
+
+TEST_F(MotherDuckConnectParamsTest, BrowserLoginLeavesOutToken) {
+  ScopedEnv token("MOTHERDUCK_TOKEN", "env-token");
+  SetOption(ADBC_OPTION_PASSWORD, "");
+  SetOption("uri", "md:db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, "browser");
+  // Connect adds the token and, with no host anywhere, the organization's host.
+  EXPECT_THAT(Values("password"), ::testing::IsEmpty());
+  EXPECT_THAT(Values("host"), ::testing::IsEmpty());
+}
+
+TEST_F(MotherDuckConnectParamsTest, BrowserLoginKeepsRegionHost) {
+  SetOption(ADBC_OPTION_PASSWORD, "");
+  SetOption("uri", "md:db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, "browser");
+  SetOption(ADBC_MOTHERDUCK_OPTION_REGION, "us-east-1");
+  EXPECT_THAT(Values("host"), ::testing::ElementsAre("pg.us-east-1-aws.motherduck.com"));
+}
+
+TEST_F(MotherDuckConnectParamsTest, BrowserLoginRejectsToken) {
+  // The fixture sets the password option.
+  SetOption("uri", "md:db");
+  SetOption(ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, "browser");
+  EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
+  SetOption(ADBC_OPTION_PASSWORD, "");
+  SetOption("uri", "motherduck://postgres:secret@localhost/db");
+  EXPECT_EQ(Status(), ADBC_STATUS_INVALID_ARGUMENT);
+}
+
+TEST_F(MotherDuckConnectParamsTest, BrowserLoginFromUriQuery) {
+  ScopedEnv token("MOTHERDUCK_TOKEN", "env-token");
+  SetOption(ADBC_OPTION_PASSWORD, "");
+  SetOption("uri",
+            "md:db?motherduck.auth_type=browser&motherduck.login_timeout=30&"
+            "motherduck.oauth_client_id=client");
+  EXPECT_THAT(Values("password"), ::testing::IsEmpty());
+  // An option on the database takes precedence over the URI's.
+  SetOption(ADBC_MOTHERDUCK_OPTION_AUTH_TYPE, "token");
+  EXPECT_THAT(Values("password"), ::testing::ElementsAre("env-token"));
+}
