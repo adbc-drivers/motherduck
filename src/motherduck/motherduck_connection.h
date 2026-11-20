@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include <arrow-adbc/adbc.h>
@@ -32,6 +33,16 @@ namespace adbcpq {
 /// server_version_num, which isn't a MotherDuck version.
 std::vector<uint32_t> MotherduckInfoCodes(const uint32_t* info_codes,
                                           size_t info_codes_length);
+
+/// \brief Points the connection's search_path at schema in database, or in
+/// the connection's current database if database is empty.
+///
+/// DuckDB resolves a bare search_path entry that names an attached database as
+/// that database, so the schema is always qualified. option names the option
+/// being applied, for the error message.
+AdbcStatusCode SetMotherduckSearchPath(PGconn* conn, std::string_view schema,
+                                       std::string_view database, const char* option,
+                                       struct AdbcError* error);
 
 class MotherduckConnection : public PostgresConnection {
  public:
@@ -55,6 +66,10 @@ class MotherduckConnection : public PostgresConnection {
   AdbcStatusCode GetTableSchema(const char* catalog, const char* db_schema,
                                 const char* table_name, struct ArrowSchema* schema,
                                 struct AdbcError* error) override;
+  /// Sets the current schema in the current database (see
+  /// SetMotherduckSearchPath); other options go to the base.
+  AdbcStatusCode SetOption(const char* key, const char* value,
+                           struct AdbcError* error) override;
   /// The table types MotherDuck's GetObjects reports: table and view.
   AdbcStatusCode GetTableTypes(struct AdbcConnection* connection,
                                struct ArrowArrayStream* out,

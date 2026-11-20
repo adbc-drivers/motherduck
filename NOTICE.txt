@@ -8,3 +8,9 @@ Copyright 2022-2026 The Apache Software Foundation
 
 This product includes software developed at
 The Apache Software Foundation (http://www.apache.org/).
+
+Trademarks:
+
+The MotherDuck name and logos (docs/images/motherduck-logo.svg and
+docs/images/motherduck-logo-dark.svg) are trademarks of MotherDuck, Inc. and
+are not licensed under the Apache License, Version 2.0.

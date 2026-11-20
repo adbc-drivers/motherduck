@@ -33,15 +33,19 @@
 namespace adbcpq {
 
 namespace {
-std::atomic<QueryRedactor> query_redactor{nullptr};
+std::atomic<TextRedactor> query_redactor{nullptr};
+std::atomic<TextRedactor> message_redactor{nullptr};
 }  // namespace
 
-void SetQueryRedactor(QueryRedactor redactor) { query_redactor.store(redactor); }
+void SetQueryRedactor(TextRedactor redactor) { query_redactor.store(redactor); }
+
+void SetMessageRedactor(TextRedactor redactor) { message_redactor.store(redactor); }
 
 namespace {
 
 // Cut to max_bytes, redact what is kept, and mark the cut.
-RedactedText TruncateAndRedact(std::string_view text, size_t max_bytes) {
+RedactedText TruncateAndRedact(std::string_view text, size_t max_bytes,
+                               TextRedactor redactor) {
   bool truncated = false;
   if (text.size() > max_bytes) {
     size_t cut = max_bytes;
@@ -51,7 +55,7 @@ RedactedText TruncateAndRedact(std::string_view text, size_t max_bytes) {
     truncated = true;
   }
   std::string out;
-  if (QueryRedactor redactor = query_redactor.load()) {
+  if (redactor != nullptr) {
     out = redactor(text);
   } else {
     out = std::string(text);
@@ -63,11 +67,13 @@ RedactedText TruncateAndRedact(std::string_view text, size_t max_bytes) {
 }  // namespace
 
 RedactedText RedactQuery(std::string_view query) {
-  return TruncateAndRedact(query, kMaxQueryBytes);
+  return TruncateAndRedact(query, kMaxQueryBytes, query_redactor.load());
 }
 
 RedactedText RedactMessage(std::string_view message) {
-  return TruncateAndRedact(message, kMaxMessageBytes);
+  TextRedactor redactor = message_redactor.load();
+  if (redactor == nullptr) redactor = query_redactor.load();
+  return TruncateAndRedact(message, kMaxMessageBytes, redactor);
 }
 
 AdbcStatusCode ClassifySqlState(const char* sqlstate) {

@@ -63,6 +63,16 @@ TEST(PostgresErrorTest, RedactorSeesOnlyThePrefix) {
   SetQueryRedactor(nullptr);
 }
 
+TEST(PostgresErrorTest, MessageRedactorAppliesOnlyToMessages) {
+  SetQueryRedactor([](std::string_view) { return std::string("query"); });
+  EXPECT_EQ(RedactMessage("x"), "query");  // Falls back to the query redactor.
+  SetMessageRedactor([](std::string_view) { return std::string("message"); });
+  EXPECT_EQ(RedactMessage("x"), "message");
+  EXPECT_EQ(RedactQuery("x"), "query");
+  SetMessageRedactor(nullptr);
+  SetQueryRedactor(nullptr);
+}
+
 // Results libpq makes itself (lost connection) have a message but no fields. A failed
 // connection gives one without a server.
 TEST(PostgresErrorTest, PqErrorTextKeepsClientSideMessages) {
