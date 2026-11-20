@@ -61,6 +61,12 @@ using ::testing::Pair;
 
 AdbcStatusCode Code(const Status& status) { return status.ToAdbc(nullptr); }
 
+// Milliseconds since the epoch. Assertions compare these rather than time points,
+// whose printing needs macOS 13.3 while builds target 13.0.
+int64_t Ms(std::chrono::system_clock::time_point time) {
+  return std::chrono::floor<std::chrono::milliseconds>(time.time_since_epoch()).count();
+}
+
 /// A fresh directory, removed with its contents at the end of the scope.
 class TempDir {
  public:
@@ -609,8 +615,7 @@ TEST_F(CredentialsFileTest, LoginAnnouncement) {
       adbcpq::auth::ReadLoginAnnouncement(path_);
   ASSERT_TRUE(read.has_value());
   EXPECT_GT(read->pid, 0);
-  EXPECT_EQ(std::chrono::floor<std::chrono::milliseconds>(read->until),
-            std::chrono::floor<std::chrono::milliseconds>(until));
+  EXPECT_EQ(Ms(read->until), Ms(until));
   adbcpq::auth::RemoveLoginAnnouncement(path_);
   EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
 
@@ -620,7 +625,7 @@ TEST_F(CredentialsFileTest, LoginAnnouncement) {
   read = adbcpq::auth::ReadLoginAnnouncement(path_);
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->pid, 1234);
-  EXPECT_EQ(read->until, std::chrono::system_clock::time_point(5ms));
+  EXPECT_EQ(Ms(read->until), 5);
   for (const char* contents : {"", "1234", "x 5", "0 5", "-3 5", "12 5 extra", "12 x"}) {
     WriteFile(announcement, contents);
     EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt) << contents;
@@ -893,10 +898,9 @@ TEST_F(TokenCacheTest, AnnouncesLoginWhileLoggingIn) {
   ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
   ASSERT_TRUE(during.has_value());
   EXPECT_GT(during->pid, 0);
-  EXPECT_GE(during->until, std::chrono::floor<std::chrono::milliseconds>(
-                               before + adbcpq::auth::MaxLoginDuration(options_)));
-  EXPECT_LE(during->until,
-            std::chrono::system_clock::now() + adbcpq::auth::MaxLoginDuration(options_));
+  EXPECT_GE(Ms(during->until), Ms(before + adbcpq::auth::MaxLoginDuration(options_)));
+  EXPECT_LE(Ms(during->until), Ms(std::chrono::system_clock::now() +
+                                  adbcpq::auth::MaxLoginDuration(options_)));
   EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
 }
 
