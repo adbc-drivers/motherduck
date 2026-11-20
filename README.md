@@ -170,8 +170,11 @@ Like the MotherDuck DuckDB extension's login, it doesn't use an HTTP proxy.
   that, the next connection logs in again.
 - The token is saved to `~/.motherduck/credentials.json` (or
   `$MOTHERDUCK_HOME/credentials.json`, which must be absolute), readable only
-  by the user, and a saved token is used without opening a browser. Processes
-  that use the same file take turns logging in, through `credentials.json.lock`
+  by the user, and a saved token is used without opening a browser. The driver
+  reads and writes only the file's top-level `motherduck_token` (in a
+  version 1 file) and keeps everything else in it, such as other tools' saved
+  profiles; a rejected token is removed from the file, not the whole file.
+  Processes that use the same file take turns logging in, through `credentials.json.lock`
   next to it, so they share one login. The process logging in writes its
   process ID and when its login ends at the latest to `credentials.json.login`.
   The others wait for that login as long as it takes, and give up once it has

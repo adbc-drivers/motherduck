@@ -66,16 +66,46 @@ std::optional<int64_t> JsonObject::GetInt(const char* key) const {
   return std::nullopt;
 }
 
-std::optional<std::string> CredentialsJson(std::string_view token) {
+std::optional<std::string> UpdateCredentialsJson(std::string_view existing,
+                                                 std::optional<std::string_view> token) {
   std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> doc(
-      yyjson_mut_doc_new(nullptr), yyjson_mut_doc_free);
-  if (!doc) return std::nullopt;
-  yyjson_mut_val* root = yyjson_mut_obj(doc.get());
-  yyjson_mut_doc_set_root(doc.get(), root);
-  yyjson_mut_obj_add_int(doc.get(), root, "version", 1);
-  yyjson_mut_obj_add_strncpy(doc.get(), root, "motherduck_token", token.data(),
-                             token.size());
-  // Two-space indentation and a final newline.
+      nullptr, yyjson_mut_doc_free);
+  if (!existing.empty()) {
+    std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> parsed(
+        yyjson_read(existing.data(), existing.size(), YYJSON_READ_NOFLAG),
+        yyjson_doc_free);
+    yyjson_val* root = parsed ? yyjson_doc_get_root(parsed.get()) : nullptr;
+    if (yyjson_is_obj(root)) {
+      yyjson_val* version = yyjson_obj_get(root, "version");
+      if (version && !(yyjson_is_int(version) && yyjson_get_int(version) == 1)) {
+        return std::nullopt;
+      }
+      doc.reset(yyjson_doc_mut_copy(parsed.get(), nullptr));
+      if (!doc) return std::nullopt;
+    }
+  }
+  if (!doc) {
+    doc.reset(yyjson_mut_doc_new(nullptr));
+    if (!doc) return std::nullopt;
+    yyjson_mut_doc_set_root(doc.get(), yyjson_mut_obj(doc.get()));
+  }
+  yyjson_mut_val* root = yyjson_mut_doc_get_root(doc.get());
+  if (!yyjson_mut_obj_get(root, "version")) {
+    yyjson_mut_obj_insert(root, yyjson_mut_str(doc.get(), "version"),
+                          yyjson_mut_int(doc.get(), 1), 0);
+  }
+  if (token) {
+    yyjson_mut_val* key = yyjson_mut_str(doc.get(), "motherduck_token");
+    yyjson_mut_val* value = yyjson_mut_strncpy(doc.get(), token->data(), token->size());
+    // In place if it's there, else after the version, as other tools write it.
+    if (!yyjson_mut_obj_replace(root, key, value)) {
+      yyjson_mut_obj_insert(root, key, value, 1);
+    }
+  } else {
+    yyjson_mut_obj_remove_str(root, "motherduck_token");
+    if (yyjson_mut_obj_size(root) == 1) return std::string();
+  }
+  // Like JSON.stringify(credentials, null, 2), which other tools use.
   size_t length = 0;
   std::unique_ptr<char, decltype(&std::free)> text(
       yyjson_mut_write(doc.get(), YYJSON_WRITE_PRETTY_TWO_SPACES, &length), std::free);

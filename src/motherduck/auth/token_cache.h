@@ -29,7 +29,8 @@
 
 /// \file token_cache.h
 /// Where browser login's MotherDuck token comes from: memory, then the credentials
-/// file, then a login. The file holds {"version": 1, "motherduck_token": "<token>"}.
+/// file, then a login. The file holds {"version": 1, "motherduck_token": "<token>"}
+/// and may hold other tools' members, such as profiles, which are kept.
 
 namespace adbcpq::auth {
 using adbc::driver::Status;
@@ -152,10 +153,12 @@ Status CredentialsPath(std::filesystem::path* path);
 ///   file.
 std::optional<std::string> LoadSavedToken(const std::filesystem::path& path);
 
-/// \brief Atomically replace the file, readable only by the user.
+/// \brief Set the file's motherduck_token atomically, keeping its other members;
+///   create it, readable only by the user, if it's missing.
 Status SaveToken(const std::filesystem::path& path, std::string_view token);
 
-/// \brief Delete the file if it still holds this token.
+/// \brief Remove the file's motherduck_token if it's still this token, and the
+///   file if nothing else is left in it.
 void RemoveSavedToken(const std::filesystem::path& path, std::string_view token);
 
 }  // namespace adbcpq::auth

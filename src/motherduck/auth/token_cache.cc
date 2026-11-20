@@ -55,7 +55,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::uintmax_t kMaxFileBytes = 64 * 1024;
+// Room for many other tools' profiles, each with a token of about 1 KB.
+constexpr size_t kMaxFileBytes = 1024 * 1024;
 
 std::string PathString(const fs::path& path) {
   const std::u8string utf8 = path.u8string();
@@ -398,10 +399,10 @@ Status CredentialsPath(fs::path* path) {
   return Status::Ok();
 }
 
-std::optional<std::string> LoadSavedToken(const fs::path& path) {
-  const std::optional<std::string> text = ReadSmallFile(path, kMaxFileBytes);
-  if (!text) return std::nullopt;
-  const JsonObject credentials = JsonObject::Parse(*text);
+namespace {
+
+std::optional<std::string> ParseSavedToken(std::string_view text) {
+  const JsonObject credentials = JsonObject::Parse(text);
   if (credentials.GetInt("version") != 1) return std::nullopt;
   const std::optional<std::string> token = credentials.GetString("motherduck_token");
   if (!token) return std::nullopt;
@@ -410,11 +411,28 @@ std::optional<std::string> LoadSavedToken(const fs::path& path) {
   return std::string(trimmed);
 }
 
+}  // namespace
+
+std::optional<std::string> LoadSavedToken(const fs::path& path) {
+  const std::optional<std::string> text = ReadSmallFile(path, kMaxFileBytes);
+  if (!text) return std::nullopt;
+  return ParseSavedToken(*text);
+}
+
 Status SaveToken(const fs::path& path, std::string_view token) {
-  const std::optional<std::string> contents = CredentialsJson(token);
+  // Other tools keep more in the file, so change only the token. Not when the
+  // file can't be read, though: that would replace whatever is in it.
+  std::error_code ec;
+  const std::optional<std::string> existing = ReadSmallFile(path, kMaxFileBytes);
+  if (!existing && fs::exists(path, ec)) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not read " + PathString(path));
+  }
+  const std::optional<std::string> contents =
+      UpdateCredentialsJson(existing.value_or(""), token);
   if (!contents) {
     return Status(ADBC_STATUS_INVALID_ARGUMENT,
-                  "[motherduck] Could not encode the MotherDuck token");
+                  "[motherduck] Could not save the MotherDuck token in " +
+                      PathString(path) + ", which has an unknown version");
   }
   return ReplacePrivateFile(path, *contents);
 }
@@ -459,9 +477,17 @@ void RemoveLoginAnnouncement(const fs::path& path) {
 }
 
 void RemoveSavedToken(const fs::path& path, std::string_view token) {
-  if (LoadSavedToken(path) != token) return;
+  const std::optional<std::string> text = ReadSmallFile(path, kMaxFileBytes);
+  if (!text || ParseSavedToken(*text) != token) return;
+  // Only the token: other tools' profiles in the file stay signed in.
+  const std::optional<std::string> contents = UpdateCredentialsJson(*text, std::nullopt);
+  if (!contents) return;
   std::error_code ec;
-  fs::remove(path, ec);
+  if (contents->empty()) {
+    fs::remove(path, ec);
+  } else {
+    ReplacePrivateFile(path, *contents);
+  }
 }
 
 uint64_t TokenCache::LoginsFinished() { return Shared().finished.load(); }

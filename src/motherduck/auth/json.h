@@ -50,8 +50,15 @@ class JsonObject {
   std::unique_ptr<yyjson_doc, Deleter> doc_;
 };
 
-/// \brief The contents of the credentials file, or
-///   nullopt if the token isn't valid UTF-8.
-std::optional<std::string> CredentialsJson(std::string_view token);
+/// \brief A credentials file's text with motherduck_token set to token, or
+///   removed if token is nullopt, keeping the file's other members, such as
+///   other tools' saved profiles.
+///
+/// \param existing The file's text. Empty, or not a JSON object, starts anew.
+/// \return nullopt if existing has a version other than 1, which this driver
+///   mustn't rewrite, or token isn't valid UTF-8. Empty if only the version
+///   is left, so the file can be deleted.
+std::optional<std::string> UpdateCredentialsJson(std::string_view existing,
+                                                 std::optional<std::string_view> token);
 
 }  // namespace adbcpq::auth

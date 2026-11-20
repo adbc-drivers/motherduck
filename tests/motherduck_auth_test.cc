@@ -79,6 +79,11 @@ class TempDir {
   fs::path path_;
 };
 
+std::string ReadFile(const fs::path& path) {
+  std::ifstream file(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(file), {});
+}
+
 void WriteFile(const fs::path& path, const std::string& contents) {
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   file << contents;
@@ -234,10 +239,67 @@ TEST(MotherDuckJsonTest, ReadsLargeNumbers) {
   EXPECT_EQ(object.GetInt("tiny"), std::numeric_limits<int64_t>::min());
 }
 
-TEST(MotherDuckJsonTest, CredentialsJson) {
-  EXPECT_EQ(adbcpq::auth::CredentialsJson("a.b/c\"d"),
-            "{\n  \"version\": 1,\n  \"motherduck_token\": \"a.b/c\\\"d\"\n}\n");
-  EXPECT_EQ(adbcpq::auth::CredentialsJson("\xff"), std::nullopt);
+// What the MotherDuck CLI writes with several profiles, the second active.
+constexpr char kProfilesFile[] = R"({
+  "version": 1,
+  "motherduck_token": "token-b",
+  "profiles": {
+    "a": {
+      "motherduck_token": "token-a"
+    },
+    "b": {
+      "motherduck_token": "token-b"
+    }
+  }
+}
+)";
+
+TEST(MotherDuckJsonTest, NewCredentialsFile) {
+  using adbcpq::auth::UpdateCredentialsJson;
+  const std::string expected =
+      "{\n  \"version\": 1,\n  \"motherduck_token\": \"a.b/c\\\"d\"\n}\n";
+  EXPECT_EQ(UpdateCredentialsJson("", "a.b/c\"d"), expected);
+  // Not a JSON object: start anew.
+  EXPECT_EQ(UpdateCredentialsJson("not json", "a.b/c\"d"), expected);
+  EXPECT_EQ(UpdateCredentialsJson("[1]", "a.b/c\"d"), expected);
+  EXPECT_EQ(UpdateCredentialsJson("", "\xff"), std::nullopt);
+}
+
+TEST(MotherDuckJsonTest, UpdateKeepsOtherMembers) {
+  using adbcpq::auth::UpdateCredentialsJson;
+  // The token is replaced in place.
+  std::string expected = kProfilesFile;
+  expected.replace(expected.find("\"token-b\""), 9, "\"md-token\"");
+  EXPECT_EQ(UpdateCredentialsJson(kProfilesFile, "md-token"), expected);
+
+  // A file without a top-level token gets one after the version.
+  EXPECT_EQ(UpdateCredentialsJson(R"({"version":1,"profiles":{},"other":[1]})", "t"),
+            "{\n  \"version\": 1,\n  \"motherduck_token\": \"t\",\n  \"profiles\": {},\n"
+            "  \"other\": [\n    1\n  ]\n}\n");
+  // And a file without a version gets one.
+  EXPECT_EQ(
+      UpdateCredentialsJson(R"({"other":true})", "t"),
+      "{\n  \"version\": 1,\n  \"motherduck_token\": \"t\",\n  \"other\": true\n}\n");
+}
+
+TEST(MotherDuckJsonTest, RemoveTokenKeepsOtherMembers) {
+  using adbcpq::auth::UpdateCredentialsJson;
+  std::string expected = kProfilesFile;
+  const std::string top_token = "  \"motherduck_token\": \"token-b\",\n";
+  expected.erase(expected.find(top_token), top_token.size());
+  EXPECT_EQ(UpdateCredentialsJson(kProfilesFile, std::nullopt), expected);
+  // Nothing but the version left.
+  EXPECT_EQ(
+      UpdateCredentialsJson(R"({"version":1,"motherduck_token":"t"})", std::nullopt), "");
+}
+
+TEST(MotherDuckJsonTest, LeavesOtherVersionsAlone) {
+  using adbcpq::auth::UpdateCredentialsJson;
+  for (const char* existing : {R"({"version":2,"motherduck_token":"t"})",
+                               R"({"version":"1"})", R"({"version":1.5})"}) {
+    EXPECT_EQ(UpdateCredentialsJson(existing, "new"), std::nullopt) << existing;
+    EXPECT_EQ(UpdateCredentialsJson(existing, std::nullopt), std::nullopt) << existing;
+  }
 }
 
 TEST_F(LoginTest, DeviceLogin) {
@@ -537,6 +599,35 @@ TEST_F(CredentialsFileTest, LoginAnnouncement) {
     WriteFile(announcement, contents);
     EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt) << contents;
   }
+}
+
+TEST_F(CredentialsFileTest, SaveKeepsOtherToolsProfiles) {
+  WriteFile(path_, kProfilesFile);
+  ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "md-token").ok());
+  EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), "md-token");
+  std::string expected = kProfilesFile;
+  expected.replace(expected.find("\"token-b\""), 9, "\"md-token\"");
+  EXPECT_EQ(ReadFile(path_), expected);
+}
+
+TEST_F(CredentialsFileTest, RemoveKeepsOtherToolsProfiles) {
+  WriteFile(path_, kProfilesFile);
+  adbcpq::auth::RemoveSavedToken(path_, "token-b");
+  EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), std::nullopt);
+  const std::string contents = ReadFile(path_);
+  EXPECT_THAT(contents, HasSubstr("\"profiles\""));
+  EXPECT_THAT(contents, HasSubstr("token-a"));
+  // The profile keeps its own copy of the rejected token: the other tool
+  // decides about it.
+  EXPECT_THAT(contents, HasSubstr("token-b"));
+}
+
+TEST_F(CredentialsFileTest, SaveLeavesUnknownVersionAlone) {
+  const std::string future = R"({"version":2,"motherduck_token":"t"})";
+  WriteFile(path_, future);
+  EXPECT_FALSE(adbcpq::auth::SaveToken(path_, "md-token").ok());
+  adbcpq::auth::RemoveSavedToken(path_, "t");
+  EXPECT_EQ(ReadFile(path_), future);
 }
 
 TEST_F(CredentialsFileTest, RemoveOnlyMatchingToken) {
@@ -897,6 +988,22 @@ TEST_F(TokenCacheTest, RejectLogsInAgain) {
   ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
   EXPECT_EQ(credentials.token, "md-token");
   EXPECT_TRUE(credentials.fresh);
+}
+
+TEST_F(TokenCacheTest, RejectAndLoginKeepOtherToolsProfiles) {
+  WriteFile(path_, kProfilesFile);
+  http_->Respond(kLookupUserWithTokenUrl, 403, R"({"errMessage":"Invalid token"})");
+  RespondWithLogin();
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "token-b");
+  EXPECT_TRUE(cache.Reject("token-b"));
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "md-token");
+  std::string expected = kProfilesFile;
+  expected.replace(expected.find("\"token-b\""), 9, "\"md-token\"");
+  EXPECT_EQ(ReadFile(path_), expected);
 }
 
 TEST_F(TokenCacheTest, RejectIgnoresReplacedToken) {
