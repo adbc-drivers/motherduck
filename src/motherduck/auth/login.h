@@ -78,6 +78,10 @@ struct LoginResult {
 Status DeviceLogin(const LoginEnvironment& env, const LoginOptions& options,
                    LoginResult* result);
 
+/// \brief The longest DeviceLogin can take with these options: the wait for
+///   approval, plus its requests and the token exchange's retries.
+std::chrono::seconds MaxLoginDuration(const LoginOptions& options);
+
 /// \brief Look up the Postgres endpoint host of a MotherDuck token's organization.
 ///
 /// Returns UNAUTHENTICATED if MotherDuck rejects the token (401 or 403). Other

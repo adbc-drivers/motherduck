@@ -42,7 +42,6 @@ namespace {
 
 constexpr time_t kConnectTimeoutSeconds = 10;
 constexpr time_t kReadWriteTimeoutSeconds = 30;
-constexpr std::chrono::seconds kRequestTimeout{30};
 constexpr size_t kMaxResponseBytes = 1 << 20;
 constexpr std::string_view kHttps = "https://";
 

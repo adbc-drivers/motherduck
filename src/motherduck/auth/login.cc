@@ -302,6 +302,14 @@ Status DeviceLogin(const LoginEnvironment& env, const LoginOptions& options,
   return ExchangeIdToken(env, options, id_token, result);
 }
 
+seconds MaxLoginDuration(const LoginOptions& options) {
+  seconds wait = kMaxLifetime;
+  if (options.timeout > 0s) wait = std::min(wait, options.timeout);
+  // The device code request, the poll in flight at the deadline, and the
+  // exchange's retries and its last request.
+  return wait + kRequestTimeout + kRequestTimeout + kExchangeDeadline + kRequestTimeout;
+}
+
 Status LookupPgEndpoint(const LoginEnvironment& env, const LoginOptions& options,
                         const std::string& token, std::string* pg_endpoint) {
   HttpResponse response;

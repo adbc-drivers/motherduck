@@ -29,7 +29,8 @@
 
 /// \file token_cache.h
 /// Where browser login's MotherDuck token comes from: memory, then the credentials
-/// file, then a login. The file holds {"version": 1, "motherduck_token": "<token>"}.
+/// file, then a login. The file holds {"version": 1, "motherduck_token": "<token>"}
+/// and may hold other tools' members, such as profiles, which are kept.
 
 namespace adbcpq::auth {
 using adbc::driver::Status;
@@ -51,17 +52,29 @@ struct Credentials {
 ///
 /// Thread-safe. Logins are serialized across the process, and across processes
 /// sharing the credentials file, so concurrent connections wait for one login
-/// rather than each starting their own.
+/// rather than each starting their own, and share its outcome, including a
+/// failure. After a denied login, the account (credentials file, client ID and
+/// API origin) doesn't open the browser again for a minute.
 class TokenCache {
  public:
   TokenCache(LoginEnvironment env, LoginOptions options)
       : env_(std::move(env)), options_(std::move(options)) {}
 
+  /// \brief Logins finished in the process; pass it to Get as since.
+  static uint64_t LoginsFinished();
+
   /// \brief Credentials to connect with, logging in through the browser unless a
   ///   saved token is usable.
   ///
   /// \param need_host Also look up the organization's Postgres endpoint.
-  Status Get(bool need_host, Credentials* credentials);
+  /// \param since LoginsFinished() when the connection attempt began. A failed
+  ///   login of the account that finished after that fails this Get too.
+  Status Get(bool need_host, Credentials* credentials, uint64_t since);
+
+  /// \brief Get, for a connection attempt that begins now.
+  Status Get(bool need_host, Credentials* credentials) {
+    return Get(need_host, credentials, LoginsFinished());
+  }
 
   /// \brief Handle a token the Postgres endpoint rejected.
   ///
@@ -76,14 +89,12 @@ class TokenCache {
  private:
   using Deadline = std::optional<std::chrono::steady_clock::time_point>;
 
-  // When to stop waiting for another login: after the login timeout, or never
-  // without one.
+  // The login timeout from now, if there is one.
   Deadline LockDeadline() const;
-  bool LockWithin(std::unique_lock<std::mutex>* lock, const Deadline& deadline) const;
   Status LockCredentials(const std::filesystem::path& path, const Deadline& deadline,
                          std::unique_ptr<CredentialsLock>* lock) const;
   Status Login(const std::filesystem::path& path, const std::string& rejected,
-               const Deadline& deadline, bool* fresh);
+               const Deadline& deadline, uint64_t since, bool* fresh);
   void ForgetLocked(const std::filesystem::path& path, const Deadline& deadline);
 
   const LoginEnvironment env_;
@@ -114,6 +125,27 @@ class CredentialsLock {
   intptr_t handle_;
 };
 
+/// \brief A login in progress, announced in credentials.json.login by the process
+///   holding the credentials lock, so waiters know how long to wait.
+struct LoginAnnouncement {
+  /// \brief For error messages only: in another PID namespace it means nothing.
+  int64_t pid = 0;
+  /// \brief When the login ends at the latest.
+  std::chrono::system_clock::time_point until;
+
+  bool operator==(const LoginAnnouncement&) const = default;
+};
+
+/// \brief Announce that this process is logging in through the credentials file
+///   at path until at most until.
+Status AnnounceLogin(const std::filesystem::path& path,
+                     std::chrono::system_clock::time_point until);
+
+/// \brief The announced login, or nullopt if there's none or it's unreadable.
+std::optional<LoginAnnouncement> ReadLoginAnnouncement(const std::filesystem::path& path);
+
+void RemoveLoginAnnouncement(const std::filesystem::path& path);
+
 /// \brief $MOTHERDUCK_HOME/credentials.json, or ~/.motherduck/credentials.json.
 Status CredentialsPath(std::filesystem::path* path);
 
@@ -121,10 +153,12 @@ Status CredentialsPath(std::filesystem::path* path);
 ///   file.
 std::optional<std::string> LoadSavedToken(const std::filesystem::path& path);
 
-/// \brief Atomically replace the file, readable only by the user.
+/// \brief Set the file's motherduck_token atomically, keeping its other members;
+///   create it, readable only by the user, if it's missing.
 Status SaveToken(const std::filesystem::path& path, std::string_view token);
 
-/// \brief Delete the file if it still holds this token.
+/// \brief Remove the file's motherduck_token if it's still this token, and the
+///   file if nothing else is left in it.
 void RemoveSavedToken(const std::filesystem::path& path, std::string_view token);
 
 }  // namespace adbcpq::auth

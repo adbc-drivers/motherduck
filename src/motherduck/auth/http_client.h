@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <utility>
@@ -30,6 +31,10 @@ struct HttpResponse {
 };
 
 using FormFields = std::vector<std::pair<std::string, std::string>>;
+
+/// \brief The longest one request of MakeHttpClient's client takes, from
+///   connecting to the last byte of the response.
+inline constexpr std::chrono::seconds kRequestTimeout{30};
 
 /// \brief The HTTPS requests that login makes.
 ///

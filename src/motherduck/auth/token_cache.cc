@@ -19,13 +19,14 @@
 
 #include "auth/token_cache.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <fstream>
-#include <functional>
-#include <iterator>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -54,7 +55,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::uintmax_t kMaxFileBytes = 64 * 1024;
+// Room for many other tools' profiles, each with a token of about 1 KB.
+constexpr size_t kMaxFileBytes = 1024 * 1024;
 
 std::string PathString(const fs::path& path) {
   const std::u8string utf8 = path.u8string();
@@ -133,6 +135,33 @@ Status WritePrivateFile(const fs::path& path, const std::string& contents) {
   if (!ok) return Status(ADBC_STATUS_IO, "[motherduck] Could not write " + name);
   return Status::Ok();
 }
+
+// Shares delete access, so a writer can rename over or remove the file meanwhile.
+std::optional<std::string> ReadSmallFile(const fs::path& path, size_t max_bytes) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return std::nullopt;
+  std::string contents;
+  char buffer[4096];
+  bool ok = true;
+  while (true) {
+    DWORD n = 0;
+    if (!ReadFile(file, buffer, sizeof(buffer), &n, nullptr)) {
+      ok = false;
+      break;
+    }
+    if (n == 0) break;
+    contents.append(buffer, n);
+    if (contents.size() > max_bytes) {
+      ok = false;
+      break;
+    }
+  }
+  CloseHandle(file);
+  if (!ok) return std::nullopt;
+  return contents;
+}
 #else
 std::optional<fs::path> EnvPath(const char* name) {
   const char* value = std::getenv(name);
@@ -179,6 +208,30 @@ Status WritePrivateFile(const fs::path& path, const std::string& contents) {
   if (!ok) return Status(ADBC_STATUS_IO, "[motherduck] Could not write " + name);
   return Status::Ok();
 }
+
+std::optional<std::string> ReadSmallFile(const fs::path& path, size_t max_bytes) {
+  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return std::nullopt;
+  std::string contents;
+  char buffer[4096];
+  bool ok = true;
+  while (true) {
+    const ssize_t n = read(fd, buffer, sizeof(buffer));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      ok = n == 0;
+      break;
+    }
+    contents.append(buffer, static_cast<size_t>(n));
+    if (contents.size() > max_bytes) {
+      ok = false;
+      break;
+    }
+  }
+  close(fd);
+  if (!ok) return std::nullopt;
+  return contents;
+}
 #endif
 
 std::string_view Trim(std::string_view text) {
@@ -188,28 +241,44 @@ std::string_view Trim(std::string_view text) {
   return text.substr(start, text.find_last_not_of(kWhitespace) - start + 1);
 }
 
-// Logins share the credentials file, so one lock for the process lets a second
-// database wait for the first one's login and then use its token.
+// Polling for the lock starts at the first and backs off to the second.
 constexpr std::chrono::milliseconds kLockPollInterval{100};
+constexpr std::chrono::milliseconds kMaxLockPollInterval{2000};
 
-// Retry try_acquire until it succeeds or the deadline passes.
-bool Poll(const LoginEnvironment& env, std::chrono::steady_clock::time_point deadline,
-          const std::function<bool()>& try_acquire) {
-  while (!try_acquire()) {
-    if (env.now() >= deadline) return false;
-    env.sleep(kLockPollInterval);
-  }
-  return true;
-}
+// Without a login timeout, how long to wait for a lock held without an announced
+// login. Its holder is only saving or deleting a token.
+constexpr std::chrono::seconds kUnannouncedHoldWait{30};
+// How long an announced login must stay overdue to count as stuck.
+constexpr std::chrono::seconds kAnnouncementGrace{10};
+// How long to refuse new logins after a denied one.
+constexpr std::chrono::seconds kDeniedLoginBackoff{60};
 
 Status WaitTimedOut() {
   return Status(ADBC_STATUS_TIMEOUT,
                 "[motherduck] Timed out waiting for another MotherDuck login to finish");
 }
 
-std::mutex& LoginMutex() {
-  static std::mutex mutex;
-  return mutex;
+// An account's latest login, if it failed.
+struct FailedLogin {
+  uint64_t number = 0;  // In SharedLogin::finished.
+  AdbcStatusCode code = ADBC_STATUS_OK;
+  std::string message;
+  std::optional<std::chrono::steady_clock::time_point> paused_until;  // If denied.
+};
+
+struct SharedLogin {
+  // Held while a TokenCache uses its token, including while it logs in, so
+  // other connections wait for that login instead of starting their own.
+  std::mutex mutex;
+  std::atomic<uint64_t> finished{0};
+  // Guarded by mutex. Keyed by credentials file, client ID and API origin, so
+  // databases set up differently don't share failures.
+  std::map<std::string, FailedLogin> failures;
+};
+
+SharedLogin& Shared() {
+  static SharedLogin shared;
+  return shared;
 }
 
 // Create the credentials directory, readable only by the user, if it's missing.
@@ -229,6 +298,31 @@ fs::path LockPath(const fs::path& path) {
   fs::path lock_path = path;
   lock_path += ".lock";
   return lock_path;
+}
+
+fs::path AnnouncementPath(const fs::path& path) {
+  fs::path announcement = path;
+  announcement += ".login";
+  return announcement;
+}
+
+// Write a sibling and rename it over path, so readers never see a partial file.
+Status ReplacePrivateFile(const fs::path& path, const std::string& contents) {
+  std::error_code ec;
+  const fs::path directory = path.parent_path();
+  UNWRAP_STATUS(EnsureDirectory(directory));
+  const fs::path temporary = directory / ("." + PathString(path.filename()) + "." +
+                                          std::to_string(ProcessId()) + ".tmp");
+  Status status = WritePrivateFile(temporary, contents);
+  if (status.ok()) {
+    fs::rename(temporary, path, ec);
+    if (ec) {
+      status = Status(ADBC_STATUS_IO, "[motherduck] Could not replace " +
+                                          PathString(path) + ": " + ec.message());
+    }
+  }
+  if (!status.ok()) fs::remove(temporary, ec);
+  return status;
 }
 
 }  // namespace
@@ -305,14 +399,9 @@ Status CredentialsPath(fs::path* path) {
   return Status::Ok();
 }
 
-std::optional<std::string> LoadSavedToken(const fs::path& path) {
-  std::error_code ec;
-  const std::uintmax_t size = fs::file_size(path, ec);
-  if (ec || size > kMaxFileBytes) return std::nullopt;
-  std::ifstream file(path, std::ios::binary);
-  if (!file) return std::nullopt;
-  const std::string text((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
+namespace {
+
+std::optional<std::string> ParseSavedToken(std::string_view text) {
   const JsonObject credentials = JsonObject::Parse(text);
   if (credentials.GetInt("version") != 1) return std::nullopt;
   const std::optional<std::string> token = credentials.GetString("motherduck_token");
@@ -322,40 +411,92 @@ std::optional<std::string> LoadSavedToken(const fs::path& path) {
   return std::string(trimmed);
 }
 
+}  // namespace
+
+std::optional<std::string> LoadSavedToken(const fs::path& path) {
+  const std::optional<std::string> text = ReadSmallFile(path, kMaxFileBytes);
+  if (!text) return std::nullopt;
+  return ParseSavedToken(*text);
+}
+
 Status SaveToken(const fs::path& path, std::string_view token) {
+  // Other tools keep more in the file, so change only the token. Not when the
+  // file can't be read, though: that would replace whatever is in it.
   std::error_code ec;
-  const fs::path directory = path.parent_path();
-  UNWRAP_STATUS(EnsureDirectory(directory));
-  // Write a sibling and rename it over the file, so readers never see a partial file.
-  const fs::path temporary = directory / ("." + PathString(path.filename()) + "." +
-                                          std::to_string(ProcessId()) + ".tmp");
-  const std::optional<std::string> contents = CredentialsJson(token);
+  const std::optional<std::string> existing = ReadSmallFile(path, kMaxFileBytes);
+  if (!existing && fs::exists(path, ec)) {
+    return Status(ADBC_STATUS_IO, "[motherduck] Could not read " + PathString(path));
+  }
+  const std::optional<std::string> contents =
+      UpdateCredentialsJson(existing.value_or(""), token);
   if (!contents) {
     return Status(ADBC_STATUS_INVALID_ARGUMENT,
-                  "[motherduck] Could not encode the MotherDuck token");
+                  "[motherduck] Could not save the MotherDuck token in " +
+                      PathString(path) + ", which has an unknown version");
   }
-  Status status = WritePrivateFile(temporary, *contents);
-  if (status.ok()) {
-    fs::rename(temporary, path, ec);
-    if (ec) {
-      status = Status(ADBC_STATUS_IO, "[motherduck] Could not replace " +
-                                          PathString(path) + ": " + ec.message());
-    }
+  return ReplacePrivateFile(path, *contents);
+}
+
+Status AnnounceLogin(const fs::path& path, std::chrono::system_clock::time_point until) {
+  const int64_t until_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(until.time_since_epoch())
+          .count();
+  return ReplacePrivateFile(AnnouncementPath(path), std::to_string(ProcessId()) + " " +
+                                                        std::to_string(until_ms) + "\n");
+}
+
+std::optional<LoginAnnouncement> ReadLoginAnnouncement(const fs::path& path) {
+  const std::optional<std::string> contents = ReadSmallFile(AnnouncementPath(path), 64);
+  if (!contents) return std::nullopt;
+  const std::string_view text = Trim(*contents);
+  const size_t space = text.find(' ');
+  if (space == std::string_view::npos) return std::nullopt;
+  int64_t pid = 0;
+  int64_t until_ms = 0;
+  const std::string_view pid_text = text.substr(0, space);
+  const std::string_view until_text = text.substr(space + 1);
+  const auto [pid_end, pid_ec] =
+      std::from_chars(pid_text.data(), pid_text.data() + pid_text.size(), pid);
+  const auto [until_end, until_ec] =
+      std::from_chars(until_text.data(), until_text.data() + until_text.size(), until_ms);
+  if (pid_ec != std::errc() || pid_end != pid_text.data() + pid_text.size() ||
+      until_ec != std::errc() || until_end != until_text.data() + until_text.size() ||
+      pid <= 0) {
+    return std::nullopt;
   }
-  if (!status.ok()) fs::remove(temporary, ec);
-  return status;
+  LoginAnnouncement announcement;
+  announcement.pid = pid;
+  announcement.until =
+      std::chrono::system_clock::time_point(std::chrono::milliseconds(until_ms));
+  return announcement;
+}
+
+void RemoveLoginAnnouncement(const fs::path& path) {
+  std::error_code ec;
+  fs::remove(AnnouncementPath(path), ec);
 }
 
 void RemoveSavedToken(const fs::path& path, std::string_view token) {
-  if (LoadSavedToken(path) != token) return;
+  const std::optional<std::string> text = ReadSmallFile(path, kMaxFileBytes);
+  if (!text || ParseSavedToken(*text) != token) return;
+  // Only the token: other tools' profiles in the file stay signed in.
+  const std::optional<std::string> contents = UpdateCredentialsJson(*text, std::nullopt);
+  if (!contents) return;
   std::error_code ec;
-  fs::remove(path, ec);
+  if (contents->empty()) {
+    fs::remove(path, ec);
+  } else {
+    ReplacePrivateFile(path, *contents);
+  }
 }
 
-Status TokenCache::Get(bool need_host, Credentials* credentials) {
+uint64_t TokenCache::LoginsFinished() { return Shared().finished.load(); }
+
+Status TokenCache::Get(bool need_host, Credentials* credentials, uint64_t since) {
+  // No deadline: a login in progress ends by its own timeout, and this
+  // connection needs its token.
+  std::lock_guard<std::mutex> lock(Shared().mutex);
   const Deadline deadline = LockDeadline();
-  std::unique_lock<std::mutex> lock(LoginMutex(), std::defer_lock);
-  if (!LockWithin(&lock, deadline)) return WaitTimedOut();
   fs::path path;
   UNWRAP_STATUS(CredentialsPath(&path));
 
@@ -367,7 +508,7 @@ Status TokenCache::Get(bool need_host, Credentials* credentials) {
     if (saved) {
       token_ = std::move(*saved);
     } else {
-      UNWRAP_STATUS(Login(path, /*rejected=*/"", deadline, &fresh));
+      UNWRAP_STATUS(Login(path, /*rejected=*/"", deadline, since, &fresh));
     }
   }
 
@@ -377,7 +518,7 @@ Status TokenCache::Get(bool need_host, Credentials* credentials) {
       // The saved token expired or was revoked.
       const std::string rejected = token_;
       ForgetLocked(path, deadline);
-      UNWRAP_STATUS(Login(path, rejected, deadline, &fresh));
+      UNWRAP_STATUS(Login(path, rejected, deadline, since, &fresh));
       status =
           host_.empty() ? LookupPgEndpoint(env_, options_, token_, &host_) : Status::Ok();
     }
@@ -391,9 +532,8 @@ Status TokenCache::Get(bool need_host, Credentials* credentials) {
 }
 
 bool TokenCache::Reject(const std::string& token) {
+  std::lock_guard<std::mutex> lock(Shared().mutex);
   const Deadline deadline = LockDeadline();
-  std::unique_lock<std::mutex> lock(LoginMutex(), std::defer_lock);
-  if (!LockWithin(&lock, deadline)) return false;
   if (token != token_) return true;
   // Keep the token if the API accepts it, or can't be reached: the failure has
   // another cause, which logging in again wouldn't fix.
@@ -417,30 +557,48 @@ TokenCache::Deadline TokenCache::LockDeadline() const {
   return env_.now() + options_.timeout;
 }
 
-bool TokenCache::LockWithin(std::unique_lock<std::mutex>* lock,
-                            const Deadline& deadline) const {
-  if (!deadline) {
-    lock->lock();
-    return true;
-  }
-  return Poll(env_, *deadline, [lock] { return lock->try_lock(); });
-}
-
 Status TokenCache::LockCredentials(const fs::path& path, const Deadline& deadline,
                                    std::unique_ptr<CredentialsLock>* lock) const {
-  if (!deadline) return CredentialsLock::Acquire(path, lock);
-  Status status;
-  const bool acquired = Poll(env_, *deadline, [&] {
-    status = CredentialsLock::Acquire(path, lock, /*block=*/false);
-    return !status.ok() || *lock != nullptr;
-  });
-  if (!status.ok()) return status;
-  if (!acquired) return WaitTimedOut();
-  return Status::Ok();
+  auto unannounced_deadline = deadline ? *deadline : env_.now() + kUnannouncedHoldWait;
+  auto poll = kLockPollInterval;
+  // The overdue announcement seen last, and since when.
+  std::optional<std::pair<LoginAnnouncement, std::chrono::steady_clock::time_point>>
+      overdue;
+  while (true) {
+    UNWRAP_STATUS(CredentialsLock::Acquire(path, lock, /*block=*/false));
+    if (*lock != nullptr) {
+      // Left by a process that no longer holds the lock, such as one that crashed.
+      RemoveLoginAnnouncement(path);
+      return Status::Ok();
+    }
+    // Wait for an announced login however long it takes, unless it's stuck. A
+    // stale announcement is only overdue until the new holder removes it, so
+    // that alone doesn't make the login stuck.
+    if (std::optional<LoginAnnouncement> login = ReadLoginAnnouncement(path)) {
+      if (std::chrono::system_clock::now() <= login->until) {
+        overdue.reset();
+      } else if (!overdue || overdue->first != *login) {
+        overdue.emplace(*login, env_.now());
+      } else if (env_.now() - overdue->second >= kAnnouncementGrace) {
+        return Status(ADBC_STATUS_TIMEOUT,
+                      "[motherduck] Process " + std::to_string(login->pid) +
+                          " has been logging in to MotherDuck for longer than its "
+                          "timeout and still holds " +
+                          PathString(LockPath(path)) + "; end it to log in here");
+      }
+      // After its login, the holder still saves the token; don't time out then.
+      unannounced_deadline =
+          std::max(unannounced_deadline, env_.now() + kUnannouncedHoldWait);
+    } else if (env_.now() >= unannounced_deadline) {
+      return WaitTimedOut();
+    }
+    env_.sleep(poll);
+    poll = std::min(poll * 2, kMaxLockPollInterval);
+  }
 }
 
 Status TokenCache::Login(const fs::path& path, const std::string& rejected,
-                         const Deadline& deadline, bool* fresh) {
+                         const Deadline& deadline, uint64_t since, bool* fresh) {
   // Wait for a login another process is running through the same file, and use
   // its token. Without the lock, such as in a read-only home directory, log in
   // anyway.
@@ -455,8 +613,41 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
     return Status::Ok();
   }
 
+  SharedLogin& shared = Shared();
+  const std::string account =
+      PathString(path) + '\n' + options_.client_id + '\n' + options_.api_origin;
+  FailedLogin& failure = shared.failures[account];
+  // A login that failed during this connection attempt fails it too.
+  if (failure.number > since) return Status(failure.code, failure.message);
+  // A denial would likely recur; a timeout or network error may not, so only
+  // a denial pauses.
+  if (failure.paused_until && env_.now() < *failure.paused_until) {
+    const auto wait =
+        std::chrono::ceil<std::chrono::seconds>(*failure.paused_until - env_.now());
+    return Status(ADBC_STATUS_UNAUTHENTICATED,
+                  failure.message + " (not opening the browser again for " +
+                      std::to_string(wait.count()) + " seconds)");
+  }
+
+  const bool announced =
+      lock != nullptr &&
+      AnnounceLogin(path, std::chrono::system_clock::now() + MaxLoginDuration(options_))
+          .ok();
   LoginResult result;
-  UNWRAP_STATUS(DeviceLogin(env_, options_, &result));
+  Status status = DeviceLogin(env_, options_, &result);
+  const uint64_t number = ++shared.finished;
+  if (!status.ok()) {
+    if (announced) RemoveLoginAnnouncement(path);
+    failure.number = number;
+    failure.code = status.ToAdbc(nullptr);
+    failure.message = status.message();
+    failure.paused_until.reset();
+    if (failure.code == ADBC_STATUS_UNAUTHENTICATED) {
+      failure.paused_until = env_.now() + kDeniedLoginBackoff;
+    }
+    return status;
+  }
+  shared.failures.erase(account);
   token_ = std::move(result.token);
   host_ = std::move(result.pg_endpoint);
   *fresh = true;
@@ -464,6 +655,9 @@ Status TokenCache::Login(const fs::path& path, const std::string& rejected,
   if (!saved.ok()) {
     env_.print(saved.message() + ". You'll be asked to log in again next time.");
   }
+  // Only after saving, so waiters never see the lock held with neither an
+  // announcement nor a saved token.
+  if (announced) RemoveLoginAnnouncement(path);
   return Status::Ok();
 }
 

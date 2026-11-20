@@ -79,6 +79,11 @@ class TempDir {
   fs::path path_;
 };
 
+std::string ReadFile(const fs::path& path) {
+  std::ifstream file(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(file), {});
+}
+
 void WriteFile(const fs::path& path, const std::string& contents) {
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   file << contents;
@@ -234,10 +239,67 @@ TEST(MotherDuckJsonTest, ReadsLargeNumbers) {
   EXPECT_EQ(object.GetInt("tiny"), std::numeric_limits<int64_t>::min());
 }
 
-TEST(MotherDuckJsonTest, CredentialsJson) {
-  EXPECT_EQ(adbcpq::auth::CredentialsJson("a.b/c\"d"),
-            "{\n  \"version\": 1,\n  \"motherduck_token\": \"a.b/c\\\"d\"\n}\n");
-  EXPECT_EQ(adbcpq::auth::CredentialsJson("\xff"), std::nullopt);
+// What the MotherDuck CLI writes with several profiles, the second active.
+constexpr char kProfilesFile[] = R"({
+  "version": 1,
+  "motherduck_token": "token-b",
+  "profiles": {
+    "a": {
+      "motherduck_token": "token-a"
+    },
+    "b": {
+      "motherduck_token": "token-b"
+    }
+  }
+}
+)";
+
+TEST(MotherDuckJsonTest, NewCredentialsFile) {
+  using adbcpq::auth::UpdateCredentialsJson;
+  const std::string expected =
+      "{\n  \"version\": 1,\n  \"motherduck_token\": \"a.b/c\\\"d\"\n}\n";
+  EXPECT_EQ(UpdateCredentialsJson("", "a.b/c\"d"), expected);
+  // Not a JSON object: start anew.
+  EXPECT_EQ(UpdateCredentialsJson("not json", "a.b/c\"d"), expected);
+  EXPECT_EQ(UpdateCredentialsJson("[1]", "a.b/c\"d"), expected);
+  EXPECT_EQ(UpdateCredentialsJson("", "\xff"), std::nullopt);
+}
+
+TEST(MotherDuckJsonTest, UpdateKeepsOtherMembers) {
+  using adbcpq::auth::UpdateCredentialsJson;
+  // The token is replaced in place.
+  std::string expected = kProfilesFile;
+  expected.replace(expected.find("\"token-b\""), 9, "\"md-token\"");
+  EXPECT_EQ(UpdateCredentialsJson(kProfilesFile, "md-token"), expected);
+
+  // A file without a top-level token gets one after the version.
+  EXPECT_EQ(UpdateCredentialsJson(R"({"version":1,"profiles":{},"other":[1]})", "t"),
+            "{\n  \"version\": 1,\n  \"motherduck_token\": \"t\",\n  \"profiles\": {},\n"
+            "  \"other\": [\n    1\n  ]\n}\n");
+  // And a file without a version gets one.
+  EXPECT_EQ(
+      UpdateCredentialsJson(R"({"other":true})", "t"),
+      "{\n  \"version\": 1,\n  \"motherduck_token\": \"t\",\n  \"other\": true\n}\n");
+}
+
+TEST(MotherDuckJsonTest, RemoveTokenKeepsOtherMembers) {
+  using adbcpq::auth::UpdateCredentialsJson;
+  std::string expected = kProfilesFile;
+  const std::string top_token = "  \"motherduck_token\": \"token-b\",\n";
+  expected.erase(expected.find(top_token), top_token.size());
+  EXPECT_EQ(UpdateCredentialsJson(kProfilesFile, std::nullopt), expected);
+  // Nothing but the version left.
+  EXPECT_EQ(
+      UpdateCredentialsJson(R"({"version":1,"motherduck_token":"t"})", std::nullopt), "");
+}
+
+TEST(MotherDuckJsonTest, LeavesOtherVersionsAlone) {
+  using adbcpq::auth::UpdateCredentialsJson;
+  for (const char* existing : {R"({"version":2,"motherduck_token":"t"})",
+                               R"({"version":"1"})", R"({"version":1.5})"}) {
+    EXPECT_EQ(UpdateCredentialsJson(existing, "new"), std::nullopt) << existing;
+    EXPECT_EQ(UpdateCredentialsJson(existing, std::nullopt), std::nullopt) << existing;
+  }
 }
 
 TEST_F(LoginTest, DeviceLogin) {
@@ -401,6 +463,17 @@ TEST_F(LoginTest, LookupPgEndpointRejected) {
   EXPECT_THAT(status.message(), HasSubstr("Invalid token"));
 }
 
+TEST_F(LoginTest, MaxLoginDuration) {
+  // The wait for approval, plus three requests and the exchange's 60s of retries.
+  options_.timeout = 120s;
+  EXPECT_EQ(adbcpq::auth::MaxLoginDuration(options_), 270s);
+  // Without a timeout, until the login code expires, at most after an hour.
+  options_.timeout = 0s;
+  EXPECT_EQ(adbcpq::auth::MaxLoginDuration(options_), 3750s);
+  options_.timeout = std::chrono::seconds(std::numeric_limits<int64_t>::max());
+  EXPECT_EQ(adbcpq::auth::MaxLoginDuration(options_), 3750s);
+}
+
 TEST_F(LoginTest, LookupPgEndpointNotFound) {
   http_->Respond(kLookupUserWithTokenUrl, 404,
                  R"({"errMessage":"Route not found: GET /mom/lookup-user-with-token",)"
@@ -502,6 +575,61 @@ TEST_F(CredentialsFileTest, IgnoresInvalidFiles) {
   }
 }
 
+TEST_F(CredentialsFileTest, LoginAnnouncement) {
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
+  const auto until = std::chrono::system_clock::now() + 90s;
+  ASSERT_TRUE(adbcpq::auth::AnnounceLogin(path_, until).ok());
+  std::optional<adbcpq::auth::LoginAnnouncement> read =
+      adbcpq::auth::ReadLoginAnnouncement(path_);
+  ASSERT_TRUE(read.has_value());
+  EXPECT_GT(read->pid, 0);
+  EXPECT_EQ(std::chrono::floor<std::chrono::milliseconds>(read->until),
+            std::chrono::floor<std::chrono::milliseconds>(until));
+  adbcpq::auth::RemoveLoginAnnouncement(path_);
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
+
+  fs::path announcement = path_;
+  announcement += ".login";
+  WriteFile(announcement, "1234 5\n");
+  read = adbcpq::auth::ReadLoginAnnouncement(path_);
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->pid, 1234);
+  EXPECT_EQ(read->until, std::chrono::system_clock::time_point(5ms));
+  for (const char* contents : {"", "1234", "x 5", "0 5", "-3 5", "12 5 extra", "12 x"}) {
+    WriteFile(announcement, contents);
+    EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt) << contents;
+  }
+}
+
+TEST_F(CredentialsFileTest, SaveKeepsOtherToolsProfiles) {
+  WriteFile(path_, kProfilesFile);
+  ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "md-token").ok());
+  EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), "md-token");
+  std::string expected = kProfilesFile;
+  expected.replace(expected.find("\"token-b\""), 9, "\"md-token\"");
+  EXPECT_EQ(ReadFile(path_), expected);
+}
+
+TEST_F(CredentialsFileTest, RemoveKeepsOtherToolsProfiles) {
+  WriteFile(path_, kProfilesFile);
+  adbcpq::auth::RemoveSavedToken(path_, "token-b");
+  EXPECT_EQ(adbcpq::auth::LoadSavedToken(path_), std::nullopt);
+  const std::string contents = ReadFile(path_);
+  EXPECT_THAT(contents, HasSubstr("\"profiles\""));
+  EXPECT_THAT(contents, HasSubstr("token-a"));
+  // The profile keeps its own copy of the rejected token: the other tool
+  // decides about it.
+  EXPECT_THAT(contents, HasSubstr("token-b"));
+}
+
+TEST_F(CredentialsFileTest, SaveLeavesUnknownVersionAlone) {
+  const std::string future = R"({"version":2,"motherduck_token":"t"})";
+  WriteFile(path_, future);
+  EXPECT_FALSE(adbcpq::auth::SaveToken(path_, "md-token").ok());
+  adbcpq::auth::RemoveSavedToken(path_, "t");
+  EXPECT_EQ(ReadFile(path_), future);
+}
+
 TEST_F(CredentialsFileTest, RemoveOnlyMatchingToken) {
   ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "token-1").ok());
   adbcpq::auth::RemoveSavedToken(path_, "token-2");
@@ -576,9 +704,12 @@ TEST_F(TokenCacheTest, LogsInWhenApiRejectsSavedToken) {
 }
 
 TEST_F(TokenCacheTest, UsesTokenFromLoginInAnotherProcess) {
-  // Holding the lock stands in for another process that is logging in.
+  // Holding the lock and announcing a login stands in for another process that
+  // is logging in.
   std::unique_ptr<adbcpq::auth::CredentialsLock> other;
   ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() + 1h).ok());
   TokenCache cache = MakeCache();
   Credentials credentials;
   std::future<Status> result = std::async(
@@ -601,6 +732,237 @@ TEST_F(TokenCacheTest, TimesOutWaitingForLoginInAnotherProcess) {
   Credentials credentials;
   EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
   EXPECT_TRUE(http_->requests.empty());
+}
+
+TEST_F(TokenCacheTest, WaitsPastTimeoutForAnnouncedLogin) {
+  // Another process announced a login that may take an hour: wait for it past
+  // this database's own login timeout, then use its token.
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() + 1h).ok());
+  options_.timeout = 5s;
+  const auto start = now_;
+  env_.sleep = [&](std::chrono::milliseconds duration) {
+    now_ += duration;
+    if (other && now_ - start > 20s) {
+      ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "other-token").ok());
+      adbcpq::auth::RemoveLoginAnnouncement(path_);
+      other.reset();
+    }
+  };
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "other-token");
+  EXPECT_FALSE(credentials.fresh);
+  EXPECT_TRUE(http_->requests.empty());
+}
+
+TEST_F(TokenCacheTest, TimesOutWhenAnnouncedLoginIsOverdue) {
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() - 1h).ok());
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  const auto start = now_;
+  const Status status = cache.Get(/*need_host=*/false, &credentials);
+  EXPECT_EQ(Code(status), ADBC_STATUS_TIMEOUT);
+  EXPECT_THAT(status.message(), HasSubstr("longer than its timeout"));
+  // Overdue for 10s of polling, not just once.
+  EXPECT_GE(now_ - start, 10s);
+  EXPECT_LT(now_ - start, 13s);
+}
+
+TEST_F(TokenCacheTest, ToleratesStaleAnnouncementBriefly) {
+  // A crashed login left an overdue announcement, and a new holder has the lock
+  // until it removes it: not a stuck login.
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() - 1h).ok());
+  const auto start = now_;
+  env_.sleep = [&](std::chrono::milliseconds duration) {
+    now_ += duration;
+    adbcpq::auth::RemoveLoginAnnouncement(path_);
+    if (other && now_ - start > 2s) {
+      ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "other-token").ok());
+      other.reset();
+    }
+  };
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "other-token");
+}
+
+TEST_F(TokenCacheTest, RemovesStaleAnnouncementWhenLocking) {
+  ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "saved-token").ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() + 1h).ok());
+  http_->Respond(kLookupUserWithTokenUrl, 401, R"({"errMessage":"Invalid token"})");
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  // Forgetting the token takes the lock.
+  EXPECT_TRUE(cache.Reject("saved-token"));
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
+}
+
+TEST_F(TokenCacheTest, BacksOffPollingTheLock) {
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  options_.timeout = 10s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
+  ASSERT_GE(sleeps_.size(), 6);
+  EXPECT_EQ(sleeps_[0], 100ms);
+  EXPECT_EQ(sleeps_[1], 200ms);
+  EXPECT_EQ(sleeps_.back(), 2000ms);
+  EXPECT_LT(sleeps_.size(), 12);
+}
+
+TEST_F(TokenCacheTest, BoundsUnannouncedWaitWithoutTimeout) {
+  // login_timeout=0 used to wait forever for a lock held without a login.
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  options_.timeout = 0s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  const auto start = now_;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
+  EXPECT_GE(now_ - start, 30s);
+  EXPECT_LT(now_ - start, 33s);
+}
+
+TEST_F(TokenCacheTest, AnnouncesLoginWhileLoggingIn) {
+  RespondWithLogin();
+  std::optional<adbcpq::auth::LoginAnnouncement> during;
+  env_.open_browser = [&](const std::string&) {
+    during = adbcpq::auth::ReadLoginAnnouncement(path_);
+    return true;
+  };
+  options_.timeout = 120s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  const auto before = std::chrono::system_clock::now();
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  ASSERT_TRUE(during.has_value());
+  EXPECT_GT(during->pid, 0);
+  EXPECT_GE(during->until, std::chrono::floor<std::chrono::milliseconds>(
+                               before + adbcpq::auth::MaxLoginDuration(options_)));
+  EXPECT_LE(during->until,
+            std::chrono::system_clock::now() + adbcpq::auth::MaxLoginDuration(options_));
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
+}
+
+TEST_F(TokenCacheTest, PausesAfterDeniedLogin) {
+  http_->Respond(kDeviceCodeUrl, 200, kDeviceCode);
+  http_->Respond(kTokenUrl, 403,
+                 R"({"error":"access_denied","error_description":"User denied"})");
+  http_->Respond(kTokenUrl, 200, kIdToken);
+  http_->Respond(kLookupUserUrl, 200, kLookupUser);
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)),
+            ADBC_STATUS_UNAUTHENTICATED);
+
+  // Within a minute, this database and a new one of the account fail without
+  // opening the browser.
+  now_ += 30s;
+  const Status status = cache.Get(/*need_host=*/false, &credentials);
+  EXPECT_EQ(Code(status), ADBC_STATUS_UNAUTHENTICATED);
+  EXPECT_THAT(status.message(), HasSubstr("User denied"));
+  EXPECT_THAT(status.message(),
+              HasSubstr("not opening the browser again for 30 seconds"));
+  TokenCache other = MakeCache();
+  EXPECT_EQ(Code(other.Get(/*need_host=*/false, &credentials)),
+            ADBC_STATUS_UNAUTHENTICATED);
+  EXPECT_EQ(http_->Count(kDeviceCodeUrl), 1);
+  EXPECT_EQ(opened_.size(), 1);
+
+  // After it, log in again.
+  now_ += 31s;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "md-token");
+  EXPECT_EQ(http_->Count(kDeviceCodeUrl), 2);
+}
+
+TEST_F(TokenCacheTest, FailuresAreKeptPerAccount) {
+  // A database with another Auth0 application neither shares the failure of a
+  // login it overlapped nor pauses after it.
+  http_->Respond(kDeviceCodeUrl, 200, kDeviceCode);
+  http_->Respond(kTokenUrl, 401,
+                 R"({"error":"invalid_client","error_description":"Unknown client"})");
+  http_->Respond(kTokenUrl, 200, kIdToken);
+  http_->Respond(kLookupUserUrl, 200, kLookupUser);
+  const uint64_t since = TokenCache::LoginsFinished();
+  options_.client_id = "wrong-client";
+  TokenCache wrong = MakeCache();
+  options_.client_id = adbcpq::auth::kDefaultClientId;
+  TokenCache right = MakeCache();
+  Credentials credentials;
+  const Status failed = wrong.Get(/*need_host=*/false, &credentials, since);
+  EXPECT_EQ(Code(failed), ADBC_STATUS_UNAUTHENTICATED);
+  EXPECT_THAT(failed.message(), HasSubstr("Unknown client"));
+  ASSERT_TRUE(right.Get(/*need_host=*/false, &credentials, since).ok());
+  EXPECT_EQ(credentials.token, "md-token");
+  EXPECT_EQ(http_->Count(kDeviceCodeUrl), 2);
+}
+
+TEST_F(TokenCacheTest, WaitsWhileAnnouncedLoginSavesItsToken) {
+  // The other process's login ends after this database's login timeout; it
+  // then keeps the lock a little longer to save its token.
+  std::unique_ptr<adbcpq::auth::CredentialsLock> other;
+  ASSERT_TRUE(adbcpq::auth::CredentialsLock::Acquire(path_, &other).ok());
+  ASSERT_TRUE(
+      adbcpq::auth::AnnounceLogin(path_, std::chrono::system_clock::now() + 1h).ok());
+  options_.timeout = 5s;
+  const auto start = now_;
+  env_.sleep = [&](std::chrono::milliseconds duration) {
+    now_ += duration;
+    if (now_ - start > 20s) adbcpq::auth::RemoveLoginAnnouncement(path_);
+    if (other && now_ - start > 25s) {
+      ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "other-token").ok());
+      other.reset();
+    }
+  };
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "other-token");
+  EXPECT_TRUE(http_->requests.empty());
+}
+
+TEST_F(TokenCacheTest, KeepsAnnouncementUntilTokenIsSaved) {
+  // Saving fails (a directory is in the way), so Login prints a warning right
+  // after trying to save: the announcement must still be there then.
+  RespondWithLogin();
+  fs::create_directories(path_);
+  std::optional<adbcpq::auth::LoginAnnouncement> while_saving;
+  env_.print = [&](const std::string& message) {
+    if (message.find("log in again next time") != std::string::npos) {
+      while_saving = adbcpq::auth::ReadLoginAnnouncement(path_);
+    }
+  };
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_TRUE(while_saving.has_value());
+  EXPECT_EQ(adbcpq::auth::ReadLoginAnnouncement(path_), std::nullopt);
+}
+
+TEST_F(TokenCacheTest, NoPauseAfterTimedOutLogin) {
+  http_->Respond(kDeviceCodeUrl, 200, kDeviceCode);
+  http_->Respond(kTokenUrl, 400, kPending);
+  options_.timeout = 10s;
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
+  EXPECT_EQ(Code(cache.Get(/*need_host=*/false, &credentials)), ADBC_STATUS_TIMEOUT);
+  EXPECT_EQ(http_->Count(kDeviceCodeUrl), 2);
 }
 
 TEST_F(TokenCacheTest, LoginFailure) {
@@ -626,6 +988,22 @@ TEST_F(TokenCacheTest, RejectLogsInAgain) {
   ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
   EXPECT_EQ(credentials.token, "md-token");
   EXPECT_TRUE(credentials.fresh);
+}
+
+TEST_F(TokenCacheTest, RejectAndLoginKeepOtherToolsProfiles) {
+  WriteFile(path_, kProfilesFile);
+  http_->Respond(kLookupUserWithTokenUrl, 403, R"({"errMessage":"Invalid token"})");
+  RespondWithLogin();
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "token-b");
+  EXPECT_TRUE(cache.Reject("token-b"));
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "md-token");
+  std::string expected = kProfilesFile;
+  expected.replace(expected.find("\"token-b\""), 9, "\"md-token\"");
+  EXPECT_EQ(ReadFile(path_), expected);
 }
 
 TEST_F(TokenCacheTest, RejectIgnoresReplacedToken) {
