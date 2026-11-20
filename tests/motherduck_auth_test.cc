@@ -35,6 +35,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "auth/env.h"
 #include "auth/http_client.h"
 #include "auth/json.h"
 #include "auth/login.h"
@@ -526,6 +527,31 @@ TEST_F(CredentialsFileTest, PathInHomeDirectory) {
 }
 #endif
 
+TEST(MotherDuckHttpTest, ExtraRootsPem) {
+  TempDir dir;
+  const fs::path roots = dir.path() / "roots.pem";
+  WriteFile(roots, "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----");
+  // Ending in a newline, so more certificates can follow.
+  EXPECT_THAT(adbcpq::auth::ExtraRootsPem(roots.string()),
+              ::testing::StartsWith(
+                  "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n"));
+  // A file that can't be read adds nothing, rather than failing.
+  EXPECT_EQ(adbcpq::auth::ExtraRootsPem((dir.path() / "missing.pem").string()),
+            adbcpq::auth::ExtraRootsPem(""));
+  EXPECT_EQ(adbcpq::auth::ExtraRootsPem(dir.path().string()),
+            adbcpq::auth::ExtraRootsPem(""));
+}
+
+TEST(MotherDuckEnvTest, GetEnvUtf8) {
+  {
+    ScopedEnv set("MOTHERDUCK_AUTH_TEST_VAR", "d\xc3\xa9j\xc3\xa0");
+    EXPECT_EQ(adbcpq::auth::GetEnvUtf8("MOTHERDUCK_AUTH_TEST_VAR"), "d\xc3\xa9j\xc3\xa0");
+  }
+  EXPECT_EQ(adbcpq::auth::GetEnvUtf8("MOTHERDUCK_AUTH_TEST_VAR"), std::nullopt);
+  ScopedEnv empty("MOTHERDUCK_AUTH_TEST_VAR", "");
+  EXPECT_EQ(adbcpq::auth::GetEnvUtf8("MOTHERDUCK_AUTH_TEST_VAR"), std::nullopt);
+}
+
 TEST_F(CredentialsFileTest, SaveAndLoad) {
   const fs::path path = dir_.path() / "new" / "credentials.json";
   ASSERT_TRUE(adbcpq::auth::SaveToken(path, "token-1").ok());
@@ -646,6 +672,22 @@ class TokenCacheTest : public LoginTest {
   ScopedEnv home_{"MOTHERDUCK_HOME", dir_.path().string().c_str()};
   fs::path path_ = dir_.path() / "credentials.json";
 };
+
+#ifndef _WIN32
+TEST_F(TokenCacheTest, RefusesDirectoryOthersCanWrite) {
+  ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "planted-token").ok());
+  fs::permissions(dir_.path(), fs::perms::all, fs::perm_options::replace);
+  TokenCache cache = MakeCache();
+  Credentials credentials;
+  const Status status = cache.Get(/*need_host=*/false, &credentials);
+  EXPECT_EQ(Code(status), ADBC_STATUS_INVALID_STATE);
+  EXPECT_THAT(status.message(), HasSubstr("Other users can write to"));
+  EXPECT_TRUE(http_->requests.empty());
+  fs::permissions(dir_.path(), fs::perms::owner_all, fs::perm_options::replace);
+  ASSERT_TRUE(cache.Get(/*need_host=*/false, &credentials).ok());
+  EXPECT_EQ(credentials.token, "planted-token");
+}
+#endif
 
 TEST_F(TokenCacheTest, UsesSavedToken) {
   ASSERT_TRUE(adbcpq::auth::SaveToken(path_, "saved-token").ok());

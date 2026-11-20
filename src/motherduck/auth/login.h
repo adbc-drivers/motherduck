@@ -45,8 +45,8 @@ struct LoginEnvironment {
 
 /// \brief cpp-httplib, stderr, the default browser, and real time.
 ///
-/// \param ca_bundle A PEM file of trusted CAs, or empty for the default.
-LoginEnvironment DefaultLoginEnvironment(std::string ca_bundle);
+/// \param extra_roots A PEM file of CAs to trust besides the system's, or empty.
+LoginEnvironment DefaultLoginEnvironment(const std::string& extra_roots);
 
 struct LoginOptions {
   /// \brief The Auth0 application to log in through, such as kDefaultClientId.

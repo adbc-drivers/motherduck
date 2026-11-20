@@ -285,7 +285,8 @@ Like the MotherDuck DuckDB extension's login, it doesn't use an HTTP proxy.
   by the user, and a saved token is used without opening a browser. The driver
   reads and writes only the file's top-level `motherduck_token` (in a
   version 1 file) and keeps everything else in it, such as other tools' saved
-  profiles; a rejected token is removed from the file, not the whole file.
+  profiles; a rejected token is removed from the file, not the whole file. The
+  driver refuses to use a credentials directory that other users can write to.
 - Processes that use the same file take turns logging in, through
   `credentials.json.lock` next to it, so they share one login. The process
   logging in writes its process ID and when its login ends at the latest to
@@ -319,7 +320,7 @@ Related options and environment variables:
 | `motherduck.login_timeout` (database option) | Seconds to wait for the login (default `120`, at most `999999999`); `0` waits until the code expires, after 15 minutes. |
 | `motherduck.oauth_client_id` (database option) | The Auth0 application to log in through. |
 | `motherduck_host` (environment) | The MotherDuck API host, for example `api.staging.motherduck.com`. |
-| `motherduck.tls_root_cert_path` (database option) or `PGSSLROOTCERT` (environment) | A CA bundle that the login's HTTPS requests trust as well as the system's trust store. |
+| `motherduck.tls_root_cert_path` (database option) or `PGSSLROOTCERT` (environment) | A CA bundle that the login's HTTPS requests trust as well as the system's trust store. One that can't be read is skipped for the login. |
 
 Like the other options, these can be set in the URI's query, and they're read
 when the database is initialized: changing them afterwards has no effect.

@@ -23,6 +23,8 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -35,6 +37,7 @@
 #include <openssl/x509.h>
 
 #include "adbc_driver_motherduck_config.h"
+#include "motherduck_trust_store.h"
 
 namespace adbcpq::auth {
 
@@ -45,36 +48,20 @@ constexpr time_t kReadWriteTimeoutSeconds = 30;
 constexpr size_t kMaxResponseBytes = 1 << 20;
 constexpr std::string_view kHttps = "https://";
 
-#if !defined(_WIN32) && !defined(__APPLE__)
-// CA bundles of common Linux distributions, as Go's crypto/x509 lists them.
-constexpr const char* kSystemCaBundles[] = {
-    "/etc/ssl/certs/ca-certificates.crt",                 // Debian, Ubuntu, Arch
-    "/etc/pki/tls/certs/ca-bundle.crt",                   // Fedora, RHEL 6
-    "/etc/ssl/ca-bundle.pem",                             // openSUSE
-    "/etc/pki/tls/cacert.pem",                            // OpenELEC
-    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  // CentOS, RHEL 7
-    "/etc/ssl/cert.pem",                                  // Alpine
-};
-
-// A statically linked OpenSSL looks for CAs where its build machine kept them. If
-// they aren't here, and SSL_CERT_FILE or SSL_CERT_DIR doesn't say otherwise, use
-// the system's bundle. (httplib uses the Windows store and the macOS keychain.)
-std::string SystemCaBundle() {
-  if (std::getenv(X509_get_default_cert_file_env()) ||
-      std::getenv(X509_get_default_cert_dir_env())) {
-    return "";
-  }
+// The contents of a file of at most kMaxRootsBytes, or empty.
+constexpr std::uintmax_t kMaxRootsBytes = 16 << 20;
+std::string ReadRoots(const std::string& path) {
   std::error_code ec;
-  if (std::filesystem::is_regular_file(X509_get_default_cert_file(), ec) ||
-      std::filesystem::is_directory(X509_get_default_cert_dir(), ec)) {
+  if (path.empty() || !std::filesystem::is_regular_file(path, ec) ||
+      std::filesystem::file_size(path, ec) > kMaxRootsBytes || ec) {
     return "";
   }
-  for (const char* bundle : kSystemCaBundles) {
-    if (std::filesystem::is_regular_file(bundle, ec)) return bundle;
-  }
-  return "";
+  std::ifstream file(path, std::ios::binary);
+  std::string contents((std::istreambuf_iterator<char>(file)),
+                       std::istreambuf_iterator<char>());
+  if (!contents.empty() && contents.back() != '\n') contents += '\n';
+  return contents;
 }
-#endif
 
 // Split https://host[:port]/path into its origin and path.
 bool SplitUrl(const std::string& url, std::string* origin, std::string* path) {
@@ -104,11 +91,8 @@ std::string Describe(const httplib::Result& result) {
 
 class HttplibClient : public HttpClient {
  public:
-  explicit HttplibClient(std::string ca_bundle) : ca_bundle_(std::move(ca_bundle)) {
-#if !defined(_WIN32) && !defined(__APPLE__)
-    if (ca_bundle_.empty()) ca_bundle_ = SystemCaBundle();
-#endif
-  }
+  explicit HttplibClient(const std::string& extra_roots)
+      : roots_pem_(ExtraRootsPem(extra_roots)) {}
 
   Status Get(const std::string& url, const std::string& bearer_token,
              HttpResponse* response) override {
@@ -147,9 +131,9 @@ class HttplibClient : public HttpClient {
       client.enable_server_hostname_verification(true);
       client.set_default_headers(
           {{"User-Agent", "adbc-driver-motherduck/" ADBC_DRIVER_MOTHERDUCK_VERSION}});
-      if (!ca_bundle_.empty()) client.set_ca_cert_path(ca_bundle_);
-      // Trust the system's CAs too: a bundle meant for the Postgres endpoint
-      // shouldn't break the login's requests.
+      if (!roots_pem_.empty()) {
+        client.load_ca_cert_store(roots_pem_.data(), roots_pem_.size());
+      }
       client.enable_system_ca(true);
 
       httplib::Result result = request(client, path);
@@ -166,13 +150,34 @@ class HttplibClient : public HttpClient {
     }
   }
 
-  std::string ca_bundle_;
+  const std::string roots_pem_;
 };
 
 }  // namespace
 
-std::unique_ptr<HttpClient> MakeHttpClient(std::string ca_bundle) {
-  return std::make_unique<HttplibClient>(std::move(ca_bundle));
+std::string ExtraRootsPem(const std::string& extra_roots) {
+  std::string pem = ReadRoots(extra_roots);
+#if !defined(_WIN32) && !defined(__APPLE__)
+  // A statically linked OpenSSL looks for the system's CAs where its build
+  // machine kept them. httplib uses the Windows store and the macOS keychain.
+  std::error_code ec;
+  const bool openssl_finds_roots =
+      std::getenv(X509_get_default_cert_file_env()) ||
+      std::getenv(X509_get_default_cert_dir_env()) ||
+      std::filesystem::is_regular_file(X509_get_default_cert_file(), ec) ||
+      std::filesystem::is_directory(X509_get_default_cert_dir(), ec);
+  if (!openssl_finds_roots) {
+    pem += ReadRoots(FindCaBundle([](const char* name) {
+      const char* value = std::getenv(name);
+      return std::string(value ? value : "");
+    }));
+  }
+#endif
+  return pem;
+}
+
+std::unique_ptr<HttpClient> MakeHttpClient(const std::string& extra_roots) {
+  return std::make_unique<HttplibClient>(extra_roots);
 }
 
 }  // namespace adbcpq::auth

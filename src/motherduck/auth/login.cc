@@ -45,6 +45,7 @@ extern char** environ;
 
 #include <fmt/format.h>
 
+#include "auth/env.h"
 #include "auth/json.h"
 
 namespace adbcpq::auth {
@@ -246,9 +247,9 @@ bool OpenBrowser(const std::string& url) {
 
 }  // namespace
 
-LoginEnvironment DefaultLoginEnvironment(std::string ca_bundle) {
+LoginEnvironment DefaultLoginEnvironment(const std::string& extra_roots) {
   LoginEnvironment env;
-  env.http = MakeHttpClient(std::move(ca_bundle));
+  env.http = MakeHttpClient(extra_roots);
   env.print = [](const std::string& message) {
     std::fprintf(stderr, "%s\n", message.c_str());
     std::fflush(stderr);
@@ -263,8 +264,7 @@ LoginEnvironment DefaultLoginEnvironment(std::string ca_bundle) {
 
 std::string ApiOrigin() {
   for (const char* name : {"motherduck_host", "MOTHERDUCK_HOST"}) {
-    const char* host = std::getenv(name);
-    if (host != nullptr && *host != '\0') return std::string("https://") + host;
+    if (std::optional<std::string> host = GetEnvUtf8(name)) return "https://" + *host;
   }
   return "https://api.motherduck.com";
 }

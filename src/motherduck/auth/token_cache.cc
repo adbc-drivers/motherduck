@@ -47,6 +47,7 @@
 #include <unistd.h>
 #endif
 
+#include "auth/env.h"
 #include "auth/json.h"
 
 namespace adbcpq::auth {
@@ -63,20 +64,16 @@ std::string PathString(const fs::path& path) {
   return std::string(utf8.begin(), utf8.end());
 }
 
-#ifdef _WIN32
-std::optional<fs::path> EnvPath(const wchar_t* name) {
-  wchar_t* value = nullptr;
-  size_t length = 0;
-  if (_wdupenv_s(&value, &length, name) != 0 || value == nullptr) return std::nullopt;
-  std::optional<fs::path> path;
-  if (*value != L'\0') path = fs::path(value);
-  std::free(value);
-  return path;
+std::optional<fs::path> EnvPath(const char* name) {
+  const std::optional<std::string> value = GetEnvUtf8(name);
+  if (!value) return std::nullopt;
+  return fs::path(std::u8string(value->begin(), value->end()));
 }
 
-std::optional<fs::path> MotherDuckHome() { return EnvPath(L"MOTHERDUCK_HOME"); }
+std::optional<fs::path> MotherDuckHome() { return EnvPath("MOTHERDUCK_HOME"); }
 
-std::optional<fs::path> HomeDirectory() { return EnvPath(L"USERPROFILE"); }
+#ifdef _WIN32
+std::optional<fs::path> HomeDirectory() { return EnvPath("USERPROFILE"); }
 
 int ProcessId() { return _getpid(); }
 
@@ -163,13 +160,6 @@ std::optional<std::string> ReadSmallFile(const fs::path& path, size_t max_bytes)
   return contents;
 }
 #else
-std::optional<fs::path> EnvPath(const char* name) {
-  const char* value = std::getenv(name);
-  if (value == nullptr || *value == '\0') return std::nullopt;
-  return fs::path(value);
-}
-
-std::optional<fs::path> MotherDuckHome() { return EnvPath("MOTHERDUCK_HOME"); }
 
 std::optional<fs::path> HomeDirectory() {
   if (auto home = EnvPath("HOME")) return home;
@@ -285,12 +275,38 @@ SharedLogin& Shared() {
 Status EnsureDirectory(const fs::path& directory) {
   std::error_code ec;
   if (fs::exists(directory, ec)) return Status::Ok();
-  fs::create_directories(directory, ec);
+  fs::create_directories(directory.parent_path(), ec);
+#ifdef _WIN32
+  if (!ec) fs::create_directory(directory, ec);
+#else
+  // 0700 from the start, so it's never open to others.
+  if (!ec && mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) {
+    ec = std::error_code(errno, std::generic_category());
+  }
+#endif
   if (ec) {
     return Status(ADBC_STATUS_IO, "[motherduck] Could not create " +
                                       PathString(directory) + ": " + ec.message());
   }
-  fs::permissions(directory, fs::perms::owner_all, fs::perm_options::replace, ec);
+  return Status::Ok();
+}
+
+// Someone else who can write to the directory could put their own token in it,
+// so refuse it, as ssh refuses such a ~/.ssh. (Windows: the access list the
+// file gets.)
+Status CheckDirectory(const fs::path& directory) {
+#ifndef _WIN32
+  struct stat info;
+  if (stat(directory.c_str(), &info) != 0) return Status::Ok();
+  const bool owned = info.st_uid == geteuid() || geteuid() == 0;
+  if (!owned || (info.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    return Status(ADBC_STATUS_INVALID_STATE,
+                  "[motherduck] Other users can write to " + PathString(directory) +
+                      ", so they could replace the MotherDuck token in it. Make it "
+                      "yours and writable only by you (chmod 700), or set "
+                      "MOTHERDUCK_HOME to another directory");
+  }
+#endif
   return Status::Ok();
 }
 
@@ -499,6 +515,7 @@ Status TokenCache::Get(bool need_host, Credentials* credentials, uint64_t since)
   const Deadline deadline = LockDeadline();
   fs::path path;
   UNWRAP_STATUS(CredentialsPath(&path));
+  UNWRAP_STATUS(CheckDirectory(path.parent_path()));
 
   // An expired token is used anyway: the server rejects it, and the caller logs
   // in again.
@@ -543,7 +560,7 @@ bool TokenCache::Reject(const std::string& token) {
     return false;
   }
   fs::path path;
-  if (CredentialsPath(&path).ok()) {
+  if (CredentialsPath(&path).ok() && CheckDirectory(path.parent_path()).ok()) {
     ForgetLocked(path, deadline);
   } else {
     token_.clear();

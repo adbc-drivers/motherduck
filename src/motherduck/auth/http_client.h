@@ -53,9 +53,15 @@ class HttpClient {
 };
 
 /// \brief An HttpClient using cpp-httplib and OpenSSL, restricted to HTTPS. It
-///   doesn't use proxies or follow redirects.
+///   doesn't use proxies or follow redirects, and trusts the system's CAs.
 ///
-/// \param ca_bundle A PEM file of CAs to trust in addition to the operating system's.
-std::unique_ptr<HttpClient> MakeHttpClient(std::string ca_bundle);
+/// \param extra_roots A PEM file of CAs to trust as well, or empty. One that
+///   can't be read is skipped.
+std::unique_ptr<HttpClient> MakeHttpClient(const std::string& extra_roots);
+
+/// \brief The PEM certificates the client trusts beyond what OpenSSL finds on
+///   its own: extra_roots, if readable, and on Linux the system's bundle when a
+///   statically linked OpenSSL looks for it in the wrong place.
+std::string ExtraRootsPem(const std::string& extra_roots);
 
 }  // namespace adbcpq::auth

@@ -38,6 +38,7 @@ add_library(adbc_driver_motherduck_impl STATIC
             motherduck/motherduck_statement.cc
             motherduck/motherduck_trust_store.cc
             motherduck/motherduck_type_resolver.cc
+            motherduck/auth/env.cc
             motherduck/auth/http_client.cc
             motherduck/auth/json.cc
             motherduck/auth/login.cc
